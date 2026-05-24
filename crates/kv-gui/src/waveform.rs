@@ -49,6 +49,13 @@ pub fn draw_waveform_area(
 
     let amp_scale = settings.amp_scale_uv();
 
+    // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
+    // At default amp_scale=1000: gain = 2.2 * 3.0 * 1.0 = 6.6
+    //   ±0.06 * 6.6 = ±0.40  (nicely visible within spacing=2.2)
+    // At amp_scale=50 (zoom in): gain = 132  → very zoomed
+    // At amp_scale=10000 (zoom out): gain = 0.66 → compressed
+    let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
+
     // Build lines for each channel
     let mut lines: Vec<(usize, Vec<[f64; 2]>)> = Vec::with_capacity(visible);
     for ch in 0..visible {
@@ -59,10 +66,9 @@ pub fn draw_waveform_area(
             collect_channel_points(ch, history, latest, total_channels, block.sample_rate);
         // Apply vertical offset: channel 0 at top, channel N at bottom
         let y_offset = -(ch as f64) * CHANNEL_SPACING;
-        let scale = 1.0 / amp_scale.max(1.0) * 500.0; // normalize amplitude
         let pts: Vec<[f64; 2]> = raw_pts
             .into_iter()
-            .map(|[x, y]| [x, y * scale + y_offset])
+            .map(|[x, y]| [x, y * gain + y_offset])
             .collect();
         lines.push((ch, pts));
     }

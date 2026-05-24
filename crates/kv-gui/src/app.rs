@@ -321,14 +321,14 @@ impl eframe::App for KvApp {
                         self.toggle_acquisition();
                     }
 
-                    // Record button
+                    // Record button — always clickable when running
                     let rec_label = match self.recording.state {
                         RecordingState::Idle => " Record ",
-                        RecordingState::Armed => " ARM ",
+                        RecordingState::Armed => "  ARM  ",
                         RecordingState::Recording => " STOP REC ",
                     };
                     let rec_color = match self.recording.state {
-                        RecordingState::Idle => theme::BTN_DISABLED,
+                        RecordingState::Idle => theme::BTN_RECORD,
                         RecordingState::Armed => theme::ACCENT_YELLOW,
                         RecordingState::Recording => theme::BTN_RECORD_ACTIVE,
                     };

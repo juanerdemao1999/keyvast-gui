@@ -31,14 +31,14 @@ pub const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(70, 140, 255);
 pub const ACCENT_ORANGE: egui::Color32 = egui::Color32::from_rgb(240, 150, 40);
 pub const ACCENT_CYAN: egui::Color32 = egui::Color32::from_rgb(60, 200, 210);
 
-// ── Transport button colors ─────────────────────────────────────────
+// ── Transport button colors (high-contrast for dark toolbar) ────────
 
-pub const BTN_PLAY: egui::Color32 = egui::Color32::from_rgb(30, 140, 50);
-pub const BTN_PLAY_ACTIVE: egui::Color32 = egui::Color32::from_rgb(60, 180, 70);
-pub const BTN_STOP: egui::Color32 = egui::Color32::from_rgb(160, 40, 40);
-pub const BTN_RECORD: egui::Color32 = egui::Color32::from_rgb(200, 40, 40);
-pub const BTN_RECORD_ACTIVE: egui::Color32 = egui::Color32::from_rgb(240, 60, 60);
-pub const BTN_DISABLED: egui::Color32 = egui::Color32::from_rgb(50, 50, 60);
+pub const BTN_PLAY: egui::Color32 = egui::Color32::from_rgb(40, 180, 70);
+pub const BTN_PLAY_ACTIVE: egui::Color32 = egui::Color32::from_rgb(60, 210, 90);
+pub const BTN_STOP: egui::Color32 = egui::Color32::from_rgb(200, 55, 55);
+pub const BTN_RECORD: egui::Color32 = egui::Color32::from_rgb(220, 50, 50);
+pub const BTN_RECORD_ACTIVE: egui::Color32 = egui::Color32::from_rgb(255, 70, 70);
+pub const BTN_DISABLED: egui::Color32 = egui::Color32::from_rgb(65, 65, 78);
 
 // ── Grid / guides ───────────────────────────────────────────────────
 
@@ -167,26 +167,29 @@ pub fn kv_label_colored(ui: &mut egui::Ui, key: &str, value: &str, color: egui::
     });
 }
 
-/// Compact transport button (play/stop/record style).
+/// High-contrast transport button (play/stop/record style).
 pub fn transport_button(
     ui: &mut egui::Ui,
     label: &str,
     fill: egui::Color32,
     enabled: bool,
 ) -> bool {
+    let (bg, text_color, stroke_color) = if enabled {
+        (fill, egui::Color32::WHITE, fill)
+    } else {
+        (BTN_DISABLED, egui::Color32::from_rgb(130, 130, 145), BTN_DISABLED)
+    };
+
     let btn = egui::Button::new(
         egui::RichText::new(label)
-            .size(13.0)
+            .size(14.0)
             .strong()
-            .color(if enabled {
-                egui::Color32::WHITE
-            } else {
-                TEXT_DIM
-            }),
+            .color(text_color),
     )
-    .fill(if enabled { fill } else { BTN_DISABLED })
-    .min_size(egui::vec2(70.0, 28.0))
-    .corner_radius(egui::CornerRadius::same(4));
+    .fill(bg)
+    .stroke(egui::Stroke::new(1.5, stroke_color))
+    .min_size(egui::vec2(76.0, 30.0))
+    .corner_radius(egui::CornerRadius::same(5));
 
     ui.add_enabled(enabled, btn).clicked()
 }

@@ -103,6 +103,19 @@ pub fn draw_waveform_area(
         }
     };
 
+    // Time-axis formatter: show seconds when window is large, ms otherwise
+    let window_ms = x_right - x_left;
+    let x_formatter = move |mark: egui_plot::GridMark, _: &std::ops::RangeInclusive<f64>| {
+        let v = mark.value;
+        if window_ms >= 2000.0 {
+            format!("{:.1}s", v / 1000.0)
+        } else if window_ms >= 200.0 {
+            format!("{:.0}ms", v)
+        } else {
+            format!("{:.1}ms", v)
+        }
+    };
+
     // Draw the combined plot — explicit bounds, no auto-fit (prevents Y-axis jitter)
     let plot = Plot::new("waveform_main")
         .height(ui.available_height())
@@ -116,11 +129,12 @@ pub fn draw_waveform_area(
         .auto_bounds(egui::Vec2b::new(false, false))
         .show_x(true)
         .show_y(true)
-        .x_axis_label("Time (ms)")
+        .x_axis_label("Time")
+        .x_axis_formatter(x_formatter)
         .y_axis_formatter(y_formatter)
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
-    plot.show(ui, |plot_ui| {
+    let response = plot.show(ui, |plot_ui| {
         // Lock to exact bounds — X from wall clock, Y from channel layout
         plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
             [x_left, y_min],
@@ -145,16 +159,76 @@ pub fn draw_waveform_area(
             }
         }
 
-        // Draw waveform traces
+        // Determine which channel the cursor is hovering over (Y → channel)
+        let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
+            let ch_idx = (-pos.y / CHANNEL_SPACING).round() as i64;
+            if ch_idx >= 0 && (ch_idx as usize) < visible {
+                Some(ch_idx as usize)
+            } else {
+                None
+            }
+        });
+
+        // Draw waveform traces — highlight hovered channel
         for (ch, pts) in &lines {
-            let color = theme::channel_color(*ch);
+            let base_color = theme::channel_color(*ch);
+            let is_hovered = hovered_ch == Some(*ch);
+            let (color, width) = if is_hovered {
+                (egui::Color32::WHITE, 1.8)
+            } else if hovered_ch.is_some() {
+                // Dim non-hovered channels when something is hovered
+                (dim_color(base_color, 0.45), 1.0)
+            } else {
+                (base_color, 1.2)
+            };
             let line = Line::new(PlotPoints::from(pts.clone()))
                 .color(color)
-                .width(1.2)
+                .width(width)
                 .name(format!("CH{ch}"));
             plot_ui.line(line);
         }
+
+        hovered_ch
     });
+
+    // Tooltip with the hovered channel + time
+    if response.response.hovered() {
+        if let Some(hovered_ch) = response.inner {
+            if let Some(ptr_pos) = response.response.hover_pos() {
+                let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
+                let tip = format_time_tooltip(hovered_ch, time_at_cursor);
+                egui::containers::popup::show_tooltip_at_pointer(
+                    ui.ctx(),
+                    ui.layer_id(),
+                    egui::Id::new("waveform_hover_tooltip"),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(tip)
+                                .monospace()
+                                .size(11.0)
+                                .color(theme::TEXT_PRIMARY),
+                        );
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn format_time_tooltip(ch: usize, time_ms: f64) -> String {
+    if time_ms.abs() >= 1000.0 {
+        format!("CH{}  •  t = {:.3} s", ch, time_ms / 1000.0)
+    } else {
+        format!("CH{}  •  t = {:.2} ms", ch, time_ms)
+    }
+}
+
+/// Linearly dim a color toward black by `factor` (0.0 = black, 1.0 = unchanged).
+fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
+    let r = (c.r() as f32 * factor) as u8;
+    let g = (c.g() as f32 * factor) as u8;
+    let b = (c.b() as f32 * factor) as u8;
+    egui::Color32::from_rgb(r, g, b)
 }
 
 // ── Data collection ─────────────────────────────────────────────────
@@ -220,6 +294,16 @@ fn collect_channel_points(
                 0.0
             };
             all_points.push([time_ms, value]);
+        }
+    }
+
+    // DC removal: subtract per-channel mean so each trace is centered in its lane.
+    // Standard practice in pro acquisition software (Open Ephys, Intan RHX).
+    if !all_points.is_empty() {
+        let mean: f64 =
+            all_points.iter().map(|p| p[1]).sum::<f64>() / all_points.len() as f64;
+        for p in &mut all_points {
+            p[1] -= mean;
         }
     }
 

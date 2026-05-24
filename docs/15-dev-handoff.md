@@ -20,9 +20,44 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 5)
+Last updated: 2026-05-24 (session 6 — GUI polish to professional standard)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now matches several Tier-1 features of those packages.
+
+### Session 6 changes (waveform / UX polish)
+
+- **Smooth wall-clock-driven scrolling** — viewport edges are computed from `elapsed_secs * 1000` instead of from data-derived bounds; data points keep absolute time positions from `block.timestamp_start`, so they never move once placed. Eliminated the discrete jumps caused by per-frame re-zeroing.
+- **Anchored decimation** — points are filtered by `(timestamp_start + s) % stride == 0` so the same physical samples are picked every frame regardless of where they fall in the per-frame collected vector. Eliminated the visual "flicker" that array-position decimation produced.
+- **Per-channel DC removal** — each visible channel's mean is subtracted before display so traces stay centered in their lane (industry standard).
+- **Display freeze** — `P` toggles a paused viewport while acquisition and recording continue.  Captured `paused_elapsed` keeps the X bounds locked.
+- **Mouse-wheel zoom** on the plot cycles through `TIME_WINDOWS` (1s/2s/5s/10s/20s); `[` and `]` do the same from the keyboard.
+- **Performance overlay** — `F` toggles a small panel showing FPS, frame interval (EMA), render time (EMA), and history block count.  Uses 0.9/0.1 EMA so the readout is stable.
+- **Hover highlight** — hovering over a channel draws it in white with extra width; non-hovered channels are dimmed; a tooltip shows `CHn  •  t = 12.34 ms`.
+- **Smarter time axis** — ticks render as seconds when window ≥ 2s, ms otherwise.
+- **Y-axis jitter fix** — replaced `include_y` + `.reset()` (which auto-fit each frame) with explicit `set_plot_bounds()` inside the draw closure.  Channel labels now stay still.
+- **ComboBox visibility fix** — set `weak_bg_fill` on widget styles so the Time/Amp dropdowns no longer render as white-on-white.
+
+### Quick keyboard / mouse reference
+
+| Key       | Action                                  |
+|-----------|-----------------------------------------|
+| `Space`   | Toggle acquisition                       |
+| `R`       | Toggle recording (Arm → Record → Stop)   |
+| `G`       | Toggle grid                              |
+| `P`       | Pause / resume display                   |
+| `F`       | Toggle performance overlay               |
+| `[` `]`   | Decrease / increase time window          |
+| `1`–`9`   | Quick-set visible channels               |
+| Wheel     | Increase / decrease time window          |
+| Hover     | Highlight channel + tooltip              |
+
+### Files most relevant to this session
+
+- `crates/kv-gui/src/waveform.rs` — viewport, decimation, hover highlight
+- `crates/kv-gui/src/app.rs` — pause state, perf metrics, scroll-wheel handling, overlays
+- `crates/kv-gui/src/panels.rs` — `TIME_WINDOWS`, ComboBox styling
+- `crates/kv-gui/src/theme.rs` — `weak_bg_fill`, `transport_button` (no `add_enabled`)
+
 
 Implemented:
 
@@ -250,7 +285,7 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-24 (session 5)
+Last verified: 2026-05-24 (session 6)
 
 Commands run successfully:
 
@@ -279,17 +314,24 @@ Current test count:
 
 ## How To Resume
 
-The full benchmark pipeline and professional GUI are feature-complete. The GUI was refactored in session 5 to follow Intan RHX / Open Ephys layout patterns (single multi-channel plot, collapsible sidebar, transport buttons, keyboard shortcuts). The next useful tasks, in priority order:
+The full benchmark pipeline and professional GUI are feature-complete. The GUI was refactored in session 5 (layout) and session 6 (smooth scrolling, freeze, perf overlay, hover, decimation fix) to match Tier-1 features of Intan RHX / Open Ephys. Tier-3 signal processing (filters, CAR, spike detection) is the next planned GUI work. The next useful tasks, in priority order:
 
-1. **Visual smoke test**: Run `cargo gui` (or `gui.bat`) and verify: dark theme, multi-channel waterfall waveforms in a single plot, collapsible sidebar with channel checkboxes, transport buttons in toolbar, acquisition clock, status bar. Test keyboard shortcuts (Space, R, G, 1-9).
+1. **Visual smoke test**: Run `gui.bat` and verify all the new interactions: smooth scroll (no flicker), `P` to freeze, `F` for perf overlay, scroll-wheel changes time window, hover highlights a channel and shows tooltip.
 
-2. **Wire GUI to live pipeline**: The Device mode uses `PreviewState` which wraps `start_preview()`. This already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition, so the GUI can monitor a live recording session.
+2. **Tier-3 GUI signal processing** (planned, not started):
+   - High-pass filter (default 300 Hz for spike, off for raw view)
+   - Low-pass filter (default 250 Hz for LFP)
+   - Notch filter at 50/60 Hz
+   - Common Average Reference (CAR) toggle
+   - Spike threshold lines per channel (visual + crossing count)
 
-3. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json` for write latency tail, buffer occupancy, CPU%, and peak memory.
+3. **Wire GUI to live pipeline**: Device mode uses `PreviewState` which wraps `start_preview()`. Already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition.
 
-4. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits to catch throughput or latency regressions early.
+4. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json`.
 
-5. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients. This is the next major crate after the GUI is functional.
+5. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits.
+
+6. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients.
 
 Recommended implementation boundary:
 

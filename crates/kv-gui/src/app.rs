@@ -10,7 +10,12 @@
 //!   Space  — Toggle acquisition start/stop
 //!   R      — Toggle recording (arm → record → stop)
 //!   G      — Toggle grid
+//!   P      — Pause/resume display (acquisition continues)
+//!   F      — Toggle performance overlay (FPS / render time)
+//!   [ / ]  — Decrease / increase time window
 //!   1..9   — Quick-set visible channels (x4: 4,8,12,16,20,24,28,32,36)
+//!
+//! Mouse: scroll-wheel over the plot also adjusts the time window.
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -55,6 +60,17 @@ pub struct KvApp {
     display: DisplaySettings,
     recording: RecordingSettings,
     theme_applied: bool,
+    /// When true, the waveform display is frozen at the current view but
+    /// acquisition and recording continue uninterrupted.
+    pub display_paused: bool,
+    /// The elapsed time captured the moment the display was paused.
+    paused_elapsed: f64,
+    /// Show performance overlay (FPS, render time).
+    pub show_perf_overlay: bool,
+    // Performance metrics
+    last_frame: Instant,
+    frame_ms_ema: f64,
+    render_ms_ema: f64,
 }
 
 impl KvApp {
@@ -76,6 +92,12 @@ impl KvApp {
             display: DisplaySettings::default(),
             recording: RecordingSettings::default(),
             theme_applied: false,
+            display_paused: false,
+            paused_elapsed: 0.0,
+            show_perf_overlay: false,
+            last_frame: now,
+            frame_ms_ema: 16.7,
+            render_ms_ema: 0.0,
         }
     }
 
@@ -124,6 +146,19 @@ impl KvApp {
                 AcqMode::Demo => self.start_demo(),
                 AcqMode::Device => self.start_device(),
             }
+        }
+    }
+
+    /// Freeze/unfreeze the display.  Acquisition continues regardless —
+    /// the user can examine a snapshot of the trace without stopping
+    /// recording.  Capture the elapsed time on pause so the X window
+    /// stays at the frozen position.
+    fn toggle_pause_display(&mut self) {
+        if self.display_paused {
+            self.display_paused = false;
+        } else {
+            self.paused_elapsed = self.elapsed_seconds();
+            self.display_paused = true;
         }
     }
 
@@ -236,6 +271,21 @@ impl KvApp {
             if i.key_pressed(egui::Key::G) {
                 self.display.show_grid = !self.display.show_grid;
             }
+            if i.key_pressed(egui::Key::P) {
+                self.toggle_pause_display();
+            }
+            if i.key_pressed(egui::Key::F) {
+                self.show_perf_overlay = !self.show_perf_overlay;
+            }
+            // [ / ] for time window prev/next
+            if i.key_pressed(egui::Key::OpenBracket) {
+                let idx = self.display.time_scale_idx.saturating_sub(1);
+                self.display.time_scale_idx = idx;
+            }
+            if i.key_pressed(egui::Key::CloseBracket) {
+                let max_idx = panels::TIME_WINDOWS.len() - 1;
+                self.display.time_scale_idx = (self.display.time_scale_idx + 1).min(max_idx);
+            }
             // 1-9: quick channel count (multiply by 4)
             for (key, num) in [
                 (egui::Key::Num1, 4),
@@ -258,6 +308,15 @@ impl KvApp {
 
 impl eframe::App for KvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
+        let frame_delta_ms = frame_start
+            .duration_since(self.last_frame)
+            .as_secs_f64()
+            * 1000.0;
+        self.last_frame = frame_start;
+        // EMA of frame interval (~250ms time constant at 60fps)
+        self.frame_ms_ema = self.frame_ms_ema * 0.9 + frame_delta_ms * 0.1;
+
         // Apply theme once
         if !self.theme_applied {
             theme::apply(ctx);
@@ -272,13 +331,19 @@ impl eframe::App for KvApp {
         // Handle keyboard shortcuts
         self.handle_keys(ctx);
 
-        // Tick
+        // Tick (acquisition runs regardless of display pause)
         match self.mode {
             AcqMode::Demo => self.tick_demo(),
             AcqMode::Device => self.tick_device(),
         }
 
-        let elapsed = self.elapsed_seconds();
+        let elapsed_live = self.elapsed_seconds();
+        // Use frozen elapsed for display when paused
+        let elapsed = if self.display_paused {
+            self.paused_elapsed
+        } else {
+            elapsed_live
+        };
 
         // ── Top toolbar ─────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar")
@@ -467,6 +532,26 @@ impl eframe::App for KvApp {
                     .inner_margin(egui::Margin::symmetric(4, 4)),
             )
             .show(ctx, |ui| {
+                let plot_rect = ui.available_rect_before_wrap();
+
+                // Mouse wheel over the plot adjusts the time window
+                let scroll_response =
+                    ui.interact(plot_rect, egui::Id::new("waveform_wheel"), egui::Sense::hover());
+                if scroll_response.hovered() {
+                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 1.0 {
+                        let max_idx = panels::TIME_WINDOWS.len() - 1;
+                        if scroll < 0.0 {
+                            self.display.time_scale_idx =
+                                (self.display.time_scale_idx + 1).min(max_idx);
+                        } else {
+                            self.display.time_scale_idx =
+                                self.display.time_scale_idx.saturating_sub(1);
+                        }
+                    }
+                }
+
+                let render_start = Instant::now();
                 waveform::draw_waveform_area(
                     ui,
                     &self.block_history,
@@ -474,11 +559,79 @@ impl eframe::App for KvApp {
                     &self.display,
                     elapsed,
                 );
+                let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
+                self.render_ms_ema = self.render_ms_ema * 0.9 + render_ms * 0.1;
+
+                // Pause indicator overlay
+                if self.display_paused {
+                    draw_paused_overlay(ui, plot_rect);
+                }
+                // Performance overlay
+                if self.show_perf_overlay {
+                    draw_perf_overlay(
+                        ui,
+                        plot_rect,
+                        self.frame_ms_ema,
+                        self.render_ms_ema,
+                        self.block_history.len(),
+                    );
+                }
             });
 
-        // Request continuous repaints while running
-        if self.is_running() {
+        // Request continuous repaints while running (or paused — for overlay)
+        if self.is_running() || self.display_paused {
             ctx.request_repaint();
         }
+    }
+}
+
+// ── Overlays ────────────────────────────────────────────────────────
+
+fn draw_paused_overlay(ui: &egui::Ui, rect: egui::Rect) {
+    let badge_pos = rect.center_top() + egui::vec2(0.0, 18.0);
+    let painter = ui.painter();
+    let text = "  PAUSED  (press P to resume)  ";
+    painter.text(
+        badge_pos,
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        theme::ACCENT_YELLOW,
+    );
+}
+
+fn draw_perf_overlay(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    frame_ms: f64,
+    render_ms: f64,
+    history_blocks: usize,
+) {
+    let painter = ui.painter();
+    let pos = rect.right_top() + egui::vec2(-8.0, 8.0);
+    let fps = if frame_ms > 0.01 { 1000.0 / frame_ms } else { 0.0 };
+    let lines = [
+        format!("FPS    {:>6.1}", fps),
+        format!("Frame  {:>5.1} ms", frame_ms),
+        format!("Render {:>5.1} ms", render_ms),
+        format!("Hist   {:>5} blk", history_blocks),
+    ];
+
+    // Background panel
+    let bg = egui::Rect::from_min_size(pos + egui::vec2(-110.0, -2.0), egui::vec2(108.0, 60.0));
+    painter.rect_filled(
+        bg,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgba_premultiplied(20, 20, 26, 200),
+    );
+
+    for (i, line) in lines.iter().enumerate() {
+        painter.text(
+            pos + egui::vec2(-6.0, 4.0 + i as f32 * 13.0),
+            egui::Align2::RIGHT_TOP,
+            line,
+            egui::FontId::monospace(11.0),
+            theme::TEXT_PRIMARY,
+        );
     }
 }

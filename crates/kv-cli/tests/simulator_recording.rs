@@ -6,8 +6,8 @@ use std::{
 };
 
 use kv_cli::{
-    CliCommand, CliError, SimulatorRecordingOptions, parse_args, run_directory_name_utc,
-    run_simulator_recording,
+    CliCommand, CliError, SimulatorPipelineOptions, SimulatorRecordingOptions, parse_args,
+    run_directory_name_utc, run_simulator_pipeline, run_simulator_recording,
 };
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET};
 
@@ -142,7 +142,9 @@ fn run_directory_name_uses_documented_timestamp_format() {
 fn simulator_record_parse_uses_default_run_directory_when_output_is_omitted() {
     let command = parse_args(["simulator-record", "--blocks", "2"]).expect("args should parse");
 
-    let CliCommand::SimulatorRecord(options) = command;
+    let CliCommand::SimulatorRecord(options) = command else {
+        panic!("expected SimulatorRecord command");
+    };
     assert_eq!(options.blocks, 2);
 
     let dir_name = options
@@ -191,6 +193,97 @@ fn kv_acq_binary_runs_simulator_record_command() {
     assert!(output_dir.join("events.csv").exists());
     assert!(output_dir.join("benchmark.json").exists());
     assert!(String::from_utf8_lossy(&output.stdout).contains("acquired_blocks=2"));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn simulator_pipeline_writes_all_output_files_with_measured_timing() {
+    let output_dir = unique_output_dir("pipeline-clean");
+    let result = run_simulator_pipeline(SimulatorPipelineOptions {
+        output_dir: output_dir.clone(),
+        blocks: 4,
+        drop_packet_ids: Vec::new(),
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+    })
+    .expect("simulator pipeline should succeed");
+
+    let expected_samples = (4 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
+    let expected_bytes = expected_samples * 2;
+
+    assert_eq!(result.recording.byte_count, expected_bytes);
+    assert_eq!(result.integrity.summary.observed_packets, 4);
+    assert_eq!(result.integrity.summary.missing_packets, 0);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+    assert_eq!(result.recorder_dropped_blocks, 0);
+
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("recording.json").exists());
+    assert!(output_dir.join("integrity.json").exists());
+    assert!(output_dir.join("log.txt").exists());
+    assert!(output_dir.join("events.csv").exists());
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark json should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"measured\""));
+    assert!(benchmark.contains("\"channel_count\": 64"));
+    assert!(benchmark.contains(&format!("\"written_samples\": {expected_samples}")));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn simulator_pipeline_detects_packet_loss_with_measured_timing() {
+    let output_dir = unique_output_dir("pipeline-loss");
+    let result = run_simulator_pipeline(SimulatorPipelineOptions {
+        output_dir: output_dir.clone(),
+        blocks: 4,
+        drop_packet_ids: vec![1],
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+    })
+    .expect("simulator pipeline with packet loss should succeed");
+
+    assert_eq!(result.integrity.summary.missing_packets, 1);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+
+    let integrity = fs::read_to_string(output_dir.join("integrity.json"))
+        .expect("integrity summary should be readable");
+    assert!(integrity.contains("\"missing_packets\": 1"));
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark json should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"measured\""));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kv_acq_binary_runs_simulator_pipeline_command() {
+    let output_dir = unique_output_dir("binary-pipeline");
+    let binary = env!("CARGO_BIN_EXE_kv-acq");
+
+    let output = Command::new(binary)
+        .arg("simulator-pipeline")
+        .arg("--blocks")
+        .arg("3")
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .expect("kv-acq should run");
+
+    assert!(
+        output.status.success(),
+        "kv-acq simulator-pipeline failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("measurement_kind=measured"));
+    assert!(stdout.contains("wall_clock_seconds="));
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("benchmark.json").exists());
 
     cleanup_dir(&output_dir);
 }

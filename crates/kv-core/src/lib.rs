@@ -1,5 +1,7 @@
 //! Acquisition lifecycle orchestration for Keyvast.
 
+pub mod pipeline;
+
 use std::fmt;
 
 use kv_integrity::{IntegrityError, IntegrityReport, check_blocks};

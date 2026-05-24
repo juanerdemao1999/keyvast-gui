@@ -14,6 +14,7 @@ dependencies = [
 name = "kv-cli"
 version = "0.1.0"
 dependencies = [
+ "kv-buffer",
  "kv-core",
  "kv-integrity",
  "kv-recorder",
@@ -25,6 +26,7 @@ dependencies = [
 name = "kv-core"
 version = "0.1.0"
 dependencies = [
+ "kv-buffer",
  "kv-integrity",
  "kv-simulator",
  "kv-types",

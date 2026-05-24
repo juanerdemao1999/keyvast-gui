@@ -20,9 +20,9 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-22
+Last updated: 2026-05-24
 
-The project is in the simulator-first foundation phase.
+The project is in the simulator-first foundation phase. The threaded fan-out pipeline is now wired end-to-end.
 
 Implemented:
 
@@ -128,12 +128,34 @@ Implemented:
   - returned acquisition, recording, and integrity summaries
   - binary smoke test that writes `recording.kvraw`, `recording.json`, `integrity.json`, `log.txt`, `events.csv`, and `benchmark.json`
 
+- Threaded fan-out pipeline implemented:
+  - `kv-core::pipeline` module with `run_threaded_pipeline`
+  - `PipelineConfig`, `PipelineResult`, `PipelineTiming`, `PipelineError`
+  - dedicated producer thread reading from `AcquisitionSource`, pushing into `FanoutBlockBuffer`
+  - main thread draining recorder consumer into `Vec<SampleBlock>`
+  - independent preview consumer drained in the same loop (drops old blocks without blocking recorder)
+  - `Arc<Mutex<SharedState>>` + `Condvar` for thread synchronization
+  - producer error propagation via `PipelineError::ProducerFailed`
+  - wall-clock timing via `std::time::Instant`
+  - first-block latency measurement
+  - post-run integrity check on recorded blocks
+  - per-consumer final status reporting (pushed, popped, dropped)
+- Real benchmark timing added:
+  - `kv-acq simulator-pipeline` command writes `benchmark.json` with `measurement_kind: "measured"`
+  - wall-clock `duration_seconds` and `average_write_mb_s` from actual elapsed time
+  - `max_buffer_occupancy` from recorder and preview consumer final status
+  - clearly distinct from `simulator_estimate` used by old `simulator-record` command
+- CLI extended:
+  - `kv-acq simulator-pipeline --blocks N [--output DIR] [--drop-packet ID] [--recorder-capacity N] [--preview-capacity N]`
+  - `CommandResult` enum for unified command dispatch
+  - default recorder capacity: 2048 blocks, preview: 32 blocks
+  - binary smoke test for the new command
+
 Not yet implemented:
 
 - `kv-gui`
-- Benchmark runner
-- Real benchmark timing metrics for write latency, buffer high-water mark, CPU, and memory
-- Threaded fan-out integration between acquisition, recorder, GUI preview, daemon, and benchmark consumers
+- Benchmark runner (dedicated endurance/stress runner, separate from CLI one-shot commands)
+- Fine-grained benchmark timing metrics: per-block write latency, CPU, memory
 - `kv-daemon`
 
 ## Current Defaults In Use
@@ -153,45 +175,41 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-22
+Last verified: 2026-05-24
 
 Commands run successfully:
 
 ```powershell
 cargo fmt --all -- --check
-cargo test -p kv-buffer
 cargo test --workspace
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-The focused TDD pass for `kv-buffer` first failed because `FanoutBlockBuffer` and `BufferConsumerId` did not exist, then passed after implementation. The CLI manual smoke commands from the previous session were not rerun because this was a buffer-only change; the workspace integration tests still exercised `kv-acq simulator-record` including the binary smoke path.
-
-Previous manual smoke context: the earlier smoke run wrote `recording.kvraw`, `recording.json`, `integrity.json`, `log.txt`, `events.csv`, and `benchmark.json`. With `--drop-packet 1`, the integrity summary reported `expected_packets: 4`, `observed_packets: 3`, `missing_packets: 1`, `timestamp_discontinuities: 1`, `expected_samples: 16384`, and `written_samples: 12288`. The log included warnings for `missing packet expected=1 observed=2 missing=1` and `timestamp discontinuity packet=2 expected=64 observed=128`. The events CSV included started, packet_missing, and stopped rows. The benchmark JSON reported `measurement_kind: simulator_estimate`, `duration_seconds: 0.006400`, `byte_count: 24576`, and `average_write_mb_s: 3.840000`.
+All 51 integration tests pass. The threaded pipeline tests verify producer/consumer threading, independent recorder/preview consumption, wall-clock timing, producer error propagation, and packet gap detection through the pipeline. The CLI binary smoke test for `simulator-pipeline` confirms the binary produces `measurement_kind=measured` output and writes all expected files.
 
 Current test count:
 
 ```text
 8 passing integration tests in kv-buffer
-6 passing integration tests in kv-cli
-4 passing integration tests in kv-core
+9 passing integration tests in kv-cli (6 original + 3 pipeline)
+10 passing integration tests in kv-core (4 original + 6 pipeline)
 4 passing integration tests in kv-types
 5 passing integration tests in kv-simulator
 6 passing integration tests in kv-integrity
 9 passing integration tests in kv-recorder
-42 total passing integration tests
+51 total passing integration tests
 ```
 
 ## How To Resume
 
-The next useful task is to wire `FanoutBlockBuffer` into a small simulator acquisition pipeline, or add a small real benchmark timing layer around recording writes. Keep explicit simulator-first boundaries.
+The threaded fan-out pipeline and real benchmark timing are now complete. The next useful tasks, in priority order:
 
-Recommended first test cases:
+1. **Benchmark runner**: A dedicated endurance/stress test runner that exercises `simulator-pipeline` for configurable durations (10-second, 10-minute, 2-hour ladder from `docs/12-confirmed-decisions.md`). Collect per-block write latency distributions, peak buffer occupancy over time, and aggregate throughput.
 
-1. For fan-out integration, verify simulator blocks can be pushed once and consumed independently by recorder and GUI-preview consumers.
-2. Verify slow preview consumption reports preview dropped blocks without causing recorder packet loss.
-3. For benchmark timing, measure wall-clock elapsed time around writing and keep simulator_estimate distinct from measured timing.
-4. Do not block on GUI or real device transport.
+2. **kv-gui scaffold**: Create the `kv-gui` crate with a minimal `egui` window that connects to the pipeline's preview consumer. Start with a simple channel trace or status display. The pipeline's `preview` consumer is already wired; it just needs a real consumer.
+
+3. **Streaming recorder**: Currently the recorder writes all blocks at the end via `write_recording(&[SampleBlock])`. For long acquisitions, the recorder consumer should write blocks incrementally as they arrive (append to `recording.kvraw`, periodically flush metadata). This is needed before the 10-minute and 2-hour endurance tests become meaningful.
 
 Recommended implementation boundary:
 
@@ -199,9 +217,9 @@ Recommended implementation boundary:
 kv-simulator -> produces SampleBlock
 kv-integrity -> checks SampleBlock continuity and sample counts
 kv-recorder -> writes validated SampleBlock data to kvraw plus metadata
-kv-core -> orchestrates fixed-size acquisition runs over backend-like sources
-kv-buffer -> bounded FIFO buffering with observable overflow counters
-kv-cli -> thin developer command that exercises simulator -> core -> recorder
+kv-core -> orchestrates acquisition: run_fixed_blocks (synchronous) or run_threaded_pipeline (threaded fan-out)
+kv-buffer -> bounded FIFO + fan-out buffering with per-consumer overflow counters
+kv-cli -> thin developer commands: simulator-record (synchronous) and simulator-pipeline (threaded)
 ```
 
 Do not add real FPGA packet format, USB details, CRC algorithm, ADC conversion, or channel mapping yet.

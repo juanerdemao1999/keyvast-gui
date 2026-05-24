@@ -4,6 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
+kv-buffer = { path = "../kv-buffer" }
 kv-integrity = { path = "../kv-integrity" }
 kv-types = { path = "../kv-types" }
 

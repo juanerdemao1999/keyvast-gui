@@ -1,0 +1,2 @@
+[alias]
+gui = "run --bin kv-gui --release"

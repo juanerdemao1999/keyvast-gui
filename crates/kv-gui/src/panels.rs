@@ -410,13 +410,7 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
         // Arm / Record / Stop buttons
         ui.horizontal(|ui| match recording.state {
             RecordingState::Idle => {
-                if ui
-                    .add_enabled(
-                        acquiring,
-                        egui::Button::new(egui::RichText::new("Arm").size(11.0)),
-                    )
-                    .clicked()
-                {
+                if theme::transport_button(ui, " Arm ", theme::ACCENT_YELLOW, acquiring) {
                     recording.state = RecordingState::Armed;
                 }
             }

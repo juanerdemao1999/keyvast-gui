@@ -5,7 +5,7 @@
 //! Open Ephys, and other professional electrophysiology acquisition software.
 //!
 //! Each channel is offset vertically so traces form a waterfall display.
-//! A custom Y-axis formatter shows channel labels instead of numbers.
+//! The X axis auto-scrolls to always show the most recent data window.
 //! Grid lines, zero-reference lines, and per-channel coloring are supported.
 
 use std::collections::VecDeque;
@@ -50,20 +50,28 @@ pub fn draw_waveform_area(
     let amp_scale = settings.amp_scale_uv();
 
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
-    // At default amp_scale=1000: gain = 2.2 * 3.0 * 1.0 = 6.6
-    //   ±0.06 * 6.6 = ±0.40  (nicely visible within spacing=2.2)
-    // At amp_scale=50 (zoom in): gain = 132  → very zoomed
-    // At amp_scale=10000 (zoom out): gain = 0.66 → compressed
     let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // Build lines for each channel
+    // Build lines for each channel and track the global X range
     let mut lines: Vec<(usize, Vec<[f64; 2]>)> = Vec::with_capacity(visible);
+    let mut x_min = f64::MAX;
+    let mut x_max = f64::MIN;
+
     for ch in 0..visible {
         if !settings.is_channel_enabled(ch) {
             continue;
         }
         let raw_pts =
             collect_channel_points(ch, history, latest, total_channels, block.sample_rate);
+
+        // Track X range from actual data
+        if let Some(first) = raw_pts.first() {
+            x_min = x_min.min(first[0]);
+        }
+        if let Some(last) = raw_pts.last() {
+            x_max = x_max.max(last[0]);
+        }
+
         // Apply vertical offset: channel 0 at top, channel N at bottom
         let y_offset = -(ch as f64) * CHANNEL_SPACING;
         let pts: Vec<[f64; 2]> = raw_pts
@@ -73,6 +81,14 @@ pub fn draw_waveform_area(
         lines.push((ch, pts));
     }
 
+    // Fallback if no data
+    if x_min >= x_max {
+        x_min = 0.0;
+        x_max = 100.0;
+    }
+    // Small margin
+    let x_margin = (x_max - x_min) * 0.02;
+
     // Y axis bounds
     let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
     let y_max = CHANNEL_SPACING * 0.5;
@@ -81,7 +97,6 @@ pub fn draw_waveform_area(
     let ch_count_for_fmt = visible;
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
         let val = mark.value;
-        // Map Y position back to channel index
         let ch_idx = (-val / CHANNEL_SPACING).round() as i64;
         if ch_idx >= 0 && (ch_idx as usize) < ch_count_for_fmt {
             format!("CH{}", ch_idx)
@@ -90,27 +105,29 @@ pub fn draw_waveform_area(
         }
     };
 
-    // Draw the combined plot
+    // Draw the combined plot — lock bounds to the actual data window
     let plot = Plot::new("waveform_main")
         .height(ui.available_height())
         .width(ui.available_width())
         .show_axes([true, true])
         .show_grid(settings.show_grid)
-        .allow_drag([true, false])
-        .allow_zoom([true, false])
+        .allow_drag(false)
+        .allow_zoom(false)
         .allow_scroll(false)
         .allow_boxed_zoom(false)
+        .include_x(x_min - x_margin)
+        .include_x(x_max + x_margin)
         .include_y(y_min)
         .include_y(y_max)
+        .reset()
         .show_x(true)
         .show_y(true)
         .x_axis_label("Time (ms)")
         .y_axis_formatter(y_formatter)
-        .set_margin_fraction(egui::vec2(0.0, 0.01))
-        .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop));
+        .set_margin_fraction(egui::vec2(0.0, 0.01));
 
     plot.show(ui, |plot_ui| {
-        // Draw zero-reference lines for each channel
+        // Draw zero-reference lines — span only the actual data range
         if settings.show_grid {
             for ch in 0..visible {
                 if !settings.is_channel_enabled(ch) {
@@ -118,8 +135,8 @@ pub fn draw_waveform_area(
                 }
                 let y_off = -(ch as f64) * CHANNEL_SPACING;
                 let zero_line = Line::new(PlotPoints::from(vec![
-                    [-10000.0, y_off],
-                    [100000.0, y_off],
+                    [x_min - x_margin, y_off],
+                    [x_max + x_margin, y_off],
                 ]))
                 .color(theme::GRID_ZERO_LINE)
                 .width(0.5)
@@ -143,6 +160,7 @@ pub fn draw_waveform_area(
 // ── Data collection ─────────────────────────────────────────────────
 
 /// Collect (time_ms, raw_normalized) pairs for one channel from the history ring.
+/// Returns points with time re-zeroed so the window always starts near 0.
 fn collect_channel_points(
     ch: usize,
     history: &VecDeque<SampleBlock>,
@@ -183,8 +201,11 @@ fn collect_channel_points(
     if all_points.len() > MAX_DISPLAY_SAMPLES {
         let skip = all_points.len() - MAX_DISPLAY_SAMPLES;
         all_points.drain(..skip);
-        // Re-zero time axis
-        if let Some(t0) = all_points.first().map(|p| p[0]) {
+    }
+
+    // Always re-zero time so the window starts at 0
+    if let Some(t0) = all_points.first().map(|p| p[0]) {
+        if t0 != 0.0 {
             for p in &mut all_points {
                 p[0] -= t0;
             }
@@ -202,7 +223,6 @@ fn draw_empty_state(ui: &mut egui::Ui) {
 
     ui.painter().rect_filled(rect, 0.0, theme::BG_DARKEST);
 
-    // Centered message
     ui.painter().text(
         rect.center() + egui::vec2(0.0, -12.0),
         egui::Align2::CENTER_CENTER,

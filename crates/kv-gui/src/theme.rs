@@ -168,16 +168,24 @@ pub fn kv_label_colored(ui: &mut egui::Ui, key: &str, value: &str, color: egui::
 }
 
 /// High-contrast transport button (play/stop/record style).
+///
+/// Does NOT use `add_enabled` — egui's disabled dimming overrides our
+/// explicit colors, making text unreadable.  Instead we always `ui.add()`
+/// and gate the click result on `enabled`.
 pub fn transport_button(
     ui: &mut egui::Ui,
     label: &str,
     fill: egui::Color32,
     enabled: bool,
 ) -> bool {
-    let (bg, text_color, stroke_color) = if enabled {
-        (fill, egui::Color32::WHITE, fill)
+    let (bg, text_color) = if enabled {
+        (fill, egui::Color32::WHITE)
     } else {
-        (BTN_DISABLED, egui::Color32::from_rgb(130, 130, 145), BTN_DISABLED)
+        // Lighter disabled background with clearly readable text
+        (
+            egui::Color32::from_rgb(55, 55, 68),
+            egui::Color32::from_rgb(110, 110, 125),
+        )
     };
 
     let btn = egui::Button::new(
@@ -187,11 +195,12 @@ pub fn transport_button(
             .color(text_color),
     )
     .fill(bg)
-    .stroke(egui::Stroke::new(1.5, stroke_color))
+    .stroke(egui::Stroke::new(1.0, bg))
     .min_size(egui::vec2(76.0, 30.0))
     .corner_radius(egui::CornerRadius::same(5));
 
-    ui.add_enabled(enabled, btn).clicked()
+    let clicked = ui.add(btn).clicked();
+    enabled && clicked
 }
 
 /// Format seconds into HH:MM:SS.

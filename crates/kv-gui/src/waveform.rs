@@ -26,11 +26,15 @@ const CHANNEL_SPACING: f64 = 2.2;
 // ── Public entry point ──────────────────────────────────────────────
 
 /// Draw the full waveform area — one large Plot with all channels stacked.
+///
+/// `elapsed_secs` is the wall-clock time since acquisition started; it drives
+/// the X-axis window edge so scrolling is smooth and continuous.
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
+    elapsed_secs: f64,
 ) {
     let block = match latest {
         Some(b) => b,
@@ -53,10 +57,12 @@ pub fn draw_waveform_area(
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
     let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // Build lines for each channel and track the global X range
+    // X-axis window driven by wall clock — smooth continuous scroll
+    let x_right = elapsed_secs * 1000.0; // current time in ms
+    let x_left = (x_right - time_window_ms).max(0.0);
+
+    // Build lines for each channel
     let mut lines: Vec<(usize, Vec<[f64; 2]>)> = Vec::with_capacity(visible);
-    let mut x_min = f64::MAX;
-    let mut x_max = f64::MIN;
 
     for ch in 0..visible {
         if !settings.is_channel_enabled(ch) {
@@ -68,16 +74,9 @@ pub fn draw_waveform_area(
             latest,
             total_channels,
             block.sample_rate,
-            time_window_ms,
+            x_left,
+            x_right,
         );
-
-        // Track X range from actual data
-        if let Some(first) = raw_pts.first() {
-            x_min = x_min.min(first[0]);
-        }
-        if let Some(last) = raw_pts.last() {
-            x_max = x_max.max(last[0]);
-        }
 
         // Apply vertical offset: channel 0 at top, channel N at bottom
         let y_offset = -(ch as f64) * CHANNEL_SPACING;
@@ -87,14 +86,6 @@ pub fn draw_waveform_area(
             .collect();
         lines.push((ch, pts));
     }
-
-    // Fallback if no data
-    if x_min >= x_max {
-        x_min = 0.0;
-        x_max = 100.0;
-    }
-    // Small margin
-    let x_margin = (x_max - x_min) * 0.02;
 
     // Y axis bounds
     let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
@@ -130,12 +121,13 @@ pub fn draw_waveform_area(
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
     plot.show(ui, |plot_ui| {
-        // Lock to exact bounds every frame — X follows data, Y is fixed to channel layout
+        // Lock to exact bounds — X from wall clock, Y from channel layout
         plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-            [x_min - x_margin, y_min],
-            [x_max + x_margin, y_max],
+            [x_left, y_min],
+            [x_right, y_max],
         ));
-        // Draw zero-reference lines — span only the actual data range
+
+        // Draw zero-reference lines spanning the visible window
         if settings.show_grid {
             for ch in 0..visible {
                 if !settings.is_channel_enabled(ch) {
@@ -143,8 +135,8 @@ pub fn draw_waveform_area(
                 }
                 let y_off = -(ch as f64) * CHANNEL_SPACING;
                 let zero_line = Line::new(PlotPoints::from(vec![
-                    [x_min - x_margin, y_off],
-                    [x_max + x_margin, y_off],
+                    [x_left, y_off],
+                    [x_right, y_off],
                 ]))
                 .color(theme::GRID_ZERO_LINE)
                 .width(0.5)
@@ -167,18 +159,19 @@ pub fn draw_waveform_area(
 
 // ── Data collection ─────────────────────────────────────────────────
 
-/// Collect (time_ms, raw_normalized) pairs for one channel from the history ring.
+/// Collect (time_ms, raw_normalized) pairs for one channel.
 ///
-/// Only keeps the most recent `window_ms` milliseconds of data so the display
-/// width matches the user-selected time window.  Time is re-zeroed so the
-/// visible window always starts at 0.
+/// Uses `block.timestamp_start` for absolute time so data points have
+/// fixed positions.  Only points within `[t_left_ms, t_right_ms]` are kept.
+/// The result is decimated to `MAX_DISPLAY_POINTS` for rendering speed.
 fn collect_channel_points(
     ch: usize,
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
     channel_count: usize,
     sample_rate: f64,
-    window_ms: f64,
+    t_left_ms: f64,
+    t_right_ms: f64,
 ) -> Vec<[f64; 2]> {
     let ms_per_sample = if sample_rate > 0.0 {
         1000.0 / sample_rate
@@ -186,11 +179,7 @@ fn collect_channel_points(
         1.0
     };
 
-    // How many raw samples fit in the requested window
-    let window_samples = (window_ms / ms_per_sample).ceil() as usize;
-
     let mut all_points: Vec<[f64; 2]> = Vec::new();
-    let mut sample_offset: u64 = 0;
 
     let blocks_iter = history.iter().chain(latest);
 
@@ -199,23 +188,30 @@ fn collect_channel_points(
             continue;
         }
         let spc = block.samples_per_channel;
+        let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
+        let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
+
+        // Skip blocks entirely outside the visible window
+        if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
+            continue;
+        }
+
         for s in 0..spc {
+            let time_ms = block_start_ms + s as f64 * ms_per_sample;
+            if time_ms < t_left_ms {
+                continue;
+            }
+            if time_ms > t_right_ms {
+                break;
+            }
             let data_idx = s * channel_count + ch;
             let value = if data_idx < block.data.len() {
                 block.data[data_idx] as f64 / i16::MAX as f64
             } else {
                 0.0
             };
-            let time_ms = (sample_offset + s as u64) as f64 * ms_per_sample;
             all_points.push([time_ms, value]);
         }
-        sample_offset += spc as u64;
-    }
-
-    // Keep only the tail that fits the time window
-    if all_points.len() > window_samples {
-        let skip = all_points.len() - window_samples;
-        all_points.drain(..skip);
     }
 
     // Decimate to MAX_DISPLAY_POINTS for rendering performance
@@ -228,15 +224,6 @@ fn collect_channel_points(
             idx += step;
         }
         all_points = decimated;
-    }
-
-    // Re-zero time so the window starts at 0
-    if let Some(t0) = all_points.first().map(|p| p[0]) {
-        if t0 != 0.0 {
-            for p in &mut all_points {
-                p[0] -= t0;
-            }
-        }
     }
 
     all_points

@@ -472,6 +472,7 @@ impl eframe::App for KvApp {
                     &self.block_history,
                     self.latest_block.as_ref(),
                     &self.display,
+                    elapsed,
                 );
             });
 

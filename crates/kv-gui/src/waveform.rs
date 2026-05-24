@@ -112,7 +112,7 @@ pub fn draw_waveform_area(
         }
     };
 
-    // Draw the combined plot — lock bounds to the actual data window
+    // Draw the combined plot — explicit bounds, no auto-fit (prevents Y-axis jitter)
     let plot = Plot::new("waveform_main")
         .height(ui.available_height())
         .width(ui.available_width())
@@ -122,11 +122,7 @@ pub fn draw_waveform_area(
         .allow_zoom(false)
         .allow_scroll(false)
         .allow_boxed_zoom(false)
-        .include_x(x_min - x_margin)
-        .include_x(x_max + x_margin)
-        .include_y(y_min)
-        .include_y(y_max)
-        .reset()
+        .auto_bounds(egui::Vec2b::new(false, false))
         .show_x(true)
         .show_y(true)
         .x_axis_label("Time (ms)")
@@ -134,6 +130,11 @@ pub fn draw_waveform_area(
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
     plot.show(ui, |plot_ui| {
+        // Lock to exact bounds every frame — X follows data, Y is fixed to channel layout
+        plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+            [x_min - x_margin, y_min],
+            [x_max + x_margin, y_max],
+        ));
         // Draw zero-reference lines — span only the actual data range
         if settings.show_grid {
             for ch in 0..visible {

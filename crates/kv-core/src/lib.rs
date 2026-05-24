@@ -1,6 +1,7 @@
 //! Acquisition lifecycle orchestration for Keyvast.
 
 pub mod pipeline;
+pub mod process_metrics;
 
 use std::fmt;
 

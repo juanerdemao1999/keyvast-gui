@@ -1,0 +1,15 @@
+[package]
+name = "kv-gui"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "kv-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.31"
+kv-buffer = { path = "../kv-buffer" }
+kv-core = { path = "../kv-core" }
+kv-simulator = { path = "../kv-simulator" }
+kv-types = { path = "../kv-types" }

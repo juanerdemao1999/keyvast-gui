@@ -35,6 +35,9 @@ pub struct BenchmarkSummary {
     pub byte_count: u64,
     pub average_write_mb_s: f64,
     pub max_write_latency_ms: Option<f64>,
+    pub p50_write_latency_ms: Option<f64>,
+    pub p95_write_latency_ms: Option<f64>,
+    pub p99_write_latency_ms: Option<f64>,
     pub max_buffer_occupancy: Option<f64>,
     pub cpu_percent_avg: Option<f64>,
     pub memory_mb_max: Option<f64>,
@@ -404,6 +407,9 @@ fn benchmark_summary_json(summary: &BenchmarkSummary) -> String {
             "  \"byte_count\": {},\n",
             "  \"average_write_mb_s\": {},\n",
             "  \"max_write_latency_ms\": {},\n",
+            "  \"p50_write_latency_ms\": {},\n",
+            "  \"p95_write_latency_ms\": {},\n",
+            "  \"p99_write_latency_ms\": {},\n",
             "  \"max_buffer_occupancy\": {},\n",
             "  \"cpu_percent_avg\": {},\n",
             "  \"memory_mb_max\": {}\n",
@@ -421,6 +427,9 @@ fn benchmark_summary_json(summary: &BenchmarkSummary) -> String {
         summary.byte_count,
         format_metric(summary.average_write_mb_s),
         format_optional_metric(summary.max_write_latency_ms),
+        format_optional_metric(summary.p50_write_latency_ms),
+        format_optional_metric(summary.p95_write_latency_ms),
+        format_optional_metric(summary.p99_write_latency_ms),
         format_optional_metric(summary.max_buffer_occupancy),
         format_optional_metric(summary.cpu_percent_avg),
         format_optional_metric(summary.memory_mb_max)
@@ -646,6 +655,7 @@ impl StreamingRecorder {
         })?;
 
         let max_write_latency_us = self.write_latencies_us.iter().copied().max();
+        let latency_distribution = LatencyDistribution::from_samples(&self.write_latencies_us);
 
         Ok(StreamingRecordingSummary {
             recording: RecordingSummary {
@@ -659,6 +669,7 @@ impl StreamingRecorder {
                 last_packet_id: self.last_packet_id,
             },
             max_write_latency_us,
+            latency_distribution,
         })
     }
 
@@ -761,11 +772,55 @@ impl fmt::Debug for StreamingRecorder {
     }
 }
 
+/// Per-block write latency distribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LatencyDistribution {
+    pub count: u64,
+    pub min_us: u64,
+    pub max_us: u64,
+    pub mean_us: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+}
+
+impl LatencyDistribution {
+    /// Compute a latency distribution from a slice of microsecond samples.
+    /// Returns `None` if the slice is empty.
+    pub fn from_samples(samples: &[u64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let count = sorted.len() as u64;
+        let sum: u64 = sorted.iter().sum();
+        Some(Self {
+            count,
+            min_us: sorted[0],
+            max_us: sorted[sorted.len() - 1],
+            mean_us: sum / count,
+            p50_us: percentile(&sorted, 50),
+            p95_us: percentile(&sorted, 95),
+            p99_us: percentile(&sorted, 99),
+        })
+    }
+}
+
+fn percentile(sorted: &[u64], pct: usize) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = (pct * (sorted.len() - 1)) / 100;
+    sorted[idx]
+}
+
 /// Summary returned by `StreamingRecorder::finish()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamingRecordingSummary {
     pub recording: RecordingSummary,
     pub max_write_latency_us: Option<u64>,
+    pub latency_distribution: Option<LatencyDistribution>,
 }
 
 fn escape_json_string(value: &str) -> String {

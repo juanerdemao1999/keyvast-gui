@@ -10,6 +10,7 @@ use kv_core::pipeline::{
     PipelineConfig, PipelineError, PipelineResult, PipelineTiming, StreamingPipelineConfig,
     StreamingPipelineResult, run_streaming_pipeline,
 };
+use kv_core::process_metrics::{ProcessMetrics, ProcessMetricsCollector};
 use kv_core::{AcquisitionRunError, AcquisitionRunSummary, run_fixed_blocks};
 use kv_integrity::IntegrityReport;
 use kv_recorder::{
@@ -73,6 +74,7 @@ pub struct BenchmarkResult {
     pub max_write_latency_us: Option<u64>,
     pub requested_duration_seconds: f64,
     pub computed_block_count: usize,
+    pub process_metrics: Option<ProcessMetrics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,7 +381,7 @@ pub fn run_simulator_stream(
     let events = simulator_recording_events(&result.integrity);
     write_events_csv(&options.output_dir, &events)?;
 
-    let benchmark = streaming_benchmark_summary(&result, &streaming_config.device);
+    let benchmark = streaming_benchmark_summary(&result, &streaming_config.device, None);
     write_benchmark_summary(&options.output_dir, &benchmark)?;
 
     Ok(SimulatorStreamResult {
@@ -448,7 +450,9 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
         move || sim.next_block().map_err(|e| e.to_string())
     };
 
+    let metrics_collector = ProcessMetricsCollector::start();
     let result = run_streaming_pipeline(&streaming_config, source)?;
+    let process_metrics = metrics_collector.finish(result.timing.wall_clock_seconds);
 
     write_integrity_summary(&options.output_dir, &result.integrity.summary)?;
     write_log_file(
@@ -458,7 +462,7 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
     let events = simulator_recording_events(&result.integrity);
     write_events_csv(&options.output_dir, &events)?;
 
-    let benchmark = streaming_benchmark_summary(&result, &device);
+    let benchmark = streaming_benchmark_summary(&result, &device, process_metrics.as_ref());
     write_benchmark_summary(&options.output_dir, &benchmark)?;
 
     Ok(BenchmarkResult {
@@ -470,12 +474,14 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
         max_write_latency_us: result.max_write_latency_us,
         requested_duration_seconds: options.duration_seconds,
         computed_block_count: block_count,
+        process_metrics,
     })
 }
 
 fn streaming_benchmark_summary(
     result: &StreamingPipelineResult,
     device: &kv_types::DeviceConfig,
+    process_metrics: Option<&ProcessMetrics>,
 ) -> BenchmarkSummary {
     BenchmarkSummary {
         measurement_kind: "measured_streaming".to_string(),
@@ -493,14 +499,26 @@ fn streaming_benchmark_summary(
             result.timing.wall_clock_seconds,
         ),
         max_write_latency_ms: result.max_write_latency_us.map(|us| us as f64 / 1_000.0),
+        p50_write_latency_ms: result
+            .latency_distribution
+            .as_ref()
+            .map(|d| d.p50_us as f64 / 1_000.0),
+        p95_write_latency_ms: result
+            .latency_distribution
+            .as_ref()
+            .map(|d| d.p95_us as f64 / 1_000.0),
+        p99_write_latency_ms: result
+            .latency_distribution
+            .as_ref()
+            .map(|d| d.p99_us as f64 / 1_000.0),
         max_buffer_occupancy: Some(
             result
                 .recorder_status
                 .occupancy
                 .max(result.preview_status.occupancy),
         ),
-        cpu_percent_avg: None,
-        memory_mb_max: None,
+        cpu_percent_avg: process_metrics.map(|m| m.cpu_percent_avg),
+        memory_mb_max: process_metrics.map(|m| m.memory_mb_max),
     }
 }
 
@@ -528,6 +546,9 @@ fn pipeline_benchmark_summary(
             pipeline.timing.wall_clock_seconds,
         ),
         max_write_latency_ms: None,
+        p50_write_latency_ms: None,
+        p95_write_latency_ms: None,
+        p99_write_latency_ms: None,
         max_buffer_occupancy: Some(
             pipeline
                 .recorder_status
@@ -612,6 +633,9 @@ fn simulator_benchmark_summary(
         byte_count: recording.byte_count,
         average_write_mb_s: average_write_mb_s(recording.byte_count, duration_seconds),
         max_write_latency_ms: None,
+        p50_write_latency_ms: None,
+        p95_write_latency_ms: None,
+        p99_write_latency_ms: None,
         max_buffer_occupancy: None,
         cpu_percent_avg: None,
         memory_mb_max: None,

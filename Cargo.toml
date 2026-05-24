@@ -3,6 +3,7 @@ members = [
     "crates/kv-buffer",
     "crates/kv-cli",
     "crates/kv-core",
+    "crates/kv-gui",
     "crates/kv-integrity",
     "crates/kv-recorder",
     "crates/kv-simulator",

@@ -176,6 +176,9 @@ fn writes_benchmark_summary_json() {
         byte_count: 24_576,
         average_write_mb_s: 3.84,
         max_write_latency_ms: None,
+        p50_write_latency_ms: None,
+        p95_write_latency_ms: None,
+        p99_write_latency_ms: None,
         max_buffer_occupancy: None,
         cpu_percent_avg: None,
         memory_mb_max: None,
@@ -377,8 +380,31 @@ fn streaming_recorder_tracks_write_latency() {
     let summary = recorder.finish().expect("finish");
 
     assert!(summary.max_write_latency_us.is_some());
+    assert!(summary.latency_distribution.is_some());
+    let dist = summary.latency_distribution.unwrap();
+    assert_eq!(dist.count, 5);
+    assert!(dist.min_us <= dist.p50_us);
+    assert!(dist.p50_us <= dist.p95_us);
+    assert!(dist.p95_us <= dist.p99_us);
+    assert!(dist.p99_us <= dist.max_us);
 
     cleanup_dir(&output_dir);
+}
+
+#[test]
+fn latency_distribution_computes_correct_percentiles() {
+    use kv_recorder::LatencyDistribution;
+
+    let samples: Vec<u64> = (1..=100).collect();
+    let dist = LatencyDistribution::from_samples(&samples).expect("distribution should exist");
+
+    assert_eq!(dist.count, 100);
+    assert_eq!(dist.min_us, 1);
+    assert_eq!(dist.max_us, 100);
+    assert_eq!(dist.mean_us, 50);
+    assert_eq!(dist.p50_us, 50);
+    assert_eq!(dist.p95_us, 95);
+    assert_eq!(dist.p99_us, 99);
 }
 
 #[test]

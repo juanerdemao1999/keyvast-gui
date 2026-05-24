@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
 use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
-use kv_recorder::{RecorderError, RecordingSummary, StreamingRecorder};
+use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
 use kv_types::{DeviceConfig, SampleBlock};
 
 use crate::AcquisitionSource;
@@ -63,6 +63,7 @@ pub struct StreamingPipelineResult {
     pub recorder_status: ConsumerBufferStatus,
     pub preview_status: ConsumerBufferStatus,
     pub max_write_latency_us: Option<u64>,
+    pub latency_distribution: Option<LatencyDistribution>,
 }
 
 /// Errors from the threaded pipeline.
@@ -369,6 +370,7 @@ where
         recorder_status,
         preview_status,
         max_write_latency_us: streaming_summary.max_write_latency_us,
+        latency_distribution: streaming_summary.latency_distribution,
     })
 }
 

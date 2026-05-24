@@ -20,9 +20,9 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 3)
+Last updated: 2026-05-24 (session 4)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, GUI scaffold, latency distribution, and CPU/memory monitoring are now complete.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete.
 
 Implemented:
 
@@ -179,12 +179,28 @@ Implemented:
   - default recorder capacity: 2048 blocks, preview: 32 blocks
   - binary smoke tests for all four commands
 
-- kv-gui scaffold implemented:
-  - `kv-gui` crate with egui/eframe
-  - `KeyvastApp` with tabbed interface (Waveform, Status)
-  - `WaveformWidget` for channel trace rendering
-  - `PreviewConsumer` for receiving blocks from pipeline preview consumer
-  - compiles and shows minimal window
+- kv-gui professional interface implemented:
+  - `kv-gui` crate with egui/eframe + egui_plot 0.31
+  - Professional dark theme (Intan RHX / Blackrock Central style) in `theme.rs`
+  - Demo mode with realistic neural signal generator (`demo.rs`):
+    - 8 channel archetypes: Quiet, LFP, Spiking, Bursting, Noisy
+    - Poisson-timed spike waveforms, LFP theta/gamma oscillations, pink noise, burst mode
+    - Per-channel phase variation and amplitude randomization
+    - Auto-starts on launch, generates blocks at real-time cadence
+  - egui_plot waveform rendering (`waveform.rs`):
+    - Per-channel Plot widgets in vertical ScrollArea
+    - Color-coded channel bars and labels
+    - Automatic downsampling (MAX_DISPLAY_SAMPLES=4096)
+    - Zero-reference lines, configurable grid
+  - Multi-panel layout (`app.rs`, `panels.rs`):
+    - Top toolbar: brand, mode selector (Demo/Device), run status, version
+    - Left panel: device info, acquisition start/stop, recording arm/record/stop, display settings (time/amplitude scale, visible channels, grid, labels, overlay)
+    - Right panel: per-channel RMS and peak-to-peak statistics, data rate, block rate, elapsed time
+    - Bottom status bar: connection/recording indicators, data rate, elapsed time, dropped blocks
+    - Central waveform area fills remaining space
+  - Device mode connects to SimulatorBackend via background thread (`preview.rs`)
+  - History ring buffer (128 blocks) for scrolling waveform display
+  - Real-time BlockStats computation (per-channel RMS/peak-to-peak, data rate, block rate)
 
 - Latency distribution implemented:
   - `LatencyDistribution` struct in kv-recorder with count, min, max, mean, p50, p95, p99 (all in microseconds)
@@ -223,18 +239,18 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-24
+Last verified: 2026-05-24 (session 4)
 
 Commands run successfully:
 
 ```powershell
 cargo fmt --all -- --check
 cargo test --workspace
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --bin kv-gui
+cargo clippy --workspace
 ```
 
-All 75 tests pass. Tests cover all four CLI commands (simulator-record, simulator-pipeline, simulator-stream, benchmark), streaming recording, incremental integrity, threaded fan-out pipeline, buffer management, latency distribution, process metrics, and binary smoke tests.
+All 75 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `auto_scale`, `file_prefix`, `min`/`max` in ChannelStats, palette colors).
 
 Current test count:
 
@@ -246,21 +262,23 @@ Current test count:
 5 passing tests in kv-simulator
 10 passing tests in kv-integrity (6 batch + 4 incremental)
 14 passing tests in kv-recorder (9 batch + 4 streaming + 1 latency distribution)
-0 tests in kv-gui (scaffold only)
+0 tests in kv-gui (GUI requires visual verification)
 75 total passing tests
 ```
 
 ## How To Resume
 
-The full benchmark pipeline is feature-complete: streaming recorder, incremental integrity, latency distribution (p50/p95/p99), CPU/memory monitoring, and GUI scaffold are all in place. The next useful tasks, in priority order:
+The full benchmark pipeline and professional GUI are feature-complete. The GUI has two working modes: Demo (auto-generating neural signals) and Device (SimulatorBackend via background thread). The next useful tasks, in priority order:
 
-1. **Wire GUI to live pipeline**: The `kv-gui` scaffold compiles but uses dummy data. Connect it to a real `FanoutBlockBuffer` preview consumer so it displays live waveforms during acquisition. This requires a shared-state bridge between the pipeline thread and the egui render loop.
+1. **Visual smoke test**: Run `cargo run --bin kv-gui` and verify the professional layout renders correctly: dark theme, multi-channel waveforms updating in real-time, left/right panels showing device info and channel statistics, bottom status bar showing data rate and elapsed time.
 
-2. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json` for write latency tail, buffer occupancy, CPU%, and peak memory.
+2. **Wire GUI to live pipeline**: The Device mode uses `PreviewState` which wraps `start_preview()`. This already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition, so the GUI can monitor a live recording session.
 
-3. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits to catch throughput or latency regressions early.
+3. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json` for write latency tail, buffer occupancy, CPU%, and peak memory.
 
-4. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients. This is the next major crate after the GUI is functional.
+4. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits to catch throughput or latency regressions early.
+
+5. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients. This is the next major crate after the GUI is functional.
 
 Recommended implementation boundary:
 

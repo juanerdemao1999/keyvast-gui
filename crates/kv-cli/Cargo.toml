@@ -1,0 +1,15 @@
+[package]
+name = "kv-cli"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kv-core = { path = "../kv-core" }
+kv-integrity = { path = "../kv-integrity" }
+kv-recorder = { path = "../kv-recorder" }
+kv-simulator = { path = "../kv-simulator" }
+kv-types = { path = "../kv-types" }
+
+[[bin]]
+name = "kv-acq"
+path = "src/main.rs"

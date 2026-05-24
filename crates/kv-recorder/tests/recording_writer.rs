@@ -1,0 +1,283 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use kv_recorder::{
+    BenchmarkSummary, RecorderError, write_benchmark_summary, write_integrity_summary,
+    write_log_file, write_recording,
+};
+use kv_simulator::{SimulatorBackend, SimulatorConfig};
+use kv_types::{
+    AcquisitionEvent, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, IntegritySummary,
+    SampleBlock,
+};
+
+#[test]
+fn writes_simulator_blocks_to_kvraw_with_expected_byte_count() {
+    let output_dir = unique_output_dir("byte-count");
+    let blocks = next_simulator_blocks(3);
+
+    let summary = write_recording(&output_dir, &blocks).expect("recording should write");
+
+    assert_eq!(summary.block_count, 3);
+    assert_eq!(summary.written_samples, 3 * samples_per_block());
+    assert_eq!(summary.byte_count, 3 * samples_per_block() * 2);
+    assert_eq!(
+        fs::metadata(output_dir.join("recording.kvraw"))
+            .expect("raw file metadata")
+            .len(),
+        3 * samples_per_block() * 2
+    );
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_i16_samples_as_little_endian_interleaved_bytes() {
+    let output_dir = unique_output_dir("little-endian");
+    let block = sample_block(0, 0, 2, 2, vec![0x0102, -2, 0x0304, -32768]);
+
+    write_recording(&output_dir, &[block]).expect("recording should write");
+
+    let raw = fs::read(output_dir.join("recording.kvraw")).expect("raw bytes");
+    assert_eq!(raw, vec![0x02, 0x01, 0xfe, 0xff, 0x04, 0x03, 0x00, 0x80]);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_minimal_recording_metadata() {
+    let output_dir = unique_output_dir("metadata");
+    let blocks = next_simulator_blocks(2);
+
+    write_recording(&output_dir, &blocks).expect("recording should write");
+
+    let metadata = fs::read_to_string(output_dir.join("recording.json")).expect("metadata json");
+    assert!(metadata.contains("\"format\": \"kvraw\""));
+    assert!(metadata.contains("\"format_version\": 1"));
+    assert!(metadata.contains("\"device_id\": \"simulator-0\""));
+    assert!(metadata.contains("\"backend\": \"simulator\""));
+    assert!(metadata.contains("\"sample_rate\": 30000.0"));
+    assert!(metadata.contains("\"channel_count\": 64"));
+    assert!(metadata.contains("\"samples_per_packet\": 64"));
+    assert!(metadata.contains("\"sample_type\": \"i16\""));
+    assert!(metadata.contains("\"endianness\": \"little\""));
+    assert!(metadata.contains("\"layout\": \"interleaved_by_sample\""));
+    assert!(metadata.contains("\"first_packet_id\": 0"));
+    assert!(metadata.contains("\"last_packet_id\": 1"));
+    assert!(metadata.contains("\"written_samples\": 8192"));
+    assert!(metadata.contains("\"clean_stop\": true"));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_machine_readable_integrity_summary() {
+    let output_dir = unique_output_dir("integrity-summary");
+    let summary = IntegritySummary {
+        expected_packets: 4,
+        observed_packets: 3,
+        missing_packets: 1,
+        crc_errors: 0,
+        timestamp_discontinuities: 1,
+        buffer_overflows: 2,
+        expected_samples: 16_384,
+        written_samples: 12_288,
+    };
+
+    let integrity_path =
+        write_integrity_summary(&output_dir, &summary).expect("integrity summary should write");
+
+    assert_eq!(integrity_path, output_dir.join("integrity.json"));
+    let integrity_json = fs::read_to_string(integrity_path).expect("integrity json");
+    assert!(integrity_json.contains("\"expected_packets\": 4"));
+    assert!(integrity_json.contains("\"observed_packets\": 3"));
+    assert!(integrity_json.contains("\"missing_packets\": 1"));
+    assert!(integrity_json.contains("\"crc_errors\": 0"));
+    assert!(integrity_json.contains("\"timestamp_discontinuities\": 1"));
+    assert!(integrity_json.contains("\"buffer_overflows\": 2"));
+    assert!(integrity_json.contains("\"expected_samples\": 16384"));
+    assert!(integrity_json.contains("\"written_samples\": 12288"));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_human_readable_log_file() {
+    let output_dir = unique_output_dir("log-file");
+    let lines = vec![
+        "[INFO] acquisition started".to_string(),
+        "[WARN] missing packet expected=1 observed=2 missing=1".to_string(),
+        "[INFO] acquisition stopped cleanly".to_string(),
+    ];
+
+    let log_path = write_log_file(&output_dir, &lines).expect("log file should write");
+
+    assert_eq!(log_path, output_dir.join("log.txt"));
+    let log = fs::read_to_string(log_path).expect("log file");
+    assert_eq!(
+        log,
+        "[INFO] acquisition started\n[WARN] missing packet expected=1 observed=2 missing=1\n[INFO] acquisition stopped cleanly\n"
+    );
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_events_csv_file() {
+    let output_dir = unique_output_dir("events-csv");
+    let events = vec![
+        AcquisitionEvent::Started {
+            timestamp_host_ms: 0,
+        },
+        AcquisitionEvent::PacketMissing {
+            expected_packet_id: 1,
+            observed_packet_id: 2,
+            missing_count: 1,
+        },
+        AcquisitionEvent::Stopped {
+            timestamp_host_ms: 10,
+        },
+    ];
+
+    let events_path =
+        kv_recorder::write_events_csv(&output_dir, &events).expect("events csv should write");
+
+    assert_eq!(events_path, output_dir.join("events.csv"));
+    let events_csv = fs::read_to_string(events_path).expect("events csv");
+    assert_eq!(
+        events_csv,
+        concat!(
+            "host_time_ms,timestamp_start,event_type,value,message\n",
+            "0,,started,,\n",
+            ",,packet_missing,1,expected_packet_id=1 observed_packet_id=2\n",
+            "10,,stopped,,\n"
+        )
+    );
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn writes_benchmark_summary_json() {
+    let output_dir = unique_output_dir("benchmark-json");
+    let summary = BenchmarkSummary {
+        measurement_kind: "simulator_estimate".to_string(),
+        duration_seconds: 0.0064,
+        channel_count: 64,
+        sample_rate: 30_000.0,
+        expected_samples: 16_384,
+        written_samples: 12_288,
+        missing_packets: 1,
+        crc_errors: 0,
+        timestamp_discontinuities: 1,
+        byte_count: 24_576,
+        average_write_mb_s: 3.84,
+        max_write_latency_ms: None,
+        max_buffer_occupancy: None,
+        cpu_percent_avg: None,
+        memory_mb_max: None,
+    };
+
+    let benchmark_path =
+        write_benchmark_summary(&output_dir, &summary).expect("benchmark summary should write");
+
+    assert_eq!(benchmark_path, output_dir.join("benchmark.json"));
+    let benchmark = fs::read_to_string(benchmark_path).expect("benchmark json");
+    assert!(benchmark.contains("\"measurement_kind\": \"simulator_estimate\""));
+    assert!(benchmark.contains("\"duration_seconds\": 0.006400"));
+    assert!(benchmark.contains("\"channel_count\": 64"));
+    assert!(benchmark.contains("\"sample_rate\": 30000.0"));
+    assert!(benchmark.contains("\"expected_samples\": 16384"));
+    assert!(benchmark.contains("\"written_samples\": 12288"));
+    assert!(benchmark.contains("\"missing_packets\": 1"));
+    assert!(benchmark.contains("\"byte_count\": 24576"));
+    assert!(benchmark.contains("\"average_write_mb_s\": 3.840000"));
+    assert!(benchmark.contains("\"max_write_latency_ms\": null"));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn invalid_block_is_rejected_before_files_are_written() {
+    let output_dir = unique_output_dir("invalid");
+    let mut block = sample_block(0, 0, 2, 2, vec![1, 2, 3, 4]);
+    block.data.pop();
+
+    let error = write_recording(&output_dir, &[block]).expect_err("invalid block should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InvalidBlock { packet_id: 0, .. }
+    ));
+    assert!(!output_dir.join("recording.kvraw").exists());
+    assert!(!output_dir.join("recording.json").exists());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn output_path_errors_are_returned_to_the_caller() {
+    let output_path = unique_output_dir("path-error");
+    fs::create_dir_all(output_path.parent().expect("parent")).expect("parent dir");
+    fs::write(&output_path, b"not a directory").expect("marker file");
+
+    let error = write_recording(&output_path, &next_simulator_blocks(1))
+        .expect_err("file path should not be usable as output directory");
+
+    assert!(matches!(error, RecorderError::Io { .. }));
+    fs::remove_file(&output_path).expect("cleanup marker file");
+}
+
+fn next_simulator_blocks(count: usize) -> Vec<SampleBlock> {
+    let mut simulator =
+        SimulatorBackend::new(SimulatorConfig::default()).expect("valid simulator config");
+
+    (0..count)
+        .map(|_| simulator.next_block().expect("simulator block"))
+        .collect()
+}
+
+fn sample_block(
+    packet_id: u64,
+    timestamp_start: u64,
+    channel_count: usize,
+    samples_per_channel: usize,
+    data: Vec<i16>,
+) -> SampleBlock {
+    SampleBlock {
+        device_id: "simulator-0".to_string(),
+        stream_id: 0,
+        packet_id,
+        timestamp_start,
+        sample_rate: 30_000.0,
+        channel_count,
+        samples_per_channel,
+        ttl_bits: 0,
+        data,
+    }
+}
+
+fn samples_per_block() -> u64 {
+    (DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64
+}
+
+fn unique_output_dir(name: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+
+    Path::new("target")
+        .join("test-runs")
+        .join("kv-recorder")
+        .join(format!("{name}-{nonce}"))
+}
+
+fn cleanup_dir(path: &Path) {
+    if path.exists() {
+        fs::remove_dir_all(path).expect("cleanup test directory");
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "kv-integrity"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kv-types = { path = "../kv-types" }
+
+[dev-dependencies]
+kv-simulator = { path = "../kv-simulator" }

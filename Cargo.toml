@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "crates/kv-buffer",
+    "crates/kv-cli",
+    "crates/kv-core",
+    "crates/kv-integrity",
+    "crates/kv-recorder",
+    "crates/kv-simulator",
+    "crates/kv-types",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"

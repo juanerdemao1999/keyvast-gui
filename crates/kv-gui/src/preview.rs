@@ -67,6 +67,36 @@ impl Drop for PreviewHandle {
     }
 }
 
+/// Compute BlockStats from a single block (used by demo mode).
+pub fn compute_block_stats(
+    block: &SampleBlock,
+    total_blocks: u64,
+    elapsed_seconds: f64,
+) -> BlockStats {
+    let channel_stats = compute_channel_stats(block);
+    let total_samples = total_blocks * (block.samples_per_channel * block.channel_count) as u64;
+    let bytes_total = total_samples * 2;
+    let data_rate_mb_s = if elapsed_seconds > 0.0 {
+        bytes_total as f64 / elapsed_seconds / 1_000_000.0
+    } else {
+        0.0
+    };
+    let block_rate_hz = if elapsed_seconds > 0.0 {
+        total_blocks as f64 / elapsed_seconds
+    } else {
+        0.0
+    };
+    BlockStats {
+        channels: channel_stats,
+        data_rate_mb_s,
+        block_rate_hz,
+        total_blocks,
+        total_samples,
+        elapsed_seconds,
+        dropped_blocks: 0,
+    }
+}
+
 /// Compute per-channel statistics from a SampleBlock.
 fn compute_channel_stats(block: &SampleBlock) -> Vec<ChannelStats> {
     let ch_count = block.channel_count;

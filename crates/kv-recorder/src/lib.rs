@@ -536,6 +536,238 @@ fn format_optional_metric(value: Option<f64>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
+/// Incremental recorder that writes sample blocks to disk one at a time.
+///
+/// Opens the raw data file on creation and appends each block as it arrives.
+/// Call `finish()` to flush, write metadata, and get the final summary.
+pub struct StreamingRecorder {
+    output_dir: PathBuf,
+    raw_path: PathBuf,
+    writer: BufWriter<File>,
+    block_count: u64,
+    written_samples: u64,
+    byte_count: u64,
+    first_packet_id: Option<u64>,
+    last_packet_id: Option<u64>,
+    device_id: Option<String>,
+    sample_rate: Option<f64>,
+    channel_count: Option<usize>,
+    samples_per_packet: Option<usize>,
+    write_latencies_us: Vec<u64>,
+}
+
+impl StreamingRecorder {
+    pub fn new(output_dir: impl AsRef<Path>) -> Result<Self, RecorderError> {
+        let output_dir = output_dir.as_ref().to_path_buf();
+        fs::create_dir_all(&output_dir).map_err(|source| RecorderError::Io {
+            path: output_dir.clone(),
+            source,
+        })?;
+
+        let raw_path = output_dir.join("recording.kvraw");
+        let file = File::create(&raw_path).map_err(|source| RecorderError::Io {
+            path: raw_path.clone(),
+            source,
+        })?;
+
+        Ok(Self {
+            output_dir,
+            raw_path,
+            writer: BufWriter::new(file),
+            block_count: 0,
+            written_samples: 0,
+            byte_count: 0,
+            first_packet_id: None,
+            last_packet_id: None,
+            device_id: None,
+            sample_rate: None,
+            channel_count: None,
+            samples_per_packet: None,
+            write_latencies_us: Vec::new(),
+        })
+    }
+
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
+
+    /// Write one block, validating consistency and appending raw samples.
+    pub fn write_block(&mut self, block: &SampleBlock) -> Result<(), RecorderError> {
+        block
+            .validate()
+            .map_err(|source| RecorderError::InvalidBlock {
+                packet_id: block.packet_id,
+                source,
+            })?;
+
+        self.check_consistency(block)?;
+
+        let start = std::time::Instant::now();
+
+        for sample in &block.data {
+            self.writer
+                .write_all(&sample.to_le_bytes())
+                .map_err(|source| RecorderError::Io {
+                    path: self.raw_path.clone(),
+                    source,
+                })?;
+        }
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.write_latencies_us.push(elapsed_us);
+
+        let sample_values = block.data.len() as u64;
+        self.block_count = self.block_count.saturating_add(1);
+        self.written_samples = self.written_samples.saturating_add(sample_values);
+        self.byte_count = self
+            .byte_count
+            .saturating_add(sample_values.saturating_mul(2));
+
+        if self.first_packet_id.is_none() {
+            self.first_packet_id = Some(block.packet_id);
+        }
+        self.last_packet_id = Some(block.packet_id);
+
+        Ok(())
+    }
+
+    /// Flush raw data, write metadata, return summary.
+    pub fn finish(mut self) -> Result<StreamingRecordingSummary, RecorderError> {
+        self.writer.flush().map_err(|source| RecorderError::Io {
+            path: self.raw_path.clone(),
+            source,
+        })?;
+
+        let metadata_path = self.output_dir.join("recording.json");
+        let metadata = self.streaming_metadata_json();
+        fs::write(&metadata_path, metadata).map_err(|source| RecorderError::Io {
+            path: metadata_path.clone(),
+            source,
+        })?;
+
+        let max_write_latency_us = self.write_latencies_us.iter().copied().max();
+
+        Ok(StreamingRecordingSummary {
+            recording: RecordingSummary {
+                output_dir: self.output_dir,
+                raw_path: self.raw_path,
+                metadata_path,
+                block_count: self.block_count,
+                written_samples: self.written_samples,
+                byte_count: self.byte_count,
+                first_packet_id: self.first_packet_id,
+                last_packet_id: self.last_packet_id,
+            },
+            max_write_latency_us,
+        })
+    }
+
+    fn check_consistency(&mut self, block: &SampleBlock) -> Result<(), RecorderError> {
+        if let Some(ref device_id) = self.device_id {
+            if block.device_id != *device_id {
+                return Err(RecorderError::InconsistentBlockConfig {
+                    packet_id: block.packet_id,
+                    field: "device_id",
+                });
+            }
+        } else {
+            self.device_id = Some(block.device_id.clone());
+        }
+
+        if let Some(sample_rate) = self.sample_rate {
+            if block.sample_rate != sample_rate {
+                return Err(RecorderError::InconsistentBlockConfig {
+                    packet_id: block.packet_id,
+                    field: "sample_rate",
+                });
+            }
+        } else {
+            self.sample_rate = Some(block.sample_rate);
+        }
+
+        if let Some(channel_count) = self.channel_count {
+            if block.channel_count != channel_count {
+                return Err(RecorderError::InconsistentBlockConfig {
+                    packet_id: block.packet_id,
+                    field: "channel_count",
+                });
+            }
+        } else {
+            self.channel_count = Some(block.channel_count);
+        }
+
+        if let Some(samples_per_packet) = self.samples_per_packet {
+            if block.samples_per_channel != samples_per_packet {
+                return Err(RecorderError::InconsistentBlockConfig {
+                    packet_id: block.packet_id,
+                    field: "samples_per_channel",
+                });
+            }
+        } else {
+            self.samples_per_packet = Some(block.samples_per_channel);
+        }
+
+        Ok(())
+    }
+
+    fn streaming_metadata_json(&self) -> String {
+        let Some(ref device_id) = self.device_id else {
+            return empty_recording_metadata_json();
+        };
+
+        format!(
+            concat!(
+                "{{\n",
+                "  \"format\": \"kvraw\",\n",
+                "  \"format_version\": 1,\n",
+                "  \"device_id\": \"{}\",\n",
+                "  \"backend\": \"simulator\",\n",
+                "  \"sample_rate\": {},\n",
+                "  \"channel_count\": {},\n",
+                "  \"samples_per_packet\": {},\n",
+                "  \"sample_type\": \"i16\",\n",
+                "  \"endianness\": \"little\",\n",
+                "  \"layout\": \"interleaved_by_sample\",\n",
+                "  \"first_packet_id\": {},\n",
+                "  \"last_packet_id\": {},\n",
+                "  \"written_samples\": {},\n",
+                "  \"clean_stop\": true\n",
+                "}}\n"
+            ),
+            escape_json_string(device_id),
+            format_sample_rate(self.sample_rate.unwrap_or(0.0)),
+            self.channel_count.unwrap_or(0),
+            self.samples_per_packet.unwrap_or(0),
+            self.first_packet_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.last_packet_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.written_samples
+        )
+    }
+}
+
+impl fmt::Debug for StreamingRecorder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StreamingRecorder")
+            .field("output_dir", &self.output_dir)
+            .field("block_count", &self.block_count)
+            .field("written_samples", &self.written_samples)
+            .field("byte_count", &self.byte_count)
+            .finish()
+    }
+}
+
+/// Summary returned by `StreamingRecorder::finish()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingRecordingSummary {
+    pub recording: RecordingSummary,
+    pub max_write_latency_us: Option<u64>,
+}
+
 fn escape_json_string(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
 

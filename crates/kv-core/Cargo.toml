@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kv-buffer = { path = "../kv-buffer" }
 kv-integrity = { path = "../kv-integrity" }
+kv-recorder = { path = "../kv-recorder" }
 kv-types = { path = "../kv-types" }
 
 [dev-dependencies]

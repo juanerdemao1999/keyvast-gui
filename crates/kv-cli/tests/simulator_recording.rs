@@ -6,10 +6,11 @@ use std::{
 };
 
 use kv_cli::{
-    CliCommand, CliError, SimulatorPipelineOptions, SimulatorRecordingOptions, parse_args,
-    run_directory_name_utc, run_simulator_pipeline, run_simulator_recording,
+    BenchmarkOptions, CliCommand, CliError, SimulatorPipelineOptions, SimulatorRecordingOptions,
+    blocks_for_duration, parse_args, run_benchmark, run_directory_name_utc, run_simulator_pipeline,
+    run_simulator_recording, run_simulator_stream,
 };
-use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET};
+use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET};
 
 #[test]
 fn simulator_recording_writes_raw_metadata_and_integrity_summary() {
@@ -282,6 +283,249 @@ fn kv_acq_binary_runs_simulator_pipeline_command() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("measurement_kind=measured"));
     assert!(stdout.contains("wall_clock_seconds="));
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("benchmark.json").exists());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn simulator_stream_writes_all_output_files_with_streaming_benchmark() {
+    let output_dir = unique_output_dir("stream-clean");
+    let result = run_simulator_stream(SimulatorPipelineOptions {
+        output_dir: output_dir.clone(),
+        blocks: 4,
+        drop_packet_ids: Vec::new(),
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+    })
+    .expect("simulator stream should succeed");
+
+    let expected_samples = (4 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
+    let expected_bytes = expected_samples * 2;
+
+    assert_eq!(result.recording.byte_count, expected_bytes);
+    assert_eq!(result.integrity.summary.observed_packets, 4);
+    assert_eq!(result.integrity.summary.missing_packets, 0);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+    assert_eq!(result.recorder_dropped_blocks, 0);
+
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("recording.json").exists());
+    assert!(output_dir.join("integrity.json").exists());
+    assert!(output_dir.join("log.txt").exists());
+    assert!(output_dir.join("events.csv").exists());
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark json should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"measured_streaming\""));
+    assert!(benchmark.contains("\"channel_count\": 64"));
+    assert!(benchmark.contains(&format!("\"written_samples\": {expected_samples}")));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn simulator_stream_detects_packet_loss() {
+    let output_dir = unique_output_dir("stream-loss");
+    let result = run_simulator_stream(SimulatorPipelineOptions {
+        output_dir: output_dir.clone(),
+        blocks: 4,
+        drop_packet_ids: vec![1],
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+    })
+    .expect("simulator stream with packet loss should succeed");
+
+    assert_eq!(result.integrity.summary.missing_packets, 1);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+
+    let integrity = fs::read_to_string(output_dir.join("integrity.json"))
+        .expect("integrity summary should be readable");
+    assert!(integrity.contains("\"missing_packets\": 1"));
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark json should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"measured_streaming\""));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kv_acq_binary_runs_simulator_stream_command() {
+    let output_dir = unique_output_dir("binary-stream");
+    let binary = env!("CARGO_BIN_EXE_kv-acq");
+
+    let output = Command::new(binary)
+        .arg("simulator-stream")
+        .arg("--blocks")
+        .arg("3")
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .expect("kv-acq should run");
+
+    assert!(
+        output.status.success(),
+        "kv-acq simulator-stream failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("measurement_kind=measured_streaming"));
+    assert!(stdout.contains("wall_clock_seconds="));
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("benchmark.json").exists());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn blocks_for_duration_computes_correct_block_count() {
+    // 10 seconds at 30 kHz with 64 samples per packet → 10 / (64/30000) = 4687.5 → ceil = 4688
+    let blocks = blocks_for_duration(10.0, 30_000.0, 64);
+    assert_eq!(blocks, 4688);
+
+    // Edge case: zero duration
+    assert_eq!(blocks_for_duration(0.0, 30_000.0, 64), 0);
+
+    // Exact multiple: 1 second at 1000 Hz with 100 samples per packet → 10 blocks
+    assert_eq!(blocks_for_duration(1.0, 1000.0, 100), 10);
+}
+
+#[test]
+fn benchmark_smoke_preset_runs_short_duration() {
+    let output_dir = unique_output_dir("bench-smoke");
+    // Use a very short custom duration (0.01s) to keep the test fast
+    let result = run_benchmark(BenchmarkOptions {
+        output_dir: output_dir.clone(),
+        duration_seconds: 0.01,
+        channel_count: DEFAULT_CHANNEL_COUNT,
+        sample_rate: DEFAULT_SAMPLE_RATE,
+        samples_per_packet: DEFAULT_SAMPLES_PER_PACKET,
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+        drop_packet_ids: Vec::new(),
+    })
+    .expect("benchmark should succeed");
+
+    assert!(result.computed_block_count > 0);
+    assert_eq!(result.requested_duration_seconds, 0.01);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+    assert_eq!(result.integrity.summary.missing_packets, 0);
+    assert_eq!(result.recorder_dropped_blocks, 0);
+
+    assert!(output_dir.join("recording.kvraw").exists());
+    assert!(output_dir.join("integrity.json").exists());
+    assert!(output_dir.join("benchmark.json").exists());
+    assert!(output_dir.join("log.txt").exists());
+    assert!(output_dir.join("events.csv").exists());
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark json should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"measured_streaming\""));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn benchmark_detects_injected_packet_loss() {
+    let output_dir = unique_output_dir("bench-loss");
+    let result = run_benchmark(BenchmarkOptions {
+        output_dir: output_dir.clone(),
+        duration_seconds: 0.01,
+        channel_count: DEFAULT_CHANNEL_COUNT,
+        sample_rate: DEFAULT_SAMPLE_RATE,
+        samples_per_packet: DEFAULT_SAMPLES_PER_PACKET,
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+        drop_packet_ids: vec![2],
+    })
+    .expect("benchmark with packet loss should succeed");
+
+    assert_eq!(result.integrity.summary.missing_packets, 1);
+
+    let integrity = fs::read_to_string(output_dir.join("integrity.json"))
+        .expect("integrity summary should be readable");
+    assert!(integrity.contains("\"missing_packets\": 1"));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn benchmark_parse_preset_smoke() {
+    let command = parse_args(["benchmark", "--preset", "smoke", "--output", "test-dir"])
+        .expect("args should parse");
+
+    let CliCommand::Benchmark(options) = command else {
+        panic!("expected Benchmark command");
+    };
+    assert_eq!(options.duration_seconds, 10.0);
+    assert_eq!(options.channel_count, DEFAULT_CHANNEL_COUNT);
+}
+
+#[test]
+fn benchmark_parse_preset_stress_128_overrides_channels() {
+    let command = parse_args([
+        "benchmark",
+        "--preset",
+        "stress-128",
+        "--output",
+        "test-dir",
+    ])
+    .expect("args should parse");
+
+    let CliCommand::Benchmark(options) = command else {
+        panic!("expected Benchmark command");
+    };
+    assert_eq!(options.duration_seconds, 600.0);
+    assert_eq!(options.channel_count, 128);
+}
+
+#[test]
+fn benchmark_parse_custom_duration_and_channels() {
+    let command = parse_args([
+        "benchmark",
+        "--duration",
+        "30",
+        "--channels",
+        "256",
+        "--output",
+        "test-dir",
+    ])
+    .expect("args should parse");
+
+    let CliCommand::Benchmark(options) = command else {
+        panic!("expected Benchmark command");
+    };
+    assert_eq!(options.duration_seconds, 30.0);
+    assert_eq!(options.channel_count, 256);
+}
+
+#[test]
+fn kv_acq_binary_runs_benchmark_command() {
+    let output_dir = unique_output_dir("binary-benchmark");
+    let binary = env!("CARGO_BIN_EXE_kv-acq");
+
+    let output = Command::new(binary)
+        .arg("benchmark")
+        .arg("--duration")
+        .arg("0.01")
+        .arg("--output")
+        .arg(&output_dir)
+        .output()
+        .expect("kv-acq should run");
+
+    assert!(
+        output.status.success(),
+        "kv-acq benchmark failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("measurement_kind=measured_streaming"));
+    assert!(stdout.contains("wall_clock_seconds="));
+    assert!(stdout.contains("computed_block_count="));
     assert!(output_dir.join("recording.kvraw").exists());
     assert!(output_dir.join("benchmark.json").exists());
 

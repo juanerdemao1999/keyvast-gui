@@ -1,4 +1,10 @@
-use kv_core::pipeline::{PipelineConfig, PipelineError, run_threaded_pipeline};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use kv_core::pipeline::{
+    PipelineConfig, PipelineError, StreamingPipelineConfig, run_streaming_pipeline,
+    run_threaded_pipeline,
+};
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, DeviceConfig, SampleBlock};
 
@@ -130,4 +136,107 @@ fn make_source(
     mut simulator: SimulatorBackend,
 ) -> impl FnMut() -> Result<SampleBlock, String> + Send + 'static {
     move || simulator.next_block().map_err(|e| e.to_string())
+}
+
+// --- Streaming pipeline tests ---
+
+fn streaming_config(requested_blocks: usize, output_dir: PathBuf) -> StreamingPipelineConfig {
+    StreamingPipelineConfig {
+        device: DeviceConfig::simulator_default(),
+        requested_blocks,
+        output_dir,
+        recorder_capacity_blocks: 128,
+        preview_capacity_blocks: 16,
+    }
+}
+
+fn unique_output_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_nanos();
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("test-output")
+        .join(format!("{name}-{}-{nanos}", std::process::id()))
+}
+
+fn cleanup_dir(path: &Path) {
+    if path.exists() {
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+}
+
+#[test]
+fn streaming_pipeline_writes_blocks_to_disk() {
+    let output_dir = unique_output_dir("stream-basic");
+    let config = streaming_config(8, output_dir.clone());
+    let source = make_source(SimulatorBackend::default());
+
+    let result =
+        run_streaming_pipeline(&config, source).expect("streaming pipeline should succeed");
+
+    assert_eq!(result.recording.block_count, 8);
+    assert_eq!(result.integrity.summary.observed_packets, 8);
+    assert_eq!(result.integrity.summary.missing_packets, 0);
+    assert!(result.timing.wall_clock_seconds > 0.0);
+
+    let expected_samples = (8 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
+    assert_eq!(result.recording.written_samples, expected_samples);
+
+    let raw_size = std::fs::metadata(output_dir.join("recording.kvraw"))
+        .expect("raw file")
+        .len();
+    assert_eq!(raw_size, expected_samples * 2);
+
+    assert!(output_dir.join("recording.json").exists());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_pipeline_detects_packet_gaps() {
+    let output_dir = unique_output_dir("stream-gap");
+    let config = streaming_config(4, output_dir.clone());
+    let simulator_config = SimulatorConfig {
+        drop_packet_ids: vec![2],
+        ..SimulatorConfig::default()
+    };
+    let simulator = SimulatorBackend::new(simulator_config).expect("valid config");
+    let source = make_source(simulator);
+
+    let result = run_streaming_pipeline(&config, source).expect("pipeline should succeed");
+
+    assert_eq!(result.integrity.summary.missing_packets, 1);
+    assert_eq!(result.integrity.packet_gaps.len(), 1);
+    assert_eq!(result.integrity.packet_gaps[0].expected_packet_id, 2);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_pipeline_reports_write_latency() {
+    let output_dir = unique_output_dir("stream-latency");
+    let config = streaming_config(5, output_dir.clone());
+    let source = make_source(SimulatorBackend::default());
+
+    let result = run_streaming_pipeline(&config, source).expect("pipeline should succeed");
+
+    assert!(result.max_write_latency_us.is_some());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_pipeline_recorder_has_zero_drops_with_large_buffer() {
+    let output_dir = unique_output_dir("stream-no-drop");
+    let config = streaming_config(10, output_dir.clone());
+    let source = make_source(SimulatorBackend::default());
+
+    let result = run_streaming_pipeline(&config, source).expect("pipeline should succeed");
+
+    assert_eq!(result.recorder_status.dropped_blocks, 0);
+    assert_eq!(result.recorder_status.pushed_blocks, 10);
+
+    cleanup_dir(&output_dir);
 }

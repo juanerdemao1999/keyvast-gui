@@ -161,3 +161,129 @@ fn expected_missing_samples(blocks: &[SampleBlock], gap: &PacketGap) -> u64 {
         .unwrap_or_default()
         .saturating_mul(gap.missing_count)
 }
+
+/// Incremental integrity checker that processes blocks one at a time.
+///
+/// Tracks packet continuity, timestamp continuity, and sample counts without
+/// holding all blocks in memory.
+#[derive(Debug, Clone)]
+pub struct IncrementalIntegrity {
+    report: IntegrityReport,
+    previous_packet_id: Option<u64>,
+    previous_timestamp_after_block: Option<u64>,
+    previous_samples_per_block: Option<u64>,
+}
+
+impl IncrementalIntegrity {
+    pub fn new() -> Self {
+        Self {
+            report: IntegrityReport {
+                summary: IntegritySummary::default(),
+                packet_gaps: Vec::new(),
+                timestamp_discontinuities: Vec::new(),
+            },
+            previous_packet_id: None,
+            previous_timestamp_after_block: None,
+            previous_samples_per_block: None,
+        }
+    }
+
+    /// Feed one block into the checker. Returns an error only for fatal
+    /// conditions (invalid block data, backwards packet IDs).
+    pub fn push(&mut self, block: &SampleBlock) -> Result<(), IntegrityError> {
+        block
+            .validate()
+            .map_err(|source| IntegrityError::InvalidBlock {
+                packet_id: block.packet_id,
+                source,
+            })?;
+
+        self.report.summary.observed_packets =
+            self.report.summary.observed_packets.saturating_add(1);
+        self.report.summary.written_samples = self
+            .report
+            .summary
+            .written_samples
+            .saturating_add(block.data.len() as u64);
+
+        if let Some(previous_id) = self.previous_packet_id {
+            let expected_packet_id = previous_id.saturating_add(1);
+
+            if block.packet_id < expected_packet_id {
+                return Err(IntegrityError::PacketIdWentBackwards {
+                    previous_packet_id: previous_id,
+                    observed_packet_id: block.packet_id,
+                });
+            }
+
+            if block.packet_id > expected_packet_id {
+                let missing_count = block.packet_id.saturating_sub(expected_packet_id);
+                self.report.summary.missing_packets = self
+                    .report
+                    .summary
+                    .missing_packets
+                    .saturating_add(missing_count);
+
+                let missing_samples = self
+                    .previous_samples_per_block
+                    .unwrap_or_default()
+                    .saturating_mul(missing_count);
+                self.report.summary.expected_samples = self
+                    .report
+                    .summary
+                    .expected_samples
+                    .saturating_add(missing_samples);
+
+                self.report.packet_gaps.push(PacketGap {
+                    expected_packet_id,
+                    observed_packet_id: block.packet_id,
+                    missing_count,
+                });
+            }
+        }
+
+        if let Some(expected_timestamp) = self.previous_timestamp_after_block
+            && block.timestamp_start != expected_timestamp
+        {
+            self.report.summary.timestamp_discontinuities = self
+                .report
+                .summary
+                .timestamp_discontinuities
+                .saturating_add(1);
+            self.report
+                .timestamp_discontinuities
+                .push(TimestampDiscontinuity {
+                    packet_id: block.packet_id,
+                    expected_timestamp_start: expected_timestamp,
+                    observed_timestamp_start: block.timestamp_start,
+                });
+        }
+
+        self.previous_packet_id = Some(block.packet_id);
+        self.previous_timestamp_after_block = Some(block.timestamp_after_block());
+        self.previous_samples_per_block = Some(block.expected_sample_values() as u64);
+
+        Ok(())
+    }
+
+    /// Finalize and return the integrity report.
+    pub fn finish(mut self) -> IntegrityReport {
+        self.report.summary.expected_packets = self
+            .report
+            .summary
+            .observed_packets
+            .saturating_add(self.report.summary.missing_packets);
+        self.report.summary.expected_samples = self
+            .report
+            .summary
+            .expected_samples
+            .saturating_add(self.report.summary.written_samples);
+        self.report
+    }
+}
+
+impl Default for IncrementalIntegrity {
+    fn default() -> Self {
+        Self::new()
+    }
+}

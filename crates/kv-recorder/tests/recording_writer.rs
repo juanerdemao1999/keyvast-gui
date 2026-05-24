@@ -5,8 +5,8 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, RecorderError, write_benchmark_summary, write_integrity_summary,
-    write_log_file, write_recording,
+    BenchmarkSummary, RecorderError, StreamingRecorder, write_benchmark_summary,
+    write_integrity_summary, write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -280,4 +280,126 @@ fn cleanup_dir(path: &Path) {
     if path.exists() {
         fs::remove_dir_all(path).expect("cleanup test directory");
     }
+}
+
+// --- StreamingRecorder tests ---
+
+#[test]
+fn streaming_recorder_writes_blocks_incrementally() {
+    let output_dir = unique_output_dir("streaming-basic");
+    let blocks = next_simulator_blocks(3);
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder should open");
+    for block in &blocks {
+        recorder
+            .write_block(block)
+            .expect("block write should succeed");
+    }
+    let summary = recorder.finish().expect("finish should succeed");
+
+    let expected_samples = (3 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
+    let expected_bytes = expected_samples * 2;
+
+    assert_eq!(summary.recording.block_count, 3);
+    assert_eq!(summary.recording.written_samples, expected_samples);
+    assert_eq!(summary.recording.byte_count, expected_bytes);
+    assert_eq!(summary.recording.first_packet_id, Some(0));
+    assert_eq!(summary.recording.last_packet_id, Some(2));
+
+    assert_eq!(
+        fs::metadata(output_dir.join("recording.kvraw"))
+            .expect("raw file should exist")
+            .len(),
+        expected_bytes
+    );
+
+    let metadata = fs::read_to_string(output_dir.join("recording.json"))
+        .expect("metadata file should be readable");
+    assert!(metadata.contains("\"first_packet_id\": 0"));
+    assert!(metadata.contains("\"last_packet_id\": 2"));
+    assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_matches_batch_recorder_output() {
+    let blocks = next_simulator_blocks(4);
+
+    let batch_dir = unique_output_dir("streaming-vs-batch-batch");
+    let batch_summary = write_recording(&batch_dir, &blocks).expect("batch recording");
+
+    let stream_dir = unique_output_dir("streaming-vs-batch-stream");
+    let mut recorder = StreamingRecorder::new(&stream_dir).expect("streaming recorder");
+    for block in &blocks {
+        recorder.write_block(block).expect("block write");
+    }
+    let stream_summary = recorder.finish().expect("finish");
+
+    assert_eq!(
+        stream_summary.recording.block_count,
+        batch_summary.block_count
+    );
+    assert_eq!(
+        stream_summary.recording.written_samples,
+        batch_summary.written_samples
+    );
+    assert_eq!(
+        stream_summary.recording.byte_count,
+        batch_summary.byte_count
+    );
+    assert_eq!(
+        stream_summary.recording.first_packet_id,
+        batch_summary.first_packet_id
+    );
+    assert_eq!(
+        stream_summary.recording.last_packet_id,
+        batch_summary.last_packet_id
+    );
+
+    let batch_raw = fs::read(batch_dir.join("recording.kvraw")).expect("batch raw");
+    let stream_raw = fs::read(stream_dir.join("recording.kvraw")).expect("stream raw");
+    assert_eq!(batch_raw, stream_raw, "raw data should be byte-identical");
+
+    cleanup_dir(&batch_dir);
+    cleanup_dir(&stream_dir);
+}
+
+#[test]
+fn streaming_recorder_tracks_write_latency() {
+    let output_dir = unique_output_dir("streaming-latency");
+    let blocks = next_simulator_blocks(5);
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    for block in &blocks {
+        recorder.write_block(block).expect("write");
+    }
+    let summary = recorder.finish().expect("finish");
+
+    assert!(summary.max_write_latency_us.is_some());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_device_id() {
+    let output_dir = unique_output_dir("streaming-inconsistent");
+    let mut blocks = next_simulator_blocks(2);
+    blocks[1].device_id = "wrong-device".to_string();
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent device should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "device_id",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
 }

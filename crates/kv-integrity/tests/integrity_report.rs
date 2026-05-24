@@ -1,4 +1,6 @@
-use kv_integrity::{IntegrityError, PacketGap, TimestampDiscontinuity, check_blocks};
+use kv_integrity::{
+    IncrementalIntegrity, IntegrityError, PacketGap, TimestampDiscontinuity, check_blocks,
+};
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, SampleBlock};
 
@@ -132,4 +134,106 @@ fn sample_block(
 
 fn samples_per_block() -> u64 {
     (DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64
+}
+
+// --- IncrementalIntegrity tests ---
+
+#[test]
+fn incremental_consecutive_blocks_match_batch_report() {
+    let blocks = next_simulator_blocks(SimulatorConfig::default(), 5);
+
+    let batch_report = check_blocks(&blocks).expect("batch should succeed");
+
+    let mut incremental = IncrementalIntegrity::new();
+    for block in &blocks {
+        incremental
+            .push(block)
+            .expect("incremental push should succeed");
+    }
+    let inc_report = incremental.finish();
+
+    assert_eq!(
+        inc_report.summary.observed_packets,
+        batch_report.summary.observed_packets
+    );
+    assert_eq!(
+        inc_report.summary.expected_packets,
+        batch_report.summary.expected_packets
+    );
+    assert_eq!(
+        inc_report.summary.missing_packets,
+        batch_report.summary.missing_packets
+    );
+    assert_eq!(
+        inc_report.summary.written_samples,
+        batch_report.summary.written_samples
+    );
+    assert_eq!(
+        inc_report.summary.expected_samples,
+        batch_report.summary.expected_samples
+    );
+    assert!(inc_report.packet_gaps.is_empty());
+    assert!(inc_report.timestamp_discontinuities.is_empty());
+}
+
+#[test]
+fn incremental_detects_packet_gap() {
+    let blocks = next_simulator_blocks(
+        SimulatorConfig {
+            drop_packet_ids: vec![2],
+            ..SimulatorConfig::default()
+        },
+        4,
+    );
+
+    let mut incremental = IncrementalIntegrity::new();
+    for block in &blocks {
+        incremental
+            .push(block)
+            .expect("incremental push should succeed");
+    }
+    let report = incremental.finish();
+
+    assert_eq!(report.summary.observed_packets, 4);
+    assert_eq!(report.summary.expected_packets, 5);
+    assert_eq!(report.summary.missing_packets, 1);
+    assert_eq!(report.packet_gaps.len(), 1);
+    assert_eq!(report.packet_gaps[0].expected_packet_id, 2);
+    assert_eq!(report.packet_gaps[0].observed_packet_id, 3);
+}
+
+#[test]
+fn incremental_detects_timestamp_discontinuity() {
+    let mut blocks = next_simulator_blocks(SimulatorConfig::default(), 2);
+    blocks[1].timestamp_start += 10;
+
+    let mut incremental = IncrementalIntegrity::new();
+    for block in &blocks {
+        incremental
+            .push(block)
+            .expect("incremental push should succeed");
+    }
+    let report = incremental.finish();
+
+    assert_eq!(report.summary.timestamp_discontinuities, 1);
+    assert_eq!(report.timestamp_discontinuities.len(), 1);
+    assert_eq!(
+        report.timestamp_discontinuities[0],
+        TimestampDiscontinuity {
+            packet_id: 1,
+            expected_timestamp_start: DEFAULT_SAMPLES_PER_PACKET as u64,
+            observed_timestamp_start: DEFAULT_SAMPLES_PER_PACKET as u64 + 10,
+        }
+    );
+}
+
+#[test]
+fn incremental_empty_produces_zero_report() {
+    let report = IncrementalIntegrity::new().finish();
+
+    assert_eq!(report.summary.observed_packets, 0);
+    assert_eq!(report.summary.expected_packets, 0);
+    assert_eq!(report.summary.missing_packets, 0);
+    assert_eq!(report.summary.expected_samples, 0);
+    assert_eq!(report.summary.written_samples, 0);
 }

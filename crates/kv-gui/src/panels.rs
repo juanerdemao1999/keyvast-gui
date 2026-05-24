@@ -68,6 +68,51 @@ impl DisplaySettings {
     }
 }
 
+// ── Filter / signal-processing settings ─────────────────────────────
+
+/// Notch frequency presets — line noise on most regions.
+pub const NOTCH_FREQS: &[f64] = &[50.0, 60.0];
+
+#[derive(Debug, Clone, Copy)]
+pub struct FilterSettings {
+    pub hp_enabled: bool,
+    pub hp_cutoff_hz: f64,
+    pub lp_enabled: bool,
+    pub lp_cutoff_hz: f64,
+    pub notch_enabled: bool,
+    pub notch_idx: usize, // index into NOTCH_FREQS
+    pub car_enabled: bool,
+    pub spike_threshold_enabled: bool,
+    /// Threshold expressed as multiples of channel RMS (negative-going).
+    pub spike_threshold_sigma: f64,
+}
+
+impl Default for FilterSettings {
+    fn default() -> Self {
+        Self {
+            hp_enabled: false,
+            hp_cutoff_hz: 300.0, // standard for spike-band view
+            lp_enabled: false,
+            lp_cutoff_hz: 250.0, // standard for LFP-band view
+            notch_enabled: false,
+            notch_idx: 0,        // default 50 Hz (CN/EU mains)
+            car_enabled: false,
+            spike_threshold_enabled: false,
+            spike_threshold_sigma: 4.0,
+        }
+    }
+}
+
+impl FilterSettings {
+    pub fn notch_freq_hz(&self) -> f64 {
+        NOTCH_FREQS[self.notch_idx]
+    }
+
+    pub fn any_filter_enabled(&self) -> bool {
+        self.hp_enabled || self.lp_enabled || self.notch_enabled
+    }
+}
+
 // ── Recording state ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,12 +145,14 @@ impl Default for RecordingSettings {
 
 // ── Left control panel ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_left_panel(
     ui: &mut egui::Ui,
     acquiring: bool,
     start_clicked: &mut bool,
     stop_clicked: &mut bool,
     display: &mut DisplaySettings,
+    filters: &mut FilterSettings,
     recording: &mut RecordingSettings,
     block: Option<&SampleBlock>,
 ) {
@@ -116,6 +163,8 @@ pub fn draw_left_panel(
         draw_acquisition_controls(ui, acquiring, start_clicked, stop_clicked);
         ui.add_space(4.0);
         draw_display_settings(ui, display);
+        ui.add_space(4.0);
+        draw_filter_settings(ui, filters);
         ui.add_space(4.0);
         draw_channel_list(ui, display, block);
         ui.add_space(4.0);
@@ -293,6 +342,94 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 egui::RichText::new("Labels").size(10.0),
             );
         });
+    });
+}
+
+// ── Filter / signal-processing settings UI ──────────────────────────
+
+fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
+    egui::CollapsingHeader::new(
+        egui::RichText::new("FILTERS")
+            .size(11.0)
+            .strong()
+            .color(theme::TEXT_SECONDARY),
+    )
+    .default_open(false)
+    .show(ui, |ui| {
+        // High-pass
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut filters.hp_enabled,
+                egui::RichText::new("HP").size(10.0).strong(),
+            );
+            ui.add(
+                egui::DragValue::new(&mut filters.hp_cutoff_hz)
+                    .speed(1.0)
+                    .range(0.1..=10_000.0)
+                    .suffix(" Hz"),
+            );
+        });
+
+        // Low-pass
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut filters.lp_enabled,
+                egui::RichText::new("LP").size(10.0).strong(),
+            );
+            ui.add(
+                egui::DragValue::new(&mut filters.lp_cutoff_hz)
+                    .speed(1.0)
+                    .range(1.0..=15_000.0)
+                    .suffix(" Hz"),
+            );
+        });
+
+        // Notch
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut filters.notch_enabled,
+                egui::RichText::new("Notch").size(10.0).strong(),
+            );
+            for (i, &f) in NOTCH_FREQS.iter().enumerate() {
+                ui.selectable_value(
+                    &mut filters.notch_idx,
+                    i,
+                    egui::RichText::new(format!("{}Hz", f as u32)).size(10.0),
+                );
+            }
+        });
+
+        ui.add_space(2.0);
+
+        // Common Average Reference
+        ui.checkbox(
+            &mut filters.car_enabled,
+            egui::RichText::new("CAR (Common Avg Ref)").size(10.0),
+        );
+
+        // Spike threshold
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut filters.spike_threshold_enabled,
+                egui::RichText::new("Spike σ").size(10.0),
+            );
+            ui.add(
+                egui::DragValue::new(&mut filters.spike_threshold_sigma)
+                    .speed(0.1)
+                    .range(1.0..=20.0)
+                    .suffix("σ"),
+            );
+        });
+
+        if filters.hp_enabled || filters.lp_enabled || filters.notch_enabled {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Display only — recording is raw")
+                    .size(9.0)
+                    .italics()
+                    .color(theme::TEXT_DIM),
+            );
+        }
     });
 }
 

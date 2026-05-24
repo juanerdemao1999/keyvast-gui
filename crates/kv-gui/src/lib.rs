@@ -8,6 +8,7 @@
 
 mod app;
 mod demo;
+mod dsp;
 mod panels;
 mod preview;
 mod theme;

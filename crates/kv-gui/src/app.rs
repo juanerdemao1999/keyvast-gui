@@ -25,7 +25,7 @@ use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
 use crate::demo::DemoPreview;
-use crate::panels::{self, DisplaySettings, RecordingSettings, RecordingState};
+use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, PreviewState};
 use crate::theme;
 use crate::waveform;
@@ -58,6 +58,7 @@ pub struct KvApp {
     latest_stats: Option<BlockStats>,
     // UI state
     display: DisplaySettings,
+    filters: FilterSettings,
     recording: RecordingSettings,
     theme_applied: bool,
     /// When true, the waveform display is frozen at the current view but
@@ -90,6 +91,7 @@ impl KvApp {
             latest_block: None,
             latest_stats: None,
             display: DisplaySettings::default(),
+            filters: FilterSettings::default(),
             recording: RecordingSettings::default(),
             theme_applied: false,
             display_paused: false,
@@ -509,6 +511,7 @@ impl eframe::App for KvApp {
                     &mut start,
                     &mut stop,
                     &mut self.display,
+                    &mut self.filters,
                     &mut self.recording,
                     self.latest_block.as_ref(),
                 );
@@ -557,6 +560,7 @@ impl eframe::App for KvApp {
                     &self.block_history,
                     self.latest_block.as_ref(),
                     &self.display,
+                    &self.filters,
                     elapsed,
                 );
                 let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;

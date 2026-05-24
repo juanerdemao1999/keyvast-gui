@@ -20,9 +20,9 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 6 — GUI polish to professional standard)
+Last updated: 2026-05-24 (session 6 — GUI polish + signal processing)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now matches several Tier-1 features of those packages.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 ### Session 6 changes (waveform / UX polish)
 
@@ -53,10 +53,19 @@ The project is in the simulator-first foundation phase. The streaming pipeline, 
 
 ### Files most relevant to this session
 
-- `crates/kv-gui/src/waveform.rs` — viewport, decimation, hover highlight
-- `crates/kv-gui/src/app.rs` — pause state, perf metrics, scroll-wheel handling, overlays
-- `crates/kv-gui/src/panels.rs` — `TIME_WINDOWS`, ComboBox styling
+- `crates/kv-gui/src/waveform.rs` — viewport, decimation, hover highlight, filter pipeline routing, spike threshold rendering
+- `crates/kv-gui/src/app.rs` — pause state, perf metrics, scroll-wheel handling, overlays, FilterSettings wiring
+- `crates/kv-gui/src/panels.rs` — `TIME_WINDOWS`, ComboBox styling, `FilterSettings` struct + Filters UI section
+- `crates/kv-gui/src/dsp.rs` — Biquad IIR filters (HP/LP/Notch via RBJ cookbook, Direct Form II Transposed), FilterChain, 9 unit tests
 - `crates/kv-gui/src/theme.rs` — `weak_bg_fill`, `transport_button` (no `add_enabled`)
+
+### Tier-3 signal processing (added at end of session 6)
+
+- **HP / LP / Notch biquad filters** — RBJ cookbook designs at user-selected cutoffs.  Defaults: HP 300 Hz (spike band), LP 250 Hz (LFP band), Notch 50 / 60 Hz selectable.  Q = 1/√2 (Butterworth) for HP/LP, Q = 30 for Notch.
+- **Common Average Reference (CAR)** — at each time index, subtract the mean of all enabled visible channels from every channel.  Standard mu-mode noise removal in multi-channel arrays.
+- **Spike threshold + crossing count** — per-channel σ (RMS) over the visible window, threshold at `−k·σ` (default k = 4), negative-going threshold crossings counted with a 1 ms refractory period.  Threshold line drawn dashed-red across each lane; crossing count painted at the right edge of each lane.
+- **Display vs. recording**: filters are display-only; the recording stream remains raw, matching standard practice in Open Ephys / Intan RHX / Plexon.  A small caption in the FILTERS panel reminds users.
+- **Performance routing**: when no filter / CAR / spike-detection is enabled, the renderer takes the original fast path (per-channel anchored decimation, no extra allocation).  The full pipeline (collect every raw sample → CAR → biquad chain → decimate) only runs when needed.
 
 
 Implemented:
@@ -296,7 +305,7 @@ cargo build --bin kv-gui
 cargo clippy --workspace
 ```
 
-All 75 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `overlay_mode`, `file_prefix`, `min`/`max` in ChannelStats, `channels`/`total_samples` in BlockStats).
+All 84 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `overlay_mode`, `file_prefix`, `min`/`max` in ChannelStats, `channels`/`total_samples` in BlockStats).
 
 Current test count:
 
@@ -308,8 +317,8 @@ Current test count:
 5 passing tests in kv-simulator
 10 passing tests in kv-integrity (6 batch + 4 incremental)
 14 passing tests in kv-recorder (9 batch + 4 streaming + 1 latency distribution)
-0 tests in kv-gui (GUI requires visual verification)
-75 total passing tests
+9 passing tests in kv-gui::dsp (Biquad / FilterChain frequency response)
+84 total passing tests
 ```
 
 ## How To Resume
@@ -318,12 +327,13 @@ The full benchmark pipeline and professional GUI are feature-complete. The GUI w
 
 1. **Visual smoke test**: Run `gui.bat` and verify all the new interactions: smooth scroll (no flicker), `P` to freeze, `F` for perf overlay, scroll-wheel changes time window, hover highlights a channel and shows tooltip.
 
-2. **Tier-3 GUI signal processing** (planned, not started):
-   - High-pass filter (default 300 Hz for spike, off for raw view)
-   - Low-pass filter (default 250 Hz for LFP)
-   - Notch filter at 50/60 Hz
-   - Common Average Reference (CAR) toggle
-   - Spike threshold lines per channel (visual + crossing count)
+2. **Tier-4 GUI / analysis features** (planned, not started):
+   - Filter parameter persistence between sessions (config file)
+   - Real-time FFT / spectrogram inset on hovered channel
+   - Channel grouping (probe layout view) for high channel counts
+   - Multi-window split: zoomed window + overview window
+   - Spike sorting (online): per-channel waveform clustering, ISI histogram
+   - Event marker stream + TTL overlay
 
 3. **Wire GUI to live pipeline**: Device mode uses `PreviewState` which wraps `start_preview()`. Already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition.
 

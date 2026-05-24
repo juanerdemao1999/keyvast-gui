@@ -14,7 +14,8 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::panels::DisplaySettings;
+use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
 /// Maximum rendered points per channel (decimation target for performance).
@@ -22,6 +23,16 @@ const MAX_DISPLAY_POINTS: usize = 4096;
 
 /// Vertical spacing (in normalized units) between channel baselines.
 const CHANNEL_SPACING: f64 = 2.2;
+
+/// Per-channel rendered trace plus optional spike detection metadata.
+struct ChannelTrace {
+    channel: usize,
+    points: Vec<[f64; 2]>,
+    /// RMS sigma in normalized-input units (only set when threshold is enabled).
+    sigma: Option<f64>,
+    /// Negative-going threshold crossings within the window.
+    spike_count: u32,
+}
 
 // ── Public entry point ──────────────────────────────────────────────
 
@@ -34,6 +45,7 @@ pub fn draw_waveform_area(
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
+    filters: &FilterSettings,
     elapsed_secs: f64,
 ) {
     let block = match latest {
@@ -61,31 +73,36 @@ pub fn draw_waveform_area(
     let x_right = elapsed_secs * 1000.0; // current time in ms
     let x_left = (x_right - time_window_ms).max(0.0);
 
-    // Build lines for each channel
-    let mut lines: Vec<(usize, Vec<[f64; 2]>)> = Vec::with_capacity(visible);
+    // Decide pipeline: fast path (raw decimated) or full path (filter/CAR).
+    let needs_full_pipeline =
+        filters.any_filter_enabled() || filters.car_enabled || filters.spike_threshold_enabled;
 
-    for ch in 0..visible {
-        if !settings.is_channel_enabled(ch) {
-            continue;
-        }
-        let raw_pts = collect_channel_points(
-            ch,
+    let traces: Vec<ChannelTrace> = if needs_full_pipeline {
+        collect_lines_filtered(
             history,
             latest,
+            settings,
+            filters,
+            visible,
             total_channels,
             block.sample_rate,
             x_left,
             x_right,
-        );
-
-        // Apply vertical offset: channel 0 at top, channel N at bottom
-        let y_offset = -(ch as f64) * CHANNEL_SPACING;
-        let pts: Vec<[f64; 2]> = raw_pts
-            .into_iter()
-            .map(|[x, y]| [x, y * gain + y_offset])
-            .collect();
-        lines.push((ch, pts));
-    }
+            gain,
+        )
+    } else {
+        collect_lines_fast(
+            history,
+            latest,
+            settings,
+            visible,
+            total_channels,
+            block.sample_rate,
+            x_left,
+            x_right,
+            gain,
+        )
+    };
 
     // Y axis bounds
     let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
@@ -169,10 +186,29 @@ pub fn draw_waveform_area(
             }
         });
 
+        // Draw spike threshold lines (negative-going) when enabled
+        if filters.spike_threshold_enabled {
+            for trace in &traces {
+                if let Some(sigma) = trace.sigma {
+                    let y_off = -(trace.channel as f64) * CHANNEL_SPACING;
+                    let thresh_y =
+                        -filters.spike_threshold_sigma * sigma * gain + y_off;
+                    let line = Line::new(PlotPoints::from(vec![
+                        [x_left, thresh_y],
+                        [x_right, thresh_y],
+                    ]))
+                    .color(theme::ACCENT_RED)
+                    .width(0.8)
+                    .style(egui_plot::LineStyle::dashed_dense());
+                    plot_ui.line(line);
+                }
+            }
+        }
+
         // Draw waveform traces — highlight hovered channel
-        for (ch, pts) in &lines {
-            let base_color = theme::channel_color(*ch);
-            let is_hovered = hovered_ch == Some(*ch);
+        for trace in &traces {
+            let base_color = theme::channel_color(trace.channel);
+            let is_hovered = hovered_ch == Some(trace.channel);
             let (color, width) = if is_hovered {
                 (egui::Color32::WHITE, 1.8)
             } else if hovered_ch.is_some() {
@@ -181,20 +217,41 @@ pub fn draw_waveform_area(
             } else {
                 (base_color, 1.2)
             };
-            let line = Line::new(PlotPoints::from(pts.clone()))
+            let line = Line::new(PlotPoints::from(trace.points.clone()))
                 .color(color)
                 .width(width)
-                .name(format!("CH{ch}"));
+                .name(format!("CH{}", trace.channel));
             plot_ui.line(line);
         }
 
         hovered_ch
     });
 
+    // Spike-count badges on the right edge of each lane (overlay painted in screen space)
+    if filters.spike_threshold_enabled {
+        let painter = ui.painter();
+        for trace in &traces {
+            if trace.spike_count == 0 {
+                continue;
+            }
+            let y_lane = -(trace.channel as f64) * CHANNEL_SPACING;
+            let plot_pos = egui_plot::PlotPoint::new(x_right, y_lane);
+            let screen_pos = response.transform.position_from_point(&plot_pos);
+            let badge_pos = screen_pos + egui::vec2(-6.0, -1.0);
+            painter.text(
+                badge_pos,
+                egui::Align2::RIGHT_CENTER,
+                format!("{}", trace.spike_count),
+                egui::FontId::monospace(10.0),
+                theme::ACCENT_RED,
+            );
+        }
+    }
+
     // Tooltip with the hovered channel + time
-    if response.response.hovered() {
-        if let Some(hovered_ch) = response.inner {
-            if let Some(ptr_pos) = response.response.hover_pos() {
+    if response.response.hovered()
+        && let Some(hovered_ch) = response.inner
+            && let Some(ptr_pos) = response.response.hover_pos() {
                 let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
                 let tip = format_time_tooltip(hovered_ch, time_at_cursor);
                 egui::containers::popup::show_tooltip_at_pointer(
@@ -211,8 +268,6 @@ pub fn draw_waveform_area(
                     },
                 );
             }
-        }
-    }
 }
 
 fn format_time_tooltip(ch: usize, time_ms: f64) -> String {
@@ -233,81 +288,271 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 
 // ── Data collection ─────────────────────────────────────────────────
 
-/// Collect (time_ms, raw_normalized) pairs for one channel.
+/// **Fast path** — used when no filter / CAR / spike-detection is enabled.
 ///
-/// Uses `block.timestamp_start` for absolute time positioning.  Decimation
-/// is **anchored to absolute sample index** (modulo stride) so the same
-/// physical samples are picked regardless of when they entered the window —
-/// this is what makes scrolling look smooth instead of flickering.
-fn collect_channel_points(
-    ch: usize,
+/// Per-channel anchored decimation: the same physical samples are picked
+/// each frame, so the visible trace is rock-solid even as the viewport
+/// slides.  Per-channel DC mean is removed at the end.
+#[allow(clippy::too_many_arguments)]
+fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
+    settings: &DisplaySettings,
+    visible: usize,
     channel_count: usize,
     sample_rate: f64,
     t_left_ms: f64,
     t_right_ms: f64,
-) -> Vec<[f64; 2]> {
+    gain: f64,
+) -> Vec<ChannelTrace> {
     let ms_per_sample = if sample_rate > 0.0 {
         1000.0 / sample_rate
     } else {
         1.0
     };
-
-    // Total samples that would fit in the visible window
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    // Stride to keep total displayed points around MAX_DISPLAY_POINTS.
-    // Anchored to absolute sample index → same physical samples chosen each frame.
     let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
 
-    let mut all_points: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
+    let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
+    for ch in 0..visible {
+        if !settings.is_channel_enabled(ch) {
+            continue;
+        }
+        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
+        for block in history.iter().chain(latest) {
+            if block.channel_count != channel_count {
+                continue;
+            }
+            let spc = block.samples_per_channel;
+            let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
+            let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
+            if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
+                continue;
+            }
+            for s in 0..spc {
+                let abs_idx = block.timestamp_start + s as u64;
+                if stride > 1 && !abs_idx.is_multiple_of(stride) {
+                    continue;
+                }
+                let time_ms = abs_idx as f64 * ms_per_sample;
+                if time_ms < t_left_ms || time_ms > t_right_ms {
+                    continue;
+                }
+                let data_idx = s * channel_count + ch;
+                let value = if data_idx < block.data.len() {
+                    block.data[data_idx] as f64 / i16::MAX as f64
+                } else {
+                    0.0
+                };
+                pts.push([time_ms, value]);
+            }
+        }
+        finalize_channel(&mut pts, ch, gain);
+        traces.push(ChannelTrace {
+            channel: ch,
+            points: pts,
+            sigma: None,
+            spike_count: 0,
+        });
+    }
+    traces
+}
 
-    let blocks_iter = history.iter().chain(latest);
+/// **Full pipeline** — used when any HP/LP/Notch/CAR is enabled.
+///
+/// Collects every raw sample within the visible window for every channel
+/// (no decimation yet), optionally subtracts the common-average reference
+/// at each time index, runs each channel through its own biquad chain in
+/// sample order to maintain phase coherence, then anchored-decimates the
+/// filtered result for rendering.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn collect_lines_filtered(
+    history: &VecDeque<SampleBlock>,
+    latest: Option<&SampleBlock>,
+    settings: &DisplaySettings,
+    filters: &FilterSettings,
+    visible: usize,
+    channel_count: usize,
+    sample_rate: f64,
+    t_left_ms: f64,
+    t_right_ms: f64,
+    gain: f64,
+) -> Vec<ChannelTrace> {
+    let ms_per_sample = if sample_rate > 0.0 {
+        1000.0 / sample_rate
+    } else {
+        1.0
+    };
+    let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
+    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
 
-    for block in blocks_iter {
+    // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
+    // once for the maximum window length to avoid reallocation churn.
+    let cap = window_samples as usize + 1024;
+    let mut times: Vec<u64> = Vec::with_capacity(cap);
+    let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
+
+    let mut times_initialized = false;
+    for block in history.iter().chain(latest) {
         if block.channel_count != channel_count {
             continue;
         }
         let spc = block.samples_per_channel;
         let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
         let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-
-        // Skip blocks entirely outside the visible window
         if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
             continue;
         }
-
         for s in 0..spc {
             let abs_idx = block.timestamp_start + s as u64;
-            // Anchored decimation: only keep samples on the global stride
-            if stride > 1 && abs_idx % stride != 0 {
-                continue;
-            }
             let time_ms = abs_idx as f64 * ms_per_sample;
             if time_ms < t_left_ms || time_ms > t_right_ms {
                 continue;
             }
-            let data_idx = s * channel_count + ch;
-            let value = if data_idx < block.data.len() {
-                block.data[data_idx] as f64 / i16::MAX as f64
-            } else {
-                0.0
-            };
-            all_points.push([time_ms, value]);
+            times.push(abs_idx);
+            for (slot, ch) in (0..visible).enumerate() {
+                let data_idx = s * channel_count + ch;
+                let v = if data_idx < block.data.len() {
+                    block.data[data_idx] as f64 / i16::MAX as f64
+                } else {
+                    0.0
+                };
+                buffers[slot].push(v);
+            }
+        }
+        times_initialized = true;
+    }
+    if !times_initialized || times.is_empty() {
+        return Vec::new();
+    }
+
+    // CAR: subtract the mean of all visible-and-enabled channels at each
+    // time index from every channel.  Common neuroscience practice for
+    // removing common-mode noise.
+    if filters.car_enabled {
+        let n = times.len();
+        for i in 0..n {
+            let mut sum = 0.0;
+            let mut count = 0;
+            for ch in 0..visible {
+                if !settings.is_channel_enabled(ch) {
+                    continue;
+                }
+                sum += buffers[ch][i];
+                count += 1;
+            }
+            if count > 0 {
+                let mean = sum / count as f64;
+                for ch in 0..visible {
+                    buffers[ch][i] -= mean;
+                }
+            }
         }
     }
 
-    // DC removal: subtract per-channel mean so each trace is centered in its lane.
-    // Standard practice in pro acquisition software (Open Ephys, Intan RHX).
-    if !all_points.is_empty() {
-        let mean: f64 =
-            all_points.iter().map(|p| p[1]).sum::<f64>() / all_points.len() as f64;
-        for p in &mut all_points {
-            p[1] -= mean;
+    // Apply per-channel filter chain in sample order.  Note: filter state
+    // is fresh each frame, so the leftmost ~10 ms have a small transient.
+    if filters.any_filter_enabled() {
+        for ch in 0..visible {
+            if !settings.is_channel_enabled(ch) {
+                continue;
+            }
+            let mut chain = make_chain(filters, sample_rate);
+            for v in &mut buffers[ch] {
+                *v = chain.process(*v);
+            }
         }
     }
 
-    all_points
+    // Per-channel sigma + spike detection on full-resolution filtered data.
+    // Using DC-removed RMS, then negative-going threshold crossings with a
+    // ~1 ms refractory period (32 samples at 32 kHz / 30 at 30 kHz).
+    let refractory_samples = (sample_rate * 0.001).max(1.0) as usize;
+    let mut sigmas: Vec<Option<f64>> = vec![None; visible];
+    let mut spike_counts: Vec<u32> = vec![0; visible];
+    if filters.spike_threshold_enabled {
+        for ch in 0..visible {
+            if !settings.is_channel_enabled(ch) {
+                continue;
+            }
+            let buf = &buffers[ch];
+            if buf.is_empty() {
+                continue;
+            }
+            // DC mean (we DC-remove for sigma estimation only — buf is left untouched here)
+            let mean: f64 = buf.iter().sum::<f64>() / buf.len() as f64;
+            let var: f64 =
+                buf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / buf.len() as f64;
+            let sigma = var.sqrt();
+            sigmas[ch] = Some(sigma);
+
+            let thresh = -filters.spike_threshold_sigma * sigma;
+            let mut last_crossing: Option<usize> = None;
+            let mut prev_centered = 0.0;
+            for (i, v) in buf.iter().enumerate() {
+                let centered = v - mean;
+                if i > 0 && prev_centered >= thresh && centered < thresh
+                    && last_crossing.is_none_or(|l| i - l >= refractory_samples) {
+                        spike_counts[ch] = spike_counts[ch].saturating_add(1);
+                        last_crossing = Some(i);
+                    }
+                prev_centered = centered;
+            }
+        }
+    }
+
+    // Anchored decimation + DC removal + gain/offset, per channel.
+    let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
+    for ch in 0..visible {
+        if !settings.is_channel_enabled(ch) {
+            continue;
+        }
+        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
+        for (i, &abs_idx) in times.iter().enumerate() {
+            if stride > 1 && abs_idx % stride != 0 {
+                continue;
+            }
+            pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
+        }
+        finalize_channel(&mut pts, ch, gain);
+        traces.push(ChannelTrace {
+            channel: ch,
+            points: pts,
+            sigma: sigmas[ch],
+            spike_count: spike_counts[ch],
+        });
+    }
+    traces
+}
+
+/// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
+fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64) {
+    if pts.is_empty() {
+        return;
+    }
+    let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
+    let y_offset = -(ch as f64) * CHANNEL_SPACING;
+    for p in pts.iter_mut() {
+        p[1] = (p[1] - mean) * gain + y_offset;
+    }
+}
+
+/// Build a fresh `FilterChain` from the user's settings.
+fn make_chain(filters: &FilterSettings, sample_rate: f64) -> FilterChain {
+    let mut c = FilterChain::passthrough();
+    if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
+        c.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+        c.hp_enabled = true;
+    }
+    if filters.lp_enabled && filters.lp_cutoff_hz < sample_rate / 2.0 {
+        c.lp = Biquad::lowpass(filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+        c.lp_enabled = true;
+    }
+    if filters.notch_enabled {
+        c.notch = Biquad::notch(filters.notch_freq_hz(), sample_rate, Q_NOTCH);
+        c.notch_enabled = true;
+    }
+    c
 }
 
 // ── Empty state ─────────────────────────────────────────────────────

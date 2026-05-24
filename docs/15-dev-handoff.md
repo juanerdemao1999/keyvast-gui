@@ -22,7 +22,7 @@ Before ending a session after meaningful work:
 
 Last updated: 2026-05-24
 
-The project is in the simulator-first foundation phase. The threaded fan-out pipeline is now wired end-to-end.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, and benchmark runner are now complete.
 
 Implemented:
 
@@ -140,22 +140,49 @@ Implemented:
   - first-block latency measurement
   - post-run integrity check on recorded blocks
   - per-consumer final status reporting (pushed, popped, dropped)
+- Streaming recorder implemented:
+  - `StreamingRecorder::new(output_dir)` opens `.kvraw` file
+  - `write_block(&SampleBlock)` appends incrementally with per-block write latency tracking
+  - `finish()` writes `recording.json` metadata, returns `StreamingRecordingSummary` with max write latency
+  - validates device consistency across blocks (same as batch recorder)
+  - `block_count()` accessor for progress monitoring
+- Incremental integrity implemented:
+  - `IncrementalIntegrity::new()` creates empty state
+  - `push(&SampleBlock)` processes one block at a time, tracking packet gaps and timestamp discontinuities
+  - `finish()` returns `IntegrityReport` identical to batch `check_blocks` output
+  - no buffering — suitable for unbounded streaming runs
+- Streaming pipeline implemented:
+  - `run_streaming_pipeline(config, source)` in `kv-core::pipeline`
+  - `StreamingPipelineConfig` with `output_dir` field
+  - recorder consumer thread writes directly to disk via `StreamingRecorder` + `IncrementalIntegrity`
+  - returns `StreamingPipelineResult` with recording summary, integrity report, timing, per-consumer status, and `max_write_latency_us`
 - Real benchmark timing added:
   - `kv-acq simulator-pipeline` command writes `benchmark.json` with `measurement_kind: "measured"`
+  - `kv-acq simulator-stream` command writes `benchmark.json` with `measurement_kind: "measured_streaming"`
   - wall-clock `duration_seconds` and `average_write_mb_s` from actual elapsed time
   - `max_buffer_occupancy` from recorder and preview consumer final status
+  - `max_write_latency_ms` from per-block streaming write latency
   - clearly distinct from `simulator_estimate` used by old `simulator-record` command
+- Benchmark runner implemented:
+  - `kv-acq benchmark --preset smoke|recorder|stress-128|stress-256|endurance`
+  - `kv-acq benchmark --duration SECONDS [--channels N] [--sample-rate F] [--samples-per-packet N]`
+  - `blocks_for_duration(seconds, sample_rate, samples_per_packet)` computes block count from target duration
+  - preset durations: smoke=10s, recorder=600s, stress-128=600s, stress-256=600s, endurance=7200s
+  - stress-128 and stress-256 presets override channel count to 128 and 256 respectively
+  - uses streaming pipeline under the hood for memory-efficient long runs
+  - returns `BenchmarkResult` with computed block count and requested duration
 - CLI extended:
   - `kv-acq simulator-pipeline --blocks N [--output DIR] [--drop-packet ID] [--recorder-capacity N] [--preview-capacity N]`
-  - `CommandResult` enum for unified command dispatch
+  - `kv-acq simulator-stream --blocks N [--output DIR] [--drop-packet ID] [--recorder-capacity N] [--preview-capacity N]`
+  - `kv-acq benchmark --preset NAME | --duration SECONDS [--channels N] [--sample-rate F] [--output DIR]`
+  - `CommandResult` enum for unified command dispatch with Record, Pipeline, Stream, and Benchmark variants
   - default recorder capacity: 2048 blocks, preview: 32 blocks
-  - binary smoke test for the new command
+  - binary smoke tests for all four commands
 
 Not yet implemented:
 
 - `kv-gui`
-- Benchmark runner (dedicated endurance/stress runner, separate from CLI one-shot commands)
-- Fine-grained benchmark timing metrics: per-block write latency, CPU, memory
+- Fine-grained benchmark timing metrics: CPU and memory tracking
 - `kv-daemon`
 
 ## Current Defaults In Use
@@ -186,40 +213,42 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-All 51 integration tests pass. The threaded pipeline tests verify producer/consumer threading, independent recorder/preview consumption, wall-clock timing, producer error propagation, and packet gap detection through the pipeline. The CLI binary smoke test for `simulator-pipeline` confirms the binary produces `measurement_kind=measured` output and writes all expected files.
+All 73 integration tests pass. Tests cover all four CLI commands (simulator-record, simulator-pipeline, simulator-stream, benchmark), streaming recording, incremental integrity, threaded fan-out pipeline, buffer management, and binary smoke tests.
 
 Current test count:
 
 ```text
 8 passing integration tests in kv-buffer
-9 passing integration tests in kv-cli (6 original + 3 pipeline)
-10 passing integration tests in kv-core (4 original + 6 pipeline)
+19 passing integration tests in kv-cli (6 record + 3 pipeline + 3 stream + 7 benchmark)
+14 passing integration tests in kv-core (4 acquisition + 6 pipeline + 4 streaming pipeline)
 4 passing integration tests in kv-types
 5 passing integration tests in kv-simulator
-6 passing integration tests in kv-integrity
-9 passing integration tests in kv-recorder
-51 total passing integration tests
+10 passing integration tests in kv-integrity (6 batch + 4 incremental)
+13 passing integration tests in kv-recorder (9 batch + 4 streaming)
+73 total passing integration tests
 ```
 
 ## How To Resume
 
-The threaded fan-out pipeline and real benchmark timing are now complete. The next useful tasks, in priority order:
+The streaming pipeline, incremental integrity, and benchmark runner are all complete. The next useful tasks, in priority order:
 
-1. **Benchmark runner**: A dedicated endurance/stress test runner that exercises `simulator-pipeline` for configurable durations (10-second, 10-minute, 2-hour ladder from `docs/12-confirmed-decisions.md`). Collect per-block write latency distributions, peak buffer occupancy over time, and aggregate throughput.
+1. **kv-gui scaffold**: Create the `kv-gui` crate with a minimal `egui` window that connects to the pipeline's preview consumer. Start with a simple channel trace or status display. The pipeline's `preview` consumer is already wired; it just needs a real consumer.
 
-2. **kv-gui scaffold**: Create the `kv-gui` crate with a minimal `egui` window that connects to the pipeline's preview consumer. Start with a simple channel trace or status display. The pipeline's `preview` consumer is already wired; it just needs a real consumer.
+2. **Run actual endurance benchmarks**: Use `kv-acq benchmark --preset smoke` to verify the 10-second smoke test, then ladder up to `--preset recorder` (10 min) and eventually `--preset endurance` (2 hours). Inspect the output `benchmark.json` for max write latency, buffer occupancy, and missing packets.
 
-3. **Streaming recorder**: Currently the recorder writes all blocks at the end via `write_recording(&[SampleBlock])`. For long acquisitions, the recorder consumer should write blocks incrementally as they arrive (append to `recording.kvraw`, periodically flush metadata). This is needed before the 10-minute and 2-hour endurance tests become meaningful.
+3. **Per-block latency distribution**: The streaming recorder already tracks `max_write_latency_us`. To get a full distribution (p50/p95/p99), add a histogram collector to `StreamingRecorder` or the streaming pipeline's recorder consumer thread.
+
+4. **CPU and memory metrics**: The `BenchmarkSummary` has `cpu_percent_avg: None` and `memory_mb_max: None` placeholders. On Windows, these can be populated via `GetProcessTimes` / `GetProcessMemoryInfo` or a lightweight sampling thread.
 
 Recommended implementation boundary:
 
 ```text
 kv-simulator -> produces SampleBlock
-kv-integrity -> checks SampleBlock continuity and sample counts
-kv-recorder -> writes validated SampleBlock data to kvraw plus metadata
-kv-core -> orchestrates acquisition: run_fixed_blocks (synchronous) or run_threaded_pipeline (threaded fan-out)
+kv-integrity -> checks SampleBlock continuity and sample counts (batch or incremental)
+kv-recorder -> writes validated SampleBlock data to kvraw plus metadata (batch or streaming)
+kv-core -> orchestrates acquisition: run_fixed_blocks, run_threaded_pipeline, or run_streaming_pipeline
 kv-buffer -> bounded FIFO + fan-out buffering with per-consumer overflow counters
-kv-cli -> thin developer commands: simulator-record (synchronous) and simulator-pipeline (threaded)
+kv-cli -> thin developer commands: simulator-record, simulator-pipeline, simulator-stream, benchmark
 ```
 
 Do not add real FPGA packet format, USB details, CRC algorithm, ADC conversion, or channel mapping yet.

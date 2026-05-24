@@ -17,8 +17,8 @@ use kv_types::SampleBlock;
 use crate::panels::DisplaySettings;
 use crate::theme;
 
-/// Maximum samples to display per channel (performance guard).
-const MAX_DISPLAY_SAMPLES: usize = 4096;
+/// Maximum rendered points per channel (decimation target for performance).
+const MAX_DISPLAY_POINTS: usize = 4096;
 
 /// Vertical spacing (in normalized units) between channel baselines.
 const CHANNEL_SPACING: f64 = 2.2;
@@ -48,6 +48,7 @@ pub fn draw_waveform_area(
     }
 
     let amp_scale = settings.amp_scale_uv();
+    let time_window_ms = settings.time_window_ms();
 
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
     let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
@@ -61,8 +62,14 @@ pub fn draw_waveform_area(
         if !settings.is_channel_enabled(ch) {
             continue;
         }
-        let raw_pts =
-            collect_channel_points(ch, history, latest, total_channels, block.sample_rate);
+        let raw_pts = collect_channel_points(
+            ch,
+            history,
+            latest,
+            total_channels,
+            block.sample_rate,
+            time_window_ms,
+        );
 
         // Track X range from actual data
         if let Some(first) = raw_pts.first() {
@@ -160,19 +167,26 @@ pub fn draw_waveform_area(
 // ── Data collection ─────────────────────────────────────────────────
 
 /// Collect (time_ms, raw_normalized) pairs for one channel from the history ring.
-/// Returns points with time re-zeroed so the window always starts near 0.
+///
+/// Only keeps the most recent `window_ms` milliseconds of data so the display
+/// width matches the user-selected time window.  Time is re-zeroed so the
+/// visible window always starts at 0.
 fn collect_channel_points(
     ch: usize,
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
     channel_count: usize,
     sample_rate: f64,
+    window_ms: f64,
 ) -> Vec<[f64; 2]> {
     let ms_per_sample = if sample_rate > 0.0 {
         1000.0 / sample_rate
     } else {
         1.0
     };
+
+    // How many raw samples fit in the requested window
+    let window_samples = (window_ms / ms_per_sample).ceil() as usize;
 
     let mut all_points: Vec<[f64; 2]> = Vec::new();
     let mut sample_offset: u64 = 0;
@@ -197,13 +211,25 @@ fn collect_channel_points(
         sample_offset += spc as u64;
     }
 
-    // Downsample if too many points — keep tail for real-time feel
-    if all_points.len() > MAX_DISPLAY_SAMPLES {
-        let skip = all_points.len() - MAX_DISPLAY_SAMPLES;
+    // Keep only the tail that fits the time window
+    if all_points.len() > window_samples {
+        let skip = all_points.len() - window_samples;
         all_points.drain(..skip);
     }
 
-    // Always re-zero time so the window starts at 0
+    // Decimate to MAX_DISPLAY_POINTS for rendering performance
+    if all_points.len() > MAX_DISPLAY_POINTS {
+        let step = all_points.len() as f64 / MAX_DISPLAY_POINTS as f64;
+        let mut decimated = Vec::with_capacity(MAX_DISPLAY_POINTS);
+        let mut idx = 0.0_f64;
+        while (idx as usize) < all_points.len() && decimated.len() < MAX_DISPLAY_POINTS {
+            decimated.push(all_points[idx as usize]);
+            idx += step;
+        }
+        all_points = decimated;
+    }
+
+    // Re-zero time so the window starts at 0
     if let Some(t0) = all_points.first().map(|p| p[0]) {
         if t0 != 0.0 {
             for p in &mut all_points {

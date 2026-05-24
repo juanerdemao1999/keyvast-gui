@@ -68,8 +68,9 @@ impl KvApp {
             demo_blocks_generated: 0,
             demo_start_time: now,
             device_preview: PreviewState::new(),
-            block_history: VecDeque::with_capacity(128),
-            history_capacity: 128,
+            // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
+            block_history: VecDeque::with_capacity(10_000),
+            history_capacity: 10_000,
             latest_block: None,
             latest_stats: None,
             display: DisplaySettings::default(),

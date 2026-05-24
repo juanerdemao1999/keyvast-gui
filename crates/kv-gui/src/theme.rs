@@ -96,10 +96,12 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
 
     v.widgets.inactive.bg_fill = BG_WIDGET;
+    v.widgets.inactive.weak_bg_fill = BG_WIDGET;
     v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
     v.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
 
     v.widgets.hovered.bg_fill = BG_HOVER;
+    v.widgets.hovered.weak_bg_fill = BG_HOVER;
     v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
 

@@ -12,8 +12,8 @@ use crate::theme;
 
 // ── Display settings state ──────────────────────────────────────────
 
-/// Time-base presets in milliseconds per division.
-pub const TIME_SCALES: &[f64] = &[0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0];
+/// Time-window presets in seconds (total visible window width).
+pub const TIME_WINDOWS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0];
 
 /// Amplitude presets in microvolts per division (display only — raw i16 scaled).
 pub const AMP_SCALES: &[f64] = &[50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0];
@@ -37,7 +37,7 @@ impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             visible_channels: 16,
-            time_scale_idx: 3, // 5 ms/div
+            time_scale_idx: 2, // 5 s window
             amp_scale_idx: 4,  // 1000 uV/div
             show_grid: true,
             show_channel_labels: true,
@@ -48,8 +48,14 @@ impl Default for DisplaySettings {
 }
 
 impl DisplaySettings {
-    pub fn time_scale_ms(&self) -> f64 {
-        TIME_SCALES[self.time_scale_idx]
+    /// Total visible window width in seconds.
+    pub fn time_window_secs(&self) -> f64 {
+        TIME_WINDOWS[self.time_scale_idx]
+    }
+
+    /// Total visible window width in milliseconds.
+    pub fn time_window_ms(&self) -> f64 {
+        self.time_window_secs() * 1000.0
     }
 
     pub fn amp_scale_uv(&self) -> f64 {
@@ -229,7 +235,7 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
             }
         });
 
-        // Time scale — dropdown
+        // Time window — dropdown
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Time")
@@ -239,13 +245,14 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
             egui::ComboBox::from_id_salt("time_scale")
                 .width(ui.available_width() - 4.0)
                 .selected_text(
-                    egui::RichText::new(format!("{:.1} ms/div", display.time_scale_ms()))
+                    egui::RichText::new(format_time_window(display.time_window_secs()))
                         .monospace()
-                        .size(11.0),
+                        .size(11.0)
+                        .color(theme::TEXT_PRIMARY),
                 )
                 .show_ui(ui, |ui| {
-                    for (i, &ms) in TIME_SCALES.iter().enumerate() {
-                        let label = format!("{ms:.1} ms/div");
+                    for (i, &secs) in TIME_WINDOWS.iter().enumerate() {
+                        let label = format_time_window(secs);
                         ui.selectable_value(&mut display.time_scale_idx, i, &label);
                     }
                 });
@@ -263,7 +270,8 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 .selected_text(
                     egui::RichText::new(format_uv(display.amp_scale_uv()))
                         .monospace()
-                        .size(11.0),
+                        .size(11.0)
+                        .color(theme::TEXT_PRIMARY),
                 )
                 .show_ui(ui, |ui| {
                     for (i, &uv) in AMP_SCALES.iter().enumerate() {
@@ -577,6 +585,14 @@ pub fn draw_status_bar(
 }
 
 // ── Formatting helpers ──────────────────────────────────────────────
+
+fn format_time_window(secs: f64) -> String {
+    if secs >= 1.0 {
+        format!("{:.0} s", secs)
+    } else {
+        format!("{:.0} ms", secs * 1000.0)
+    }
+}
 
 fn format_uv(uv: f64) -> String {
     if uv >= 1000.0 {

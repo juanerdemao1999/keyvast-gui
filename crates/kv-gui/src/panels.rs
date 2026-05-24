@@ -291,79 +291,88 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
 fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
     theme::section_heading(ui, "DISPLAY");
 
-    // Channel count
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Channels")
-                .size(10.0)
-                .color(theme::TEXT_DIM),
-        );
-        for &count in &[8_usize, 16, 32, 64] {
-            if ui
-                .selectable_label(
-                    display.visible_channels == count,
-                    egui::RichText::new(format!("{count}")).size(10.0),
-                )
-                .clicked()
-            {
-                display.visible_channels = count;
-            }
-        }
-    });
+    // ── Visible channels — slider (drag or click anywhere) ──────
+    ui.label(
+        egui::RichText::new("Visible Channels")
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+    );
+    let mut ch = display.visible_channels as i32;
+    let slider = egui::Slider::new(&mut ch, 1..=64)
+        .step_by(1.0)
+        .suffix(" ch")
+        .trailing_fill(true);
+    if ui
+        .add(slider)
+        .on_hover_text("Drag to change, or click the number to type")
+        .changed()
+    {
+        display.visible_channels = ch.max(1) as usize;
+    }
 
-    // Time scale
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("Time")
-                .size(10.0)
-                .color(theme::TEXT_DIM),
-        );
-        if ui.small_button("<").clicked() && display.time_scale_idx > 0 {
-            display.time_scale_idx -= 1;
-        }
-        ui.label(
+    ui.add_space(2.0);
+
+    // ── Time scale — dropdown ───────────────────────────────────
+    ui.label(
+        egui::RichText::new("Time Scale")
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+    );
+    egui::ComboBox::from_id_salt("time_scale")
+        .width(ui.available_width() - 4.0)
+        .selected_text(
             egui::RichText::new(format!("{:.1} ms/div", display.time_scale_ms()))
-                .size(10.0)
                 .monospace()
-                .color(theme::TEXT_PRIMARY),
-        );
-        if ui.small_button(">").clicked() && display.time_scale_idx < TIME_SCALES.len() - 1 {
-            display.time_scale_idx += 1;
-        }
-    });
+                .size(11.0),
+        )
+        .show_ui(ui, |ui| {
+            for (i, &ms) in TIME_SCALES.iter().enumerate() {
+                let label = format!("{ms:.1} ms/div");
+                ui.selectable_value(&mut display.time_scale_idx, i, &label);
+            }
+        });
 
-    // Amplitude scale
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Amp").size(10.0).color(theme::TEXT_DIM));
-        if ui.small_button("<").clicked() && display.amp_scale_idx > 0 {
-            display.amp_scale_idx -= 1;
-        }
-        ui.label(
+    ui.add_space(2.0);
+
+    // ── Amplitude scale — dropdown ──────────────────────────────
+    ui.label(
+        egui::RichText::new("Amplitude Scale")
+            .size(10.0)
+            .color(theme::TEXT_DIM),
+    );
+    egui::ComboBox::from_id_salt("amp_scale")
+        .width(ui.available_width() - 4.0)
+        .selected_text(
             egui::RichText::new(format_uv(display.amp_scale_uv()))
-                .size(10.0)
                 .monospace()
-                .color(theme::TEXT_PRIMARY),
-        );
-        if ui.small_button(">").clicked() && display.amp_scale_idx < AMP_SCALES.len() - 1 {
-            display.amp_scale_idx += 1;
-        }
-    });
+                .size(11.0),
+        )
+        .show_ui(ui, |ui| {
+            for (i, &uv) in AMP_SCALES.iter().enumerate() {
+                ui.selectable_value(&mut display.amp_scale_idx, i, format_uv(uv));
+            }
+        });
 
-    // Toggles
-    ui.horizontal(|ui| {
-        ui.checkbox(
-            &mut display.show_grid,
-            egui::RichText::new("Grid").size(10.0),
-        );
-        ui.checkbox(
-            &mut display.show_channel_labels,
-            egui::RichText::new("Labels").size(10.0),
-        );
-    });
+    ui.add_space(4.0);
+
+    // ── Toggles ─────────────────────────────────────────────────
+    ui.checkbox(
+        &mut display.show_grid,
+        egui::RichText::new("Grid lines").size(10.0),
+    )
+    .on_hover_text("Show grid lines on waveform plots");
+
+    ui.checkbox(
+        &mut display.show_channel_labels,
+        egui::RichText::new("Channel labels").size(10.0),
+    )
+    .on_hover_text("Show CH0, CH1… labels on the left");
+
     ui.checkbox(
         &mut display.overlay_mode,
         egui::RichText::new("Overlay mode").size(10.0),
-    );
+    )
+    .on_hover_text("Stack all channels on a single plot");
 }
 
 // ── Right statistics panel ──────────────────────────────────────────

@@ -161,9 +161,10 @@ pub fn draw_waveform_area(
 
 /// Collect (time_ms, raw_normalized) pairs for one channel.
 ///
-/// Uses `block.timestamp_start` for absolute time so data points have
-/// fixed positions.  Only points within `[t_left_ms, t_right_ms]` are kept.
-/// The result is decimated to `MAX_DISPLAY_POINTS` for rendering speed.
+/// Uses `block.timestamp_start` for absolute time positioning.  Decimation
+/// is **anchored to absolute sample index** (modulo stride) so the same
+/// physical samples are picked regardless of when they entered the window —
+/// this is what makes scrolling look smooth instead of flickering.
 fn collect_channel_points(
     ch: usize,
     history: &VecDeque<SampleBlock>,
@@ -179,7 +180,13 @@ fn collect_channel_points(
         1.0
     };
 
-    let mut all_points: Vec<[f64; 2]> = Vec::new();
+    // Total samples that would fit in the visible window
+    let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
+    // Stride to keep total displayed points around MAX_DISPLAY_POINTS.
+    // Anchored to absolute sample index → same physical samples chosen each frame.
+    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+
+    let mut all_points: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
 
     let blocks_iter = history.iter().chain(latest);
 
@@ -197,12 +204,14 @@ fn collect_channel_points(
         }
 
         for s in 0..spc {
-            let time_ms = block_start_ms + s as f64 * ms_per_sample;
-            if time_ms < t_left_ms {
+            let abs_idx = block.timestamp_start + s as u64;
+            // Anchored decimation: only keep samples on the global stride
+            if stride > 1 && abs_idx % stride != 0 {
                 continue;
             }
-            if time_ms > t_right_ms {
-                break;
+            let time_ms = abs_idx as f64 * ms_per_sample;
+            if time_ms < t_left_ms || time_ms > t_right_ms {
+                continue;
             }
             let data_idx = s * channel_count + ch;
             let value = if data_idx < block.data.len() {
@@ -212,18 +221,6 @@ fn collect_channel_points(
             };
             all_points.push([time_ms, value]);
         }
-    }
-
-    // Decimate to MAX_DISPLAY_POINTS for rendering performance
-    if all_points.len() > MAX_DISPLAY_POINTS {
-        let step = all_points.len() as f64 / MAX_DISPLAY_POINTS as f64;
-        let mut decimated = Vec::with_capacity(MAX_DISPLAY_POINTS);
-        let mut idx = 0.0_f64;
-        while (idx as usize) < all_points.len() && decimated.len() < MAX_DISPLAY_POINTS {
-            decimated.push(all_points[idx as usize]);
-            idx += step;
-        }
-        all_points = decimated;
     }
 
     all_points

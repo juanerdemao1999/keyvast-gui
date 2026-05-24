@@ -1,121 +1,148 @@
 //! Main application struct implementing `eframe::App`.
+//!
+//! Professional layout:
+//!   Top:    thin toolbar (title + quick controls)
+//!   Left:   control panel (device, acquisition, recording, display)
+//!   Center: multi-channel waveform area
+//!   Right:  statistics panel (throughput, buffer, per-channel)
+//!   Bottom: status bar with indicators
 
 use eframe::egui;
 use kv_simulator::SimulatorConfig;
-use kv_types::SampleBlock;
 
-use crate::preview::{PreviewHandle, start_preview};
+use crate::panels::{self, DisplaySettings, RecordingSettings};
+use crate::preview::PreviewState;
+use crate::theme;
 use crate::waveform;
 
 /// Application state for the Keyvast GUI.
 pub struct KvApp {
-    preview: Option<PreviewHandle>,
-    latest_block: Option<SampleBlock>,
-    block_count: u64,
-    visible_channels: usize,
-    acquiring: bool,
+    preview: PreviewState,
+    display: DisplaySettings,
+    recording: RecordingSettings,
+    theme_applied: bool,
 }
 
 impl KvApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
-            preview: None,
-            latest_block: None,
-            block_count: 0,
-            visible_channels: waveform::default_visible_channels(),
-            acquiring: false,
-        }
-    }
-
-    fn start_acquisition(&mut self) {
-        if self.acquiring {
-            return;
-        }
-        let config = SimulatorConfig::default();
-        self.preview = Some(start_preview(config));
-        self.acquiring = true;
-        self.block_count = 0;
-        self.latest_block = None;
-    }
-
-    fn stop_acquisition(&mut self) {
-        if let Some(ref handle) = self.preview {
-            handle.stop();
-        }
-        self.preview = None;
-        self.acquiring = false;
-    }
-
-    fn poll_preview(&mut self) {
-        if let Some(ref handle) = self.preview
-            && let Some(block) = handle.latest_block()
-        {
-            self.block_count = self.block_count.saturating_add(1);
-            self.latest_block = Some(block);
+            preview: PreviewState::new(),
+            display: DisplaySettings::default(),
+            recording: RecordingSettings::default(),
+            theme_applied: false,
         }
     }
 }
 
 impl eframe::App for KvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_preview();
+        // Apply theme once
+        if !self.theme_applied {
+            theme::apply(ctx);
+            self.theme_applied = true;
+        }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Keyvast");
-                ui.separator();
+        // Poll for new data
+        self.preview.poll();
 
-                if self.acquiring {
-                    if ui.button("Stop").clicked() {
-                        self.stop_acquisition();
-                    }
+        // ── Top toolbar ─────────────────────────────────────────
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::new().fill(theme::BG_DARK).inner_margin(6.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("ACQUIRING")
-                            .color(egui::Color32::LIGHT_GREEN)
-                            .strong(),
+                        egui::RichText::new("KEYVAST")
+                            .size(14.0)
+                            .strong()
+                            .color(theme::ACCENT_BLUE),
                     );
-                } else if ui.button("Start").clicked() {
-                    self.start_acquisition();
+                    ui.label(
+                        egui::RichText::new("Acquisition System")
+                            .size(11.0)
+                            .color(theme::TEXT_DIM),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("v0.1.0")
+                                .size(9.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    });
+                });
+            });
+
+        // ── Bottom status bar ───────────────────────────────────
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(egui::Frame::new().fill(theme::BG_DARK).inner_margin(4.0))
+            .show(ctx, |ui| {
+                panels::draw_status_bar(
+                    ui,
+                    self.preview.acquiring,
+                    &self.recording,
+                    self.preview.latest_stats.as_ref(),
+                    self.preview.latest_block.as_ref(),
+                );
+            });
+
+        // ── Left control panel ──────────────────────────────────
+        egui::SidePanel::left("control_panel")
+            .resizable(true)
+            .default_width(230.0)
+            .width_range(180.0..=320.0)
+            .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(8.0))
+            .show(ctx, |ui| {
+                let mut start = false;
+                let mut stop = false;
+
+                panels::draw_left_panel(
+                    ui,
+                    self.preview.acquiring,
+                    &mut start,
+                    &mut stop,
+                    &mut self.display,
+                    &mut self.recording,
+                    self.preview.latest_block.as_ref(),
+                );
+
+                if start {
+                    let config = SimulatorConfig::default();
+                    self.preview.start(config);
                 }
-
-                ui.separator();
-
-                ui.label("Channels:");
-                for &count in &[16_usize, 32, 64] {
-                    if ui
-                        .selectable_label(self.visible_channels == count, format!("{count}"))
-                        .clicked()
-                    {
-                        self.visible_channels = count;
-                    }
+                if stop {
+                    self.preview.stop();
                 }
             });
-        });
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            if let Some(ref block) = self.latest_block {
-                waveform::draw_status_panel(ui, block, self.block_count, self.visible_channels);
-            } else {
-                ui.label("Idle — press Start to begin acquisition");
-            }
-        });
+        // ── Right statistics panel ──────────────────────────────
+        egui::SidePanel::right("stats_panel")
+            .resizable(true)
+            .default_width(210.0)
+            .width_range(160.0..=300.0)
+            .frame(egui::Frame::new().fill(theme::BG_PANEL).inner_margin(8.0))
+            .show(ctx, |ui| {
+                panels::draw_right_panel(
+                    ui,
+                    self.preview.latest_stats.as_ref(),
+                    self.preview.latest_block.as_ref(),
+                    self.display.visible_channels,
+                );
+            });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(ref block) = self.latest_block {
-                waveform::draw_waveform_panel(ui, block, self.visible_channels);
-            } else {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("No data — start acquisition to view waveforms")
-                            .size(18.0)
-                            .color(egui::Color32::from_gray(100)),
-                    );
-                });
-            }
-        });
+        // ── Central waveform area ───────────────────────────────
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::BG_DARKEST).inner_margin(0.0))
+            .show(ctx, |ui| {
+                waveform::draw_waveform_area(
+                    ui,
+                    &self.preview.block_history,
+                    self.preview.latest_block.as_ref(),
+                    &self.display,
+                );
+            });
 
         // Request continuous repaints while acquiring
-        if self.acquiring {
+        if self.preview.acquiring {
             ctx.request_repaint();
         }
     }

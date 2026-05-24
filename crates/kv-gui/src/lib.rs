@@ -1,12 +1,12 @@
-//! Keyvast GUI — engineering display for real-time acquisition monitoring.
+//! Keyvast GUI — professional acquisition monitoring interface.
 //!
-//! Provides waveform visualization, buffer health, and acquisition status
-//! using `egui` / `eframe`. Connects to the pipeline's preview consumer
-//! via an `mpsc` channel.
+//! Provides multi-channel waveform visualization, real-time statistics,
+//! buffer health monitoring, and recording controls using `egui` / `eframe`.
 
 mod app;
+mod panels;
 mod preview;
+mod theme;
 mod waveform;
 
 pub use app::KvApp;
-pub use preview::{PreviewCommand, PreviewHandle, start_preview};

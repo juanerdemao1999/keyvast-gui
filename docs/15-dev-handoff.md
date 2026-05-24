@@ -20,9 +20,9 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 4)
+Last updated: 2026-05-24 (session 5)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns.
 
 Implemented:
 
@@ -179,25 +179,36 @@ Implemented:
   - default recorder capacity: 2048 blocks, preview: 32 blocks
   - binary smoke tests for all four commands
 
-- kv-gui professional interface implemented:
+- kv-gui professional interface implemented (v0.2.0, refactored session 5):
   - `kv-gui` crate with egui/eframe + egui_plot 0.31
-  - Professional dark theme (Intan RHX / Blackrock Central style) in `theme.rs`
+  - Professional dark theme (Intan RHX / Open Ephys style) in `theme.rs`
+    - 16-color channel palette, transport button colors, toolbar background
+    - `transport_button()` reusable widget, `format_clock()` helper
   - Demo mode with realistic neural signal generator (`demo.rs`):
     - 8 channel archetypes: Quiet, LFP, Spiking, Bursting, Noisy
     - Poisson-timed spike waveforms, LFP theta/gamma oscillations, pink noise, burst mode
     - Per-channel phase variation and amplitude randomization
     - Auto-starts on launch, generates blocks at real-time cadence
-  - egui_plot waveform rendering (`waveform.rs`):
-    - Per-channel Plot widgets in vertical ScrollArea
-    - Color-coded channel bars and labels
+  - Single-plot multi-channel waveform display (`waveform.rs`, rewritten session 5):
+    - **Single `egui_plot::Plot` with all channels as stacked waterfall traces**
+      (replaces N separate Plot widgets — much faster, professional look)
+    - Per-channel vertical offset with Y-axis channel labels
+    - Per-channel coloring from 16-color palette
+    - Zero-reference lines for each channel baseline
+    - Horizontal pan/zoom on time axis
     - Automatic downsampling (MAX_DISPLAY_SAMPLES=4096)
-    - Zero-reference lines, configurable grid
-  - Multi-panel layout (`app.rs`, `panels.rs`):
-    - Top toolbar: brand, mode selector (Demo/Device), run status, version
-    - Left panel: device info, acquisition start/stop, recording arm/record/stop, display settings (time/amplitude scale, visible channels, grid, labels, overlay)
-    - Right panel: per-channel RMS and peak-to-peak statistics, data rate, block rate, elapsed time
-    - Bottom status bar: connection/recording indicators, data rate, elapsed time, dropped blocks
-    - Central waveform area fills remaining space
+  - Professional toolbar layout (`app.rs`, rewritten session 5):
+    - Prominent Start/Stop and Record transport buttons with color states
+    - Real-time acquisition clock (yellow=acquiring, red=recording)
+    - Mode selector (Demo/Device)
+  - Collapsible sidebar (`panels.rs`, rewritten session 5):
+    - DEVICE: connection status, device info (CollapsingHeader)
+    - ACQUISITION: transport controls with status indicator
+    - DISPLAY: channel count slider, time/amplitude ComboBox, grid/label toggles
+    - CHANNELS: per-channel enable/disable checkboxes with colored bars, All/None toggle
+    - RECORDING: arm/record/stop workflow with directory selector
+  - Status bar: ACQ/IDLE, recording state, clock, device info, data rate, block rate, drops
+  - Keyboard shortcuts: Space=start/stop, R=record cycle, G=grid, 1-9=quick channel count
   - Device mode connects to SimulatorBackend via background thread (`preview.rs`)
   - History ring buffer (128 blocks) for scrolling waveform display
   - Real-time BlockStats computation (per-channel RMS/peak-to-peak, data rate, block rate)
@@ -239,7 +250,7 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-24 (session 4)
+Last verified: 2026-05-24 (session 5)
 
 Commands run successfully:
 
@@ -250,7 +261,7 @@ cargo build --bin kv-gui
 cargo clippy --workspace
 ```
 
-All 75 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `auto_scale`, `file_prefix`, `min`/`max` in ChannelStats, palette colors).
+All 75 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `overlay_mode`, `file_prefix`, `min`/`max` in ChannelStats, `channels`/`total_samples` in BlockStats).
 
 Current test count:
 
@@ -268,9 +279,9 @@ Current test count:
 
 ## How To Resume
 
-The full benchmark pipeline and professional GUI are feature-complete. The GUI has two working modes: Demo (auto-generating neural signals) and Device (SimulatorBackend via background thread). The next useful tasks, in priority order:
+The full benchmark pipeline and professional GUI are feature-complete. The GUI was refactored in session 5 to follow Intan RHX / Open Ephys layout patterns (single multi-channel plot, collapsible sidebar, transport buttons, keyboard shortcuts). The next useful tasks, in priority order:
 
-1. **Visual smoke test**: Run `cargo run --bin kv-gui` and verify the professional layout renders correctly: dark theme, multi-channel waveforms updating in real-time, left/right panels showing device info and channel statistics, bottom status bar showing data rate and elapsed time.
+1. **Visual smoke test**: Run `cargo gui` (or `gui.bat`) and verify: dark theme, multi-channel waterfall waveforms in a single plot, collapsible sidebar with channel checkboxes, transport buttons in toolbar, acquisition clock, status bar. Test keyboard shortcuts (Space, R, G, 1-9).
 
 2. **Wire GUI to live pipeline**: The Device mode uses `PreviewState` which wraps `start_preview()`. This already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition, so the GUI can monitor a live recording session.
 

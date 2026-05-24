@@ -1,8 +1,16 @@
 //! Main application struct implementing `eframe::App`.
 //!
-//! Modes:
-//!   Demo   – auto-starts with synthetic neural data, no real device needed.
-//!   Device – connects to a SimulatorBackend (or future real hardware).
+//! Layout follows professional acquisition software patterns:
+//!   Top:    Toolbar with transport controls, mode selector, clock
+//!   Left:   Control panel (collapsible sections)
+//!   Center: Multi-channel waveform display
+//!   Bottom: Status bar with key metrics
+//!
+//! Keyboard shortcuts:
+//!   Space  — Toggle acquisition start/stop
+//!   R      — Toggle recording (arm → record → stop)
+//!   G      — Toggle grid
+//!   1..9   — Quick-set visible channels (x4: 4,8,12,16,20,24,28,32,36)
 
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -12,7 +20,7 @@ use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
 use crate::demo::DemoPreview;
-use crate::panels::{self, DisplaySettings, RecordingSettings};
+use crate::panels::{self, DisplaySettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, PreviewState};
 use crate::theme;
 use crate::waveform;
@@ -107,6 +115,56 @@ impl KvApp {
         }
     }
 
+    fn toggle_acquisition(&mut self) {
+        if self.is_running() {
+            self.stop_all();
+        } else {
+            match self.mode {
+                AcqMode::Demo => self.start_demo(),
+                AcqMode::Device => self.start_device(),
+            }
+        }
+    }
+
+    fn toggle_recording(&mut self) {
+        match self.recording.state {
+            RecordingState::Idle => {
+                if self.is_running() {
+                    self.recording.state = RecordingState::Armed;
+                }
+            }
+            RecordingState::Armed => {
+                self.recording.state = RecordingState::Recording;
+                self.recording.recorded_blocks = 0;
+                self.recording.recorded_bytes = 0;
+            }
+            RecordingState::Recording => {
+                self.recording.state = RecordingState::Idle;
+            }
+        }
+    }
+
+    /// Elapsed time since acquisition started.
+    fn elapsed_seconds(&self) -> f64 {
+        if self.is_running() {
+            match self.mode {
+                AcqMode::Demo => Instant::now()
+                    .duration_since(self.demo_start_time)
+                    .as_secs_f64(),
+                AcqMode::Device => self
+                    .latest_stats
+                    .as_ref()
+                    .map(|s| s.elapsed_seconds)
+                    .unwrap_or(0.0),
+            }
+        } else {
+            self.latest_stats
+                .as_ref()
+                .map(|s| s.elapsed_seconds)
+                .unwrap_or(0.0)
+        }
+    }
+
     /// Tick the demo generator to produce blocks at real-time cadence.
     fn tick_demo(&mut self) {
         if !self.demo_started {
@@ -114,7 +172,6 @@ impl KvApp {
         }
 
         let now = Instant::now();
-        let _dt = now.duration_since(self.demo_last_tick).as_secs_f64();
         self.demo_last_tick = now;
 
         let elapsed_total = now.duration_since(self.demo_start_time).as_secs_f64();
@@ -137,7 +194,6 @@ impl KvApp {
         }
 
         if let Some(block) = last_block {
-            // Compute stats
             let stats = crate::preview::compute_block_stats(
                 &block,
                 self.demo_blocks_generated,
@@ -161,6 +217,42 @@ impl KvApp {
             self.latest_stats = self.device_preview.latest_stats.clone();
         }
     }
+
+    /// Handle keyboard shortcuts.
+    fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Only when no text field is focused
+        if ctx.memory(|m| m.focused().is_some()) {
+            return;
+        }
+
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Space) {
+                self.toggle_acquisition();
+            }
+            if i.key_pressed(egui::Key::R) {
+                self.toggle_recording();
+            }
+            if i.key_pressed(egui::Key::G) {
+                self.display.show_grid = !self.display.show_grid;
+            }
+            // 1-9: quick channel count (multiply by 4)
+            for (key, num) in [
+                (egui::Key::Num1, 4),
+                (egui::Key::Num2, 8),
+                (egui::Key::Num3, 12),
+                (egui::Key::Num4, 16),
+                (egui::Key::Num5, 20),
+                (egui::Key::Num6, 24),
+                (egui::Key::Num7, 28),
+                (egui::Key::Num8, 32),
+                (egui::Key::Num9, 36),
+            ] {
+                if i.key_pressed(key) {
+                    self.display.visible_channels = num;
+                }
+            }
+        });
+    }
 }
 
 impl eframe::App for KvApp {
@@ -176,17 +268,22 @@ impl eframe::App for KvApp {
             self.start_demo();
         }
 
+        // Handle keyboard shortcuts
+        self.handle_keys(ctx);
+
         // Tick
         match self.mode {
             AcqMode::Demo => self.tick_demo(),
             AcqMode::Device => self.tick_device(),
         }
 
+        let elapsed = self.elapsed_seconds();
+
         // ── Top toolbar ─────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_DARK)
+                    .fill(theme::BG_TOOLBAR)
                     .inner_margin(egui::Margin::symmetric(12, 6)),
             )
             .show(ctx, |ui| {
@@ -194,7 +291,7 @@ impl eframe::App for KvApp {
                     // Brand
                     ui.label(
                         egui::RichText::new("KEYVAST")
-                            .size(15.0)
+                            .size(16.0)
                             .strong()
                             .color(theme::ACCENT_BLUE),
                     );
@@ -209,6 +306,42 @@ impl eframe::App for KvApp {
                     ui.separator();
                     ui.add_space(8.0);
 
+                    // Transport buttons
+                    let running = self.is_running();
+                    if theme::transport_button(
+                        ui,
+                        if running { "  Stop  " } else { "  Start  " },
+                        if running {
+                            theme::BTN_STOP
+                        } else {
+                            theme::BTN_PLAY
+                        },
+                        true,
+                    ) {
+                        self.toggle_acquisition();
+                    }
+
+                    // Record button
+                    let rec_label = match self.recording.state {
+                        RecordingState::Idle => " Record ",
+                        RecordingState::Armed => " ARM ",
+                        RecordingState::Recording => " STOP REC ",
+                    };
+                    let rec_color = match self.recording.state {
+                        RecordingState::Idle => theme::BTN_DISABLED,
+                        RecordingState::Armed => theme::ACCENT_YELLOW,
+                        RecordingState::Recording => theme::BTN_RECORD_ACTIVE,
+                    };
+                    let rec_enabled =
+                        running || self.recording.state != RecordingState::Idle;
+                    if theme::transport_button(ui, rec_label, rec_color, rec_enabled) {
+                        self.toggle_recording();
+                    }
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
                     // Mode selector
                     ui.label(
                         egui::RichText::new("Mode:")
@@ -217,52 +350,58 @@ impl eframe::App for KvApp {
                     );
                     let demo_selected = self.mode == AcqMode::Demo;
                     if ui
-                        .selectable_label(demo_selected, egui::RichText::new("Demo").size(11.0))
-                        .on_hover_text("Synthetic neural data for demonstration")
+                        .selectable_label(
+                            demo_selected,
+                            egui::RichText::new("Demo").size(11.0),
+                        )
+                        .on_hover_text("Synthetic neural data (Space to toggle)")
                         .clicked()
                         && !demo_selected
                     {
                         self.start_demo();
                     }
                     if ui
-                        .selectable_label(!demo_selected, egui::RichText::new("Device").size(11.0))
-                        .on_hover_text("Simulator backend (or future real hardware)")
+                        .selectable_label(
+                            !demo_selected,
+                            egui::RichText::new("Device").size(11.0),
+                        )
+                        .on_hover_text("Simulator backend")
                         .clicked()
                         && demo_selected
                     {
                         self.start_device();
                     }
 
-                    ui.add_space(16.0);
-                    ui.separator();
-                    ui.add_space(8.0);
+                    // Right-aligned clock + version
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("v0.2.0")
+                                    .size(9.0)
+                                    .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(8.0);
 
-                    // Run status
-                    if self.is_running() {
-                        theme::status_dot(ui, theme::STATUS_CONNECTED);
-                        ui.label(
-                            egui::RichText::new("RUNNING")
-                                .size(10.0)
-                                .strong()
-                                .color(theme::ACCENT_GREEN),
-                        );
-                    } else {
-                        theme::status_dot(ui, theme::STATUS_IDLE);
-                        ui.label(
-                            egui::RichText::new("STOPPED")
-                                .size(10.0)
-                                .color(theme::STATUS_IDLE),
-                        );
-                    }
-
-                    // Right-aligned version
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("v0.1.0")
-                                .size(9.0)
-                                .color(theme::TEXT_DIM),
-                        );
-                    });
+                            // Acquisition clock
+                            let clock_color = if self.recording.state
+                                == RecordingState::Recording
+                            {
+                                theme::ACCENT_RED
+                            } else if running {
+                                theme::ACCENT_YELLOW
+                            } else {
+                                theme::TEXT_DIM
+                            };
+                            ui.label(
+                                egui::RichText::new(theme::format_clock(elapsed))
+                                    .size(14.0)
+                                    .monospace()
+                                    .strong()
+                                    .color(clock_color),
+                            );
+                        },
+                    );
                 });
             });
 
@@ -270,7 +409,7 @@ impl eframe::App for KvApp {
         egui::TopBottomPanel::bottom("status_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::BG_DARK)
+                    .fill(theme::BG_TOOLBAR)
                     .inner_margin(egui::Margin::symmetric(8, 3)),
             )
             .show(ctx, |ui| {
@@ -280,14 +419,15 @@ impl eframe::App for KvApp {
                     &self.recording,
                     self.latest_stats.as_ref(),
                     self.latest_block.as_ref(),
+                    elapsed,
                 );
             });
 
         // ── Left control panel ──────────────────────────────────
         egui::SidePanel::left("control_panel")
             .resizable(true)
-            .default_width(230.0)
-            .width_range(180.0..=320.0)
+            .default_width(240.0)
+            .width_range(200.0..=350.0)
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_PANEL)
@@ -318,31 +458,12 @@ impl eframe::App for KvApp {
                 }
             });
 
-        // ── Right statistics panel ──────────────────────────────
-        egui::SidePanel::right("stats_panel")
-            .resizable(true)
-            .default_width(210.0)
-            .width_range(160.0..=300.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG_PANEL)
-                    .inner_margin(egui::Margin::symmetric(10, 8)),
-            )
-            .show(ctx, |ui| {
-                panels::draw_right_panel(
-                    ui,
-                    self.latest_stats.as_ref(),
-                    self.latest_block.as_ref(),
-                    self.display.visible_channels,
-                );
-            });
-
         // ── Central waveform area ───────────────────────────────
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_DARKEST)
-                    .inner_margin(egui::Margin::symmetric(2, 2)),
+                    .inner_margin(egui::Margin::symmetric(4, 4)),
             )
             .show(ctx, |ui| {
                 waveform::draw_waveform_area(

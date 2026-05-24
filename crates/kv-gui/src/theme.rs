@@ -1,7 +1,9 @@
 //! Professional dark theme for Keyvast GUI.
 //!
-//! Modeled after Intan RHX / Blackrock Central style: dark backgrounds,
-//! high-contrast text, colored accent indicators.
+//! Modeled after Intan RHX / Open Ephys style: dark backgrounds,
+//! high-contrast text, colored accent indicators, clean typography.
+
+#![allow(dead_code)] // palette constants used progressively as features land
 
 use eframe::egui;
 
@@ -12,8 +14,7 @@ pub const BG_DARK: egui::Color32 = egui::Color32::from_rgb(24, 24, 30);
 pub const BG_PANEL: egui::Color32 = egui::Color32::from_rgb(30, 30, 38);
 pub const BG_WIDGET: egui::Color32 = egui::Color32::from_rgb(40, 40, 50);
 pub const BG_HOVER: egui::Color32 = egui::Color32::from_rgb(50, 50, 64);
-pub const BG_WAVEFORM_EVEN: egui::Color32 = egui::Color32::from_rgb(20, 20, 26);
-pub const BG_WAVEFORM_ODD: egui::Color32 = egui::Color32::from_rgb(24, 24, 30);
+pub const BG_TOOLBAR: egui::Color32 = egui::Color32::from_rgb(22, 22, 28);
 
 // ── Text ────────────────────────────────────────────────────────────
 
@@ -30,11 +31,18 @@ pub const ACCENT_BLUE: egui::Color32 = egui::Color32::from_rgb(70, 140, 255);
 pub const ACCENT_ORANGE: egui::Color32 = egui::Color32::from_rgb(240, 150, 40);
 pub const ACCENT_CYAN: egui::Color32 = egui::Color32::from_rgb(60, 200, 210);
 
+// ── Transport button colors ─────────────────────────────────────────
+
+pub const BTN_PLAY: egui::Color32 = egui::Color32::from_rgb(30, 140, 50);
+pub const BTN_PLAY_ACTIVE: egui::Color32 = egui::Color32::from_rgb(60, 180, 70);
+pub const BTN_STOP: egui::Color32 = egui::Color32::from_rgb(160, 40, 40);
+pub const BTN_RECORD: egui::Color32 = egui::Color32::from_rgb(200, 40, 40);
+pub const BTN_RECORD_ACTIVE: egui::Color32 = egui::Color32::from_rgb(240, 60, 60);
+pub const BTN_DISABLED: egui::Color32 = egui::Color32::from_rgb(50, 50, 60);
+
 // ── Grid / guides ───────────────────────────────────────────────────
 
-pub const GRID_MAJOR: egui::Color32 = egui::Color32::from_rgb(55, 55, 65);
-pub const GRID_MINOR: egui::Color32 = egui::Color32::from_rgb(35, 35, 42);
-pub const GRID_ZERO_LINE: egui::Color32 = egui::Color32::from_rgb(65, 65, 78);
+pub const GRID_ZERO_LINE: egui::Color32 = egui::Color32::from_rgb(55, 55, 68);
 
 // ── Status indicator colors ─────────────────────────────────────────
 
@@ -43,7 +51,7 @@ pub const STATUS_RECORDING: egui::Color32 = ACCENT_RED;
 pub const STATUS_ARMED: egui::Color32 = ACCENT_YELLOW;
 pub const STATUS_IDLE: egui::Color32 = egui::Color32::from_rgb(80, 80, 95);
 
-// ── Channel trace palette (8 colors cycling) ────────────────────────
+// ── Channel trace palette (16 distinct colors) ─────────────────────
 
 pub const CHANNEL_PALETTE: &[egui::Color32] = &[
     egui::Color32::from_rgb(80, 200, 80),   // green
@@ -54,6 +62,14 @@ pub const CHANNEL_PALETTE: &[egui::Color32] = &[
     egui::Color32::from_rgb(60, 200, 200),  // cyan
     egui::Color32::from_rgb(255, 90, 90),   // red
     egui::Color32::from_rgb(150, 200, 255), // light blue
+    egui::Color32::from_rgb(180, 255, 120), // lime
+    egui::Color32::from_rgb(255, 180, 200), // pink
+    egui::Color32::from_rgb(120, 100, 255), // indigo
+    egui::Color32::from_rgb(255, 200, 100), // gold
+    egui::Color32::from_rgb(100, 255, 200), // mint
+    egui::Color32::from_rgb(255, 120, 180), // hot pink
+    egui::Color32::from_rgb(160, 200, 80),  // olive
+    egui::Color32::from_rgb(100, 200, 255), // sky blue
 ];
 
 pub fn channel_color(channel: usize) -> egui::Color32 {
@@ -109,7 +125,7 @@ pub fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     ui.painter().circle_filled(rect.center(), 4.0, color);
 }
 
-/// Section heading for side panels.
+/// Section heading for side panels — collapsible style.
 pub fn section_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
     ui.label(
@@ -149,4 +165,41 @@ pub fn kv_label_colored(ui: &mut egui::Ui, key: &str, value: &str, color: egui::
             );
         });
     });
+}
+
+/// Compact transport button (play/stop/record style).
+pub fn transport_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    enabled: bool,
+) -> bool {
+    let btn = egui::Button::new(
+        egui::RichText::new(label)
+            .size(13.0)
+            .strong()
+            .color(if enabled {
+                egui::Color32::WHITE
+            } else {
+                TEXT_DIM
+            }),
+    )
+    .fill(if enabled { fill } else { BTN_DISABLED })
+    .min_size(egui::vec2(70.0, 28.0))
+    .corner_radius(egui::CornerRadius::same(4));
+
+    ui.add_enabled(enabled, btn).clicked()
+}
+
+/// Format seconds into HH:MM:SS.
+pub fn format_clock(seconds: f64) -> String {
+    let total_secs = seconds as u64;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h:02}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
 }

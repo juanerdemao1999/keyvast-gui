@@ -1,8 +1,12 @@
-//! Professional waveform rendering using egui_plot.
+//! Professional multi-channel waveform display.
 //!
-//! Each channel is rendered as an individual Plot widget inside a vertical
-//! ScrollArea.  egui_plot provides smooth antialiased lines, interactive
-//! pan/zoom, and automatic axis formatting out of the box.
+//! Renders all visible channels as vertically-stacked traces in a **single**
+//! `egui_plot::Plot` widget — matching the approach used by Intan RHX,
+//! Open Ephys, and other professional electrophysiology acquisition software.
+//!
+//! Each channel is offset vertically so traces form a waterfall display.
+//! A custom Y-axis formatter shows channel labels instead of numbers.
+//! Grid lines, zero-reference lines, and per-channel coloring are supported.
 
 use std::collections::VecDeque;
 
@@ -13,12 +17,15 @@ use kv_types::SampleBlock;
 use crate::panels::DisplaySettings;
 use crate::theme;
 
-/// Minimum height per channel trace in pixels.
-const MIN_CHANNEL_HEIGHT: f32 = 50.0;
-/// Maximum samples to display per channel (performance limit).
+/// Maximum samples to display per channel (performance guard).
 const MAX_DISPLAY_SAMPLES: usize = 4096;
 
-/// Draw the full waveform area using egui_plot.
+/// Vertical spacing (in normalized units) between channel baselines.
+const CHANNEL_SPACING: f64 = 2.2;
+
+// ── Public entry point ──────────────────────────────────────────────
+
+/// Draw the full waveform area — one large Plot with all channels stacked.
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     history: &VecDeque<SampleBlock>,
@@ -33,105 +40,103 @@ pub fn draw_waveform_area(
         }
     };
 
-    let channels = settings.visible_channels.min(block.channel_count);
-    if channels == 0 {
+    let total_channels = block.channel_count;
+    let visible = settings.visible_channels.min(total_channels);
+    if visible == 0 {
         draw_empty_state(ui);
         return;
     }
 
-    let available = ui.available_size();
-    let channel_height = (available.y / channels as f32).max(MIN_CHANNEL_HEIGHT);
+    let amp_scale = settings.amp_scale_uv();
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            for ch in 0..channels {
-                draw_channel_plot(
-                    ui,
-                    ch,
-                    channel_height,
-                    history,
-                    latest,
-                    block.channel_count,
-                    block.sample_rate,
-                    settings,
-                );
-            }
-        });
-}
+    // Build lines for each channel
+    let mut lines: Vec<(usize, Vec<[f64; 2]>)> = Vec::with_capacity(visible);
+    for ch in 0..visible {
+        if !settings.is_channel_enabled(ch) {
+            continue;
+        }
+        let raw_pts =
+            collect_channel_points(ch, history, latest, total_channels, block.sample_rate);
+        // Apply vertical offset: channel 0 at top, channel N at bottom
+        let y_offset = -(ch as f64) * CHANNEL_SPACING;
+        let scale = 1.0 / amp_scale.max(1.0) * 500.0; // normalize amplitude
+        let pts: Vec<[f64; 2]> = raw_pts
+            .into_iter()
+            .map(|[x, y]| [x, y * scale + y_offset])
+            .collect();
+        lines.push((ch, pts));
+    }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_channel_plot(
-    ui: &mut egui::Ui,
-    ch: usize,
-    height: f32,
-    history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
-    channel_count: usize,
-    sample_rate: f64,
-    settings: &DisplaySettings,
-) {
-    let color = theme::channel_color(ch);
-    let _bg = if ch.is_multiple_of(2) {
-        theme::BG_WAVEFORM_EVEN
-    } else {
-        theme::BG_WAVEFORM_ODD
+    // Y axis bounds
+    let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
+    let y_max = CHANNEL_SPACING * 0.5;
+
+    // Channel label formatter for Y-axis
+    let ch_count_for_fmt = visible;
+    let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
+        let val = mark.value;
+        // Map Y position back to channel index
+        let ch_idx = (-val / CHANNEL_SPACING).round() as i64;
+        if ch_idx >= 0 && (ch_idx as usize) < ch_count_for_fmt {
+            format!("CH{}", ch_idx)
+        } else {
+            String::new()
+        }
     };
 
-    // Collect samples for this channel across history + latest
-    let points = collect_channel_points(ch, history, latest, channel_count, sample_rate);
+    // Draw the combined plot
+    let plot = Plot::new("waveform_main")
+        .height(ui.available_height())
+        .width(ui.available_width())
+        .show_axes([true, true])
+        .show_grid(settings.show_grid)
+        .allow_drag([true, false])
+        .allow_zoom([true, false])
+        .allow_scroll(false)
+        .allow_boxed_zoom(false)
+        .include_y(y_min)
+        .include_y(y_max)
+        .show_x(true)
+        .show_y(true)
+        .x_axis_label("Time (ms)")
+        .y_axis_formatter(y_formatter)
+        .set_margin_fraction(egui::vec2(0.0, 0.01))
+        .legend(egui_plot::Legend::default().position(egui_plot::Corner::RightTop));
 
-    let plot_id = format!("ch_plot_{ch}");
+    plot.show(ui, |plot_ui| {
+        // Draw zero-reference lines for each channel
+        if settings.show_grid {
+            for ch in 0..visible {
+                if !settings.is_channel_enabled(ch) {
+                    continue;
+                }
+                let y_off = -(ch as f64) * CHANNEL_SPACING;
+                let zero_line = Line::new(PlotPoints::from(vec![
+                    [-10000.0, y_off],
+                    [100000.0, y_off],
+                ]))
+                .color(theme::GRID_ZERO_LINE)
+                .width(0.5)
+                .name("");
+                plot_ui.line(zero_line);
+            }
+        }
 
-    // Channel label on the left
-    ui.horizontal(|ui| {
-        // Color bar + label
-        let (bar_rect, _) = ui.allocate_exact_size(egui::vec2(4.0, height), egui::Sense::hover());
-        ui.painter().rect_filled(bar_rect, 0.0, color);
-
-        let (label_rect, _) =
-            ui.allocate_exact_size(egui::vec2(38.0, height), egui::Sense::hover());
-        ui.painter().text(
-            egui::pos2(label_rect.left() + 4.0, label_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            format!("CH{ch}"),
-            egui::FontId::monospace(9.0),
-            if settings.show_channel_labels {
-                theme::TEXT_SECONDARY
-            } else {
-                egui::Color32::TRANSPARENT
-            },
-        );
-
-        // Plot
-        let line = Line::new(PlotPoints::from(points)).color(color).width(1.2);
-
-        Plot::new(&plot_id)
-            .height(height)
-            .width(ui.available_width())
-            .show_axes(false)
-            .show_grid(settings.show_grid)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .allow_scroll(false)
-            .allow_boxed_zoom(false)
-            .include_y(-1.0)
-            .include_y(1.0)
-            .show_x(false)
-            .show_y(false)
-            .set_margin_fraction(egui::vec2(0.0, 0.02))
-            .show(ui, |plot_ui| {
-                // Zero reference line
-                let zero = Line::new(PlotPoints::from(vec![[0.0, 0.0], [1.0, 0.0]]))
-                    .color(theme::GRID_ZERO_LINE)
-                    .width(0.5);
-                plot_ui.line(zero);
-                plot_ui.line(line);
-            });
+        // Draw waveform traces
+        for (ch, pts) in &lines {
+            let color = theme::channel_color(*ch);
+            let line = Line::new(PlotPoints::from(pts.clone()))
+                .color(color)
+                .width(1.2)
+                .name(format!("CH{ch}"));
+            plot_ui.line(line);
+        }
     });
 }
 
-/// Collect (time_ms, normalized_value) pairs for one channel from the history ring.
+// ── Data collection ─────────────────────────────────────────────────
+
+/// Collect (time_ms, raw_normalized) pairs for one channel from the history ring.
 fn collect_channel_points(
     ch: usize,
     history: &VecDeque<SampleBlock>,
@@ -168,11 +173,11 @@ fn collect_channel_points(
         sample_offset += spc as u64;
     }
 
-    // Downsample if too many points (keep tail for real-time feel)
+    // Downsample if too many points — keep tail for real-time feel
     if all_points.len() > MAX_DISPLAY_SAMPLES {
         let skip = all_points.len() - MAX_DISPLAY_SAMPLES;
         all_points.drain(..skip);
-        // Re-zero time
+        // Re-zero time axis
         if let Some(t0) = all_points.first().map(|p| p[0]) {
             for p in &mut all_points {
                 p[0] -= t0;
@@ -183,16 +188,27 @@ fn collect_channel_points(
     all_points
 }
 
+// ── Empty state ─────────────────────────────────────────────────────
+
 fn draw_empty_state(ui: &mut egui::Ui) {
     let available = ui.available_size();
     let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
 
     ui.painter().rect_filled(rect, 0.0, theme::BG_DARKEST);
+
+    // Centered message
     ui.painter().text(
-        rect.center(),
+        rect.center() + egui::vec2(0.0, -12.0),
         egui::Align2::CENTER_CENTER,
-        "No data",
-        egui::FontId::proportional(16.0),
+        "No Data",
+        egui::FontId::proportional(18.0),
+        theme::TEXT_DIM,
+    );
+    ui.painter().text(
+        rect.center() + egui::vec2(0.0, 12.0),
+        egui::Align2::CENTER_CENTER,
+        "Press Start or switch to Demo mode",
+        egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
 }

@@ -20,9 +20,9 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24
+Last updated: 2026-05-24 (session 3)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, and benchmark runner are now complete.
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, GUI scaffold, latency distribution, and CPU/memory monitoring are now complete.
 
 Implemented:
 
@@ -179,10 +179,31 @@ Implemented:
   - default recorder capacity: 2048 blocks, preview: 32 blocks
   - binary smoke tests for all four commands
 
+- kv-gui scaffold implemented:
+  - `kv-gui` crate with egui/eframe
+  - `KeyvastApp` with tabbed interface (Waveform, Status)
+  - `WaveformWidget` for channel trace rendering
+  - `PreviewConsumer` for receiving blocks from pipeline preview consumer
+  - compiles and shows minimal window
+
+- Latency distribution implemented:
+  - `LatencyDistribution` struct in kv-recorder with count, min, max, mean, p50, p95, p99 (all in microseconds)
+  - `LatencyDistribution::from_samples(&[u64])` computes distribution from raw samples
+  - `StreamingRecordingSummary` carries `latency_distribution: Option<LatencyDistribution>`
+  - `StreamingPipelineResult` carries `latency_distribution: Option<LatencyDistribution>`
+  - `BenchmarkSummary` extended with `p50_write_latency_ms`, `p95_write_latency_ms`, `p99_write_latency_ms`
+  - `benchmark.json` output includes all three percentile fields
+
+- CPU/memory monitoring implemented:
+  - `kv-core::process_metrics` module
+  - `ProcessMetricsCollector::start()` / `finish(wall_clock_seconds)` pattern
+  - On Windows: uses `GetProcessTimes` for CPU%, `GetProcessMemoryInfo` for peak working set
+  - On non-Windows: returns `None` (graceful degradation)
+  - `BenchmarkSummary.cpu_percent_avg` and `memory_mb_max` populated during benchmark runs
+  - `windows-sys` v0.59 added as a `cfg(windows)` dependency in kv-core
+
 Not yet implemented:
 
-- `kv-gui`
-- Fine-grained benchmark timing metrics: CPU and memory tracking
 - `kv-daemon`
 
 ## Current Defaults In Use
@@ -213,32 +234,33 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-All 73 integration tests pass. Tests cover all four CLI commands (simulator-record, simulator-pipeline, simulator-stream, benchmark), streaming recording, incremental integrity, threaded fan-out pipeline, buffer management, and binary smoke tests.
+All 75 tests pass. Tests cover all four CLI commands (simulator-record, simulator-pipeline, simulator-stream, benchmark), streaming recording, incremental integrity, threaded fan-out pipeline, buffer management, latency distribution, process metrics, and binary smoke tests.
 
 Current test count:
 
 ```text
-8 passing integration tests in kv-buffer
-19 passing integration tests in kv-cli (6 record + 3 pipeline + 3 stream + 7 benchmark)
-14 passing integration tests in kv-core (4 acquisition + 6 pipeline + 4 streaming pipeline)
-4 passing integration tests in kv-types
-5 passing integration tests in kv-simulator
-10 passing integration tests in kv-integrity (6 batch + 4 incremental)
-13 passing integration tests in kv-recorder (9 batch + 4 streaming)
-73 total passing integration tests
+8 passing tests in kv-buffer
+19 passing tests in kv-cli (6 record + 3 pipeline + 3 stream + 7 benchmark)
+15 passing tests in kv-core (4 acquisition + 10 pipeline + 1 process_metrics)
+4 passing tests in kv-types
+5 passing tests in kv-simulator
+10 passing tests in kv-integrity (6 batch + 4 incremental)
+14 passing tests in kv-recorder (9 batch + 4 streaming + 1 latency distribution)
+0 tests in kv-gui (scaffold only)
+75 total passing tests
 ```
 
 ## How To Resume
 
-The streaming pipeline, incremental integrity, and benchmark runner are all complete. The next useful tasks, in priority order:
+The full benchmark pipeline is feature-complete: streaming recorder, incremental integrity, latency distribution (p50/p95/p99), CPU/memory monitoring, and GUI scaffold are all in place. The next useful tasks, in priority order:
 
-1. **kv-gui scaffold**: Create the `kv-gui` crate with a minimal `egui` window that connects to the pipeline's preview consumer. Start with a simple channel trace or status display. The pipeline's `preview` consumer is already wired; it just needs a real consumer.
+1. **Wire GUI to live pipeline**: The `kv-gui` scaffold compiles but uses dummy data. Connect it to a real `FanoutBlockBuffer` preview consumer so it displays live waveforms during acquisition. This requires a shared-state bridge between the pipeline thread and the egui render loop.
 
-2. **Run actual endurance benchmarks**: Use `kv-acq benchmark --preset smoke` to verify the 10-second smoke test, then ladder up to `--preset recorder` (10 min) and eventually `--preset endurance` (2 hours). Inspect the output `benchmark.json` for max write latency, buffer occupancy, and missing packets.
+2. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json` for write latency tail, buffer occupancy, CPU%, and peak memory.
 
-3. **Per-block latency distribution**: The streaming recorder already tracks `max_write_latency_us`. To get a full distribution (p50/p95/p99), add a histogram collector to `StreamingRecorder` or the streaming pipeline's recorder consumer thread.
+3. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits to catch throughput or latency regressions early.
 
-4. **CPU and memory metrics**: The `BenchmarkSummary` has `cpu_percent_avg: None` and `memory_mb_max: None` placeholders. On Windows, these can be populated via `GetProcessTimes` / `GetProcessMemoryInfo` or a lightweight sampling thread.
+4. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients. This is the next major crate after the GUI is functional.
 
 Recommended implementation boundary:
 

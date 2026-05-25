@@ -19,7 +19,8 @@ use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
 /// Maximum rendered points per channel (decimation target for performance).
-const MAX_DISPLAY_POINTS: usize = 4096;
+/// Min-max decimation emits 2 points per interval, so 6000 ≈ 3000 intervals.
+const MAX_DISPLAY_POINTS: usize = 6000;
 
 /// Vertical spacing (in normalized units) between channel baselines.
 const CHANNEL_SPACING: f64 = 2.2;
@@ -368,9 +369,12 @@ fn draw_ttl_markers(
 
 /// **Fast path** — used when no filter / CAR / spike-detection is enabled.
 ///
-/// Per-channel anchored decimation: the same physical samples are picked
-/// each frame, so the visible trace is rock-solid even as the viewport
-/// slides.  Per-channel DC mean is removed at the end.
+/// Uses **min-max decimation**: for each stride interval, we emit two
+/// points — the minimum and maximum sample values.  This guarantees that
+/// spikes, transients, and oscillation envelopes are never lost, matching
+/// the approach used by Intan RHX, Open Ephys, and LabChart.
+///
+/// When stride == 1 (no decimation needed), all samples are passed through.
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
@@ -388,7 +392,9 @@ fn collect_lines_fast(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+    // Each min-max pair is 2 points, so budget = MAX_DISPLAY_POINTS / 2 intervals
+    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
+    let no_decimate = stride <= 1;
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
@@ -396,6 +402,14 @@ fn collect_lines_fast(
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
+
+        // Min-max accumulation state for the current stride interval
+        let mut iv_min: f64 = f64::MAX;
+        let mut iv_max: f64 = f64::MIN;
+        let mut iv_t_min: f64 = 0.0;
+        let mut iv_t_max: f64 = 0.0;
+        let mut iv_id: u64 = u64::MAX;
+
         for block in history.iter() {
             if block.channel_count != channel_count {
                 continue;
@@ -408,9 +422,6 @@ fn collect_lines_fast(
             }
             for s in 0..spc {
                 let abs_idx = block.timestamp_start + s as u64;
-                if stride > 1 && !abs_idx.is_multiple_of(stride) {
-                    continue;
-                }
                 let time_ms = abs_idx as f64 * ms_per_sample;
                 if time_ms < t_left_ms || time_ms > t_right_ms {
                     continue;
@@ -421,9 +432,42 @@ fn collect_lines_fast(
                 } else {
                     0.0
                 };
-                pts.push([time_ms, value]);
+
+                if no_decimate {
+                    pts.push([time_ms, value]);
+                    continue;
+                }
+
+                let interval = abs_idx / stride;
+                if iv_id == u64::MAX {
+                    iv_id = interval;
+                    iv_min = value;
+                    iv_max = value;
+                    iv_t_min = time_ms;
+                    iv_t_max = time_ms;
+                } else if interval != iv_id {
+                    emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
+                    iv_id = interval;
+                    iv_min = value;
+                    iv_max = value;
+                    iv_t_min = time_ms;
+                    iv_t_max = time_ms;
+                } else {
+                    if value < iv_min {
+                        iv_min = value;
+                        iv_t_min = time_ms;
+                    }
+                    if value > iv_max {
+                        iv_max = value;
+                        iv_t_max = time_ms;
+                    }
+                }
             }
         }
+        if iv_id != u64::MAX && !no_decimate {
+            emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
+        }
+
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
             channel: ch,
@@ -460,7 +504,8 @@ fn collect_lines_filtered(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
+    let no_decimate = stride <= 1;
 
     // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
     // once for the maximum window length to avoid reallocation churn.
@@ -577,18 +622,57 @@ fn collect_lines_filtered(
         }
     }
 
-    // Anchored decimation + DC removal + gain/offset, per channel.
+    // Min-max decimation + DC removal + gain/offset, per channel.
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
         if !settings.is_channel_enabled(ch) {
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for (i, &abs_idx) in times.iter().enumerate() {
-            if stride > 1 && abs_idx % stride != 0 {
-                continue;
+        if no_decimate {
+            for (i, &abs_idx) in times.iter().enumerate() {
+                pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
             }
-            pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
+        } else {
+            let mut iv_min: f64 = f64::MAX;
+            let mut iv_max: f64 = f64::MIN;
+            let mut iv_t_min: f64 = 0.0;
+            let mut iv_t_max: f64 = 0.0;
+            let mut iv_id: u64 = u64::MAX;
+
+            for (i, &abs_idx) in times.iter().enumerate() {
+                let interval = abs_idx / stride;
+                let t = abs_idx as f64 * ms_per_sample;
+                let v = buffers[ch][i];
+
+                if iv_id == u64::MAX {
+                    iv_id = interval;
+                    iv_min = v;
+                    iv_max = v;
+                    iv_t_min = t;
+                    iv_t_max = t;
+                } else if interval != iv_id {
+                    // Flush
+                    emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
+                    iv_id = interval;
+                    iv_min = v;
+                    iv_max = v;
+                    iv_t_min = t;
+                    iv_t_max = t;
+                } else {
+                    if v < iv_min {
+                        iv_min = v;
+                        iv_t_min = t;
+                    }
+                    if v > iv_max {
+                        iv_max = v;
+                        iv_t_max = t;
+                    }
+                }
+            }
+            if iv_id != u64::MAX {
+                emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
+            }
         }
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
@@ -599,6 +683,23 @@ fn collect_lines_filtered(
         });
     }
     traces
+}
+
+/// Emit a min-max pair for one decimation interval.  The point that came
+/// first in time is emitted first so the polyline stays monotonic in X.
+#[inline]
+fn emit_minmax(pts: &mut Vec<[f64; 2]>, min: f64, max: f64, t_min: f64, t_max: f64) {
+    if t_min <= t_max {
+        pts.push([t_min, min]);
+        if (max - min).abs() > 1e-12 {
+            pts.push([t_max, max]);
+        }
+    } else {
+        pts.push([t_max, max]);
+        if (max - min).abs() > 1e-12 {
+            pts.push([t_min, min]);
+        }
+    }
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.

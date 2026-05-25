@@ -51,25 +51,47 @@ pub const STATUS_RECORDING: egui::Color32 = ACCENT_RED;
 pub const STATUS_ARMED: egui::Color32 = ACCENT_YELLOW;
 pub const STATUS_IDLE: egui::Color32 = egui::Color32::from_rgb(80, 80, 95);
 
-// ── Channel trace palette (16 distinct colors) ─────────────────────
+// ── Channel trace palette (32 distinct colors) ─────────────────────
+//
+// Hand-tuned to be perceptually distinct on a dark background.  The first
+// 16 are the original palette; the next 16 are shifted in hue/lightness
+// so that adjacent channels never share a similar color even at 32+ ch.
 
 pub const CHANNEL_PALETTE: &[egui::Color32] = &[
-    egui::Color32::from_rgb(80, 200, 80),   // green
-    egui::Color32::from_rgb(80, 150, 255),  // blue
-    egui::Color32::from_rgb(255, 140, 80),  // orange
-    egui::Color32::from_rgb(220, 200, 60),  // yellow
-    egui::Color32::from_rgb(200, 100, 220), // purple
-    egui::Color32::from_rgb(60, 200, 200),  // cyan
-    egui::Color32::from_rgb(255, 90, 90),   // red
-    egui::Color32::from_rgb(150, 200, 255), // light blue
-    egui::Color32::from_rgb(180, 255, 120), // lime
-    egui::Color32::from_rgb(255, 180, 200), // pink
-    egui::Color32::from_rgb(120, 100, 255), // indigo
-    egui::Color32::from_rgb(255, 200, 100), // gold
-    egui::Color32::from_rgb(100, 255, 200), // mint
-    egui::Color32::from_rgb(255, 120, 180), // hot pink
-    egui::Color32::from_rgb(160, 200, 80),  // olive
-    egui::Color32::from_rgb(100, 200, 255), // sky blue
+    // -- original 16 --
+    egui::Color32::from_rgb(80, 200, 80),   //  0 green
+    egui::Color32::from_rgb(80, 150, 255),  //  1 blue
+    egui::Color32::from_rgb(255, 140, 80),  //  2 orange
+    egui::Color32::from_rgb(220, 200, 60),  //  3 yellow
+    egui::Color32::from_rgb(200, 100, 220), //  4 purple
+    egui::Color32::from_rgb(60, 200, 200),  //  5 cyan
+    egui::Color32::from_rgb(255, 90, 90),   //  6 red
+    egui::Color32::from_rgb(150, 200, 255), //  7 light blue
+    egui::Color32::from_rgb(180, 255, 120), //  8 lime
+    egui::Color32::from_rgb(255, 180, 200), //  9 pink
+    egui::Color32::from_rgb(120, 100, 255), // 10 indigo
+    egui::Color32::from_rgb(255, 200, 100), // 11 gold
+    egui::Color32::from_rgb(100, 255, 200), // 12 mint
+    egui::Color32::from_rgb(255, 120, 180), // 13 hot pink
+    egui::Color32::from_rgb(160, 200, 80),  // 14 olive
+    egui::Color32::from_rgb(100, 200, 255), // 15 sky blue
+    // -- extended 16 (shifted hue/lightness) --
+    egui::Color32::from_rgb(140, 255, 140), // 16 bright green
+    egui::Color32::from_rgb(100, 110, 220), // 17 slate blue
+    egui::Color32::from_rgb(220, 100, 50),  // 18 burnt orange
+    egui::Color32::from_rgb(255, 255, 120), // 19 pale yellow
+    egui::Color32::from_rgb(160, 60, 180),  // 20 dark purple
+    egui::Color32::from_rgb(80, 240, 240),  // 21 bright cyan
+    egui::Color32::from_rgb(200, 50, 50),   // 22 dark red
+    egui::Color32::from_rgb(180, 220, 255), // 23 ice blue
+    egui::Color32::from_rgb(120, 200, 60),  // 24 grass
+    egui::Color32::from_rgb(255, 140, 160), // 25 salmon
+    egui::Color32::from_rgb(80, 70, 200),   // 26 deep indigo
+    egui::Color32::from_rgb(200, 160, 60),  // 27 amber
+    egui::Color32::from_rgb(60, 220, 160),  // 28 teal
+    egui::Color32::from_rgb(220, 80, 140),  // 29 magenta
+    egui::Color32::from_rgb(200, 220, 100), // 30 chartreuse
+    egui::Color32::from_rgb(140, 180, 220), // 31 steel blue
 ];
 
 pub fn channel_color(channel: usize) -> egui::Color32 {

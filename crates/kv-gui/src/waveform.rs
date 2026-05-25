@@ -17,8 +17,10 @@ use kv_types::SampleBlock;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
-/// Maximum rendered points per channel (decimation target for performance).
-const MAX_DISPLAY_POINTS: usize = 4096;
+/// Maximum rendered points per channel.
+/// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.
+/// We use a conservative budget to keep egui_plot tessellation cheap.
+const MAX_DISPLAY_POINTS: usize = 2000;
 
 /// Default vertical spacing (in normalized units) between channel baselines.
 pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
@@ -348,12 +350,16 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 
 /// **Fast path** — always used for rendering (data is pre-filtered by app).
 ///
-/// Min-max decimation: for each stride bucket, we keep the sample with the
-/// minimum value and the sample with the maximum value, emitted in time
-/// order.  This guarantees that short transients (spikes) are never lost
-/// during zoom-out, matching the approach used by Intan RHX.
+/// Stride-based decimation (SpikeGLX `draw1Analog` style): take every Nth
+/// sample where N = ceil(visible_samples / MAX_DISPLAY_POINTS).  This keeps
+/// line thickness equal to a single-pixel-width trace at all zoom levels,
+/// avoiding the "thickening" artifact that min-max decimation causes when
+/// rendered as a connected line strip.
 ///
-/// When stride == 1 (zoomed in enough), all samples pass through directly.
+/// Performance: uses binary search to find the first relevant block and
+/// arithmetic indexing within each block — never iterates samples outside
+/// the visible window or between stride positions.
+///
 /// Spike detection (sigma + threshold crossings) is computed inline when enabled.
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
@@ -375,9 +381,18 @@ fn collect_lines_fast(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    // Target ~MAX_DISPLAY_POINTS output points; with min-max each bucket
-    // emits 2 points, so we use half the budget for bucket count.
-    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
+    // SpikeGLX: dwnSmp = int(spanSmp / maxDim), maxDim = 2 * screen_width.
+    // We target MAX_DISPLAY_POINTS output points per channel.
+    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+
+    // Convert time bounds to absolute sample indices for fast arithmetic
+    let idx_left = (t_left_ms / ms_per_sample).floor() as u64;
+    let idx_right = (t_right_ms / ms_per_sample).ceil() as u64;
+
+    // Binary-search for first history block that might overlap [idx_left, idx_right].
+    // Blocks are ordered by timestamp_start — find the first whose end > idx_left.
+    let hist_slice = history.as_slices();
+    let first_block_pos = find_first_visible_block(hist_slice, idx_left, channel_count);
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
@@ -385,103 +400,50 @@ fn collect_lines_fast(
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
+        let norm = 1.0 / i16::MAX as f64;
 
-        if stride <= 1 {
-            // No decimation needed — emit every sample in the window
-            for block in history.iter().chain(latest) {
-                if block.channel_count != channel_count {
-                    continue;
-                }
-                let spc = block.samples_per_channel;
-                let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-                let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-                if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
-                    continue;
-                }
-                for s in 0..spc {
-                    let abs_idx = block.timestamp_start + s as u64;
-                    let time_ms = abs_idx as f64 * ms_per_sample;
-                    if time_ms < t_left_ms || time_ms > t_right_ms {
-                        continue;
-                    }
-                    let data_idx = s * channel_count + ch;
-                    let value = if data_idx < block.data.len() {
-                        block.data[data_idx] as f64 / i16::MAX as f64
-                    } else {
-                        0.0
-                    };
-                    pts.push([time_ms, value]);
-                }
+        // Iterate only blocks that overlap the visible window, starting from
+        // the binary-search position.
+        let iter = history.iter().skip(first_block_pos).chain(latest);
+        for block in iter {
+            if block.channel_count != channel_count {
+                continue;
             }
-        } else {
-            // Min-max decimation: partition samples into stride-sized buckets,
-            // keep the min and max sample from each bucket (in time order).
-            let mut bucket_min_val: f64 = f64::MAX;
-            let mut bucket_max_val: f64 = f64::MIN;
-            let mut bucket_min_time: f64 = 0.0;
-            let mut bucket_max_time: f64 = 0.0;
-            let mut bucket_has_data = false;
-            let mut last_bucket_id: u64 = u64::MAX;
-
-            for block in history.iter().chain(latest) {
-                if block.channel_count != channel_count {
-                    continue;
-                }
-                let spc = block.samples_per_channel;
-                let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-                let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-                if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
-                    continue;
-                }
-                for s in 0..spc {
-                    let abs_idx = block.timestamp_start + s as u64;
-                    let time_ms = abs_idx as f64 * ms_per_sample;
-                    if time_ms < t_left_ms || time_ms > t_right_ms {
-                        continue;
-                    }
-                    let data_idx = s * channel_count + ch;
-                    let value = if data_idx < block.data.len() {
-                        block.data[data_idx] as f64 / i16::MAX as f64
-                    } else {
-                        0.0
-                    };
-
-                    let bucket_id = abs_idx / stride;
-                    if bucket_id != last_bucket_id {
-                        // Flush previous bucket
-                        if bucket_has_data {
-                            emit_minmax(
-                                &mut pts,
-                                bucket_min_time, bucket_min_val,
-                                bucket_max_time, bucket_max_val,
-                            );
-                        }
-                        // Start new bucket
-                        bucket_min_val = value;
-                        bucket_max_val = value;
-                        bucket_min_time = time_ms;
-                        bucket_max_time = time_ms;
-                        bucket_has_data = true;
-                        last_bucket_id = bucket_id;
-                    } else {
-                        if value < bucket_min_val {
-                            bucket_min_val = value;
-                            bucket_min_time = time_ms;
-                        }
-                        if value > bucket_max_val {
-                            bucket_max_val = value;
-                            bucket_max_time = time_ms;
-                        }
-                    }
-                }
+            let spc = block.samples_per_channel;
+            let block_start = block.timestamp_start;
+            let block_end = block_start + spc as u64;
+            // Past the visible window → done
+            if block_start > idx_right {
+                break;
             }
-            // Flush last bucket
-            if bucket_has_data {
-                emit_minmax(
-                    &mut pts,
-                    bucket_min_time, bucket_min_val,
-                    bucket_max_time, bucket_max_val,
-                );
+            // Before the visible window → skip (shouldn't happen after bisect)
+            if block_end <= idx_left {
+                continue;
+            }
+
+            // Compute the sample range within this block that is both:
+            //   (a) inside the visible window [idx_left, idx_right]
+            //   (b) aligned to the global stride grid
+            let win_start = idx_left.max(block_start);
+            let win_end = idx_right.min(block_end);
+            // First stride-aligned index >= win_start
+            let first_aligned = if win_start % stride == 0 {
+                win_start
+            } else {
+                win_start + stride - (win_start % stride)
+            };
+
+            let mut abs_idx = first_aligned;
+            while abs_idx < win_end {
+                let s = (abs_idx - block_start) as usize;
+                let data_idx = s * channel_count + ch;
+                let value = if data_idx < block.data.len() {
+                    block.data[data_idx] as f64 * norm
+                } else {
+                    0.0
+                };
+                pts.push([abs_idx as f64 * ms_per_sample, value]);
+                abs_idx += stride;
             }
         }
 
@@ -522,24 +484,41 @@ fn collect_lines_fast(
     traces
 }
 
-/// Emit min and max points from a bucket in time order.  If min and max
-/// occur at the same time (identical sample), emit only one point.
-#[inline]
-fn emit_minmax(
-    pts: &mut Vec<[f64; 2]>,
-    min_time: f64, min_val: f64,
-    max_time: f64, max_val: f64,
-) {
-    if (min_time - max_time).abs() < 1e-9 {
-        // Same sample is both min and max (flat bucket or single sample)
-        pts.push([min_time, min_val]);
-    } else if min_time < max_time {
-        pts.push([min_time, min_val]);
-        pts.push([max_time, max_val]);
-    } else {
-        pts.push([max_time, max_val]);
-        pts.push([min_time, min_val]);
+/// Binary search for the first block in history whose end sample index
+/// is greater than `idx_left` (i.e. it overlaps the visible window).
+/// Returns an index into `history` (0 if all blocks are relevant).
+fn find_first_visible_block(
+    slices: (&[SampleBlock], &[SampleBlock]),
+    idx_left: u64,
+    channel_count: usize,
+) -> usize {
+    // Combine both slices conceptually for length
+    let total = slices.0.len() + slices.1.len();
+    if total == 0 {
+        return 0;
     }
+    // Accessor: logical index → block reference
+    let get = |i: usize| -> &SampleBlock {
+        if i < slices.0.len() {
+            &slices.0[i]
+        } else {
+            &slices.1[i - slices.0.len()]
+        }
+    };
+    // Binary search: find smallest i where block_end(i) > idx_left
+    let mut lo = 0usize;
+    let mut hi = total;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let b = get(mid);
+        let block_end = b.timestamp_start + b.samples_per_channel as u64;
+        if b.channel_count != channel_count || block_end <= idx_left {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.

@@ -23,8 +23,9 @@ use kv_types::SampleBlock;
 pub const RING_DWNSP: usize = 4;
 
 /// Ring stores this many seconds of pre-decimated data.
-/// 22s exceeds the maximum display window (20s) with a small margin.
-const RING_SECS: f64 = 22.0;
+/// 120s (2 min) allows paused browsing of a large history window.
+/// Memory: 120 * 30000/4 = 900,000 entries × 4 bytes × 16 ch ≈ 57 MB.
+const RING_SECS: f64 = 120.0;
 
 /// Pre-allocated display ring buffer.
 ///

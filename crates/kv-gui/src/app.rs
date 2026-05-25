@@ -88,6 +88,13 @@ pub struct KvApp {
     sweep_start_ms: f64,
     /// Show performance overlay (FPS, render time).
     pub show_perf_overlay: bool,
+    // Scroll accumulators — prevent smooth_scroll_delta from firing multiple
+    // discrete steps per physical mouse-wheel click.
+    // Each accumulator fills from smooth_scroll_delta; a step fires when
+    // |accum| reaches SCROLL_STEP_PX, then that amount is subtracted.
+    scroll_accum_y: f32,   // Y-axis amplitude zoom
+    scroll_accum_t: f32,   // X-axis time window zoom
+    scroll_accum_browse: f32, // paused time browse
     // Performance metrics
     last_frame: Instant,
     frame_ms_ema: f64,
@@ -123,6 +130,9 @@ impl KvApp {
             paused_elapsed: 0.0,
             sweep_start_ms: 0.0,
             show_perf_overlay: false,
+            scroll_accum_y: 0.0,
+            scroll_accum_t: 0.0,
+            scroll_accum_browse: 0.0,
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
@@ -763,10 +773,15 @@ impl eframe::App for KvApp {
                 //  Main area     → when paused: scroll browses time history
                 //                  when running: no scroll action
                 //  Drag (paused) → horizontal drag browses history
+                //
+                // Accumulator pattern: smooth_scroll_delta spreads one physical
+                // wheel click across several frames.  We accumulate and only
+                // fire a step when |accum| crosses SCROLL_STEP_PX, then subtract
+                // that threshold (not reset) so fast scrolling still works.
 
-                // Approximate axis-strip dimensions (pixel guesses for egui_plot layout)
-                const Y_STRIP_W: f32 = 55.0; // Y-axis label column
-                const X_STRIP_H: f32 = 28.0; // X-axis label row
+                const Y_STRIP_W: f32 = 55.0;  // Y-axis label column width
+                const X_STRIP_H: f32 = 28.0;  // X-axis label row height
+                const SCROLL_STEP_PX: f32 = 30.0; // pixels per discrete step
 
                 let sense = if self.display_paused {
                     egui::Sense::click_and_drag()
@@ -776,56 +791,78 @@ impl eframe::App for KvApp {
                 let scroll_response =
                     ui.interact(plot_rect, egui::Id::new("waveform_wheel"), sense);
 
-                // Determine which zone the cursor is currently in
-                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                let raw_scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                 let cursor_pos = ctx.input(|i| i.pointer.hover_pos());
 
-                if scroll.abs() > 1.0 {
+                // Route raw scroll into the correct accumulator
+                if raw_scroll.abs() > 0.5 {
                     if let Some(pos) = cursor_pos {
                         if plot_rect.contains(pos) {
                             let in_y_strip = pos.x < plot_rect.left() + Y_STRIP_W;
                             let in_x_strip = pos.y > plot_rect.bottom() - X_STRIP_H;
-
                             if in_y_strip && !in_x_strip {
-                                // Y-axis strip: scroll adjusts amplitude scale
-                                let max_idx = panels::AMP_SCALES.len() - 1;
-                                if scroll < 0.0 {
-                                    // scroll down → zoom out (larger µV range)
-                                    self.display.amp_scale_idx =
-                                        (self.display.amp_scale_idx + 1).min(max_idx);
-                                } else {
-                                    // scroll up → zoom in (smaller µV range)
-                                    self.display.amp_scale_idx =
-                                        self.display.amp_scale_idx.saturating_sub(1);
-                                }
+                                self.scroll_accum_y += raw_scroll;
                             } else if in_x_strip {
-                                // X-axis strip: scroll adjusts time window
-                                let max_idx = panels::TIME_WINDOWS.len() - 1;
-                                if scroll < 0.0 {
-                                    self.display.time_scale_idx =
-                                        (self.display.time_scale_idx + 1).min(max_idx);
-                                } else {
-                                    self.display.time_scale_idx =
-                                        self.display.time_scale_idx.saturating_sub(1);
-                                }
+                                self.scroll_accum_t += raw_scroll;
                             } else if self.display_paused {
-                                // Main area when paused: scroll browses time history
-                                let window_ms = self.display.time_window_ms();
-                                // One scroll step = 10% of the current time window
-                                let step_s = window_ms * 0.10 / 1000.0;
-                                if scroll < 0.0 {
-                                    // scroll down → go back in time
-                                    self.paused_elapsed =
-                                        (self.paused_elapsed - step_s).max(0.0);
-                                } else {
-                                    // scroll up → go forward in time
-                                    let live = self.elapsed_seconds();
-                                    self.paused_elapsed =
-                                        (self.paused_elapsed + step_s).min(live);
-                                }
+                                self.scroll_accum_browse += raw_scroll;
                             }
                         }
                     }
+                }
+
+                // Drain Y-axis accumulator → amplitude scale steps
+                {
+                    let max_idx = panels::AMP_SCALES.len() - 1;
+                    while self.scroll_accum_y >= SCROLL_STEP_PX {
+                        self.scroll_accum_y -= SCROLL_STEP_PX;
+                        // scroll up → zoom in (smaller µV range)
+                        self.display.amp_scale_idx =
+                            self.display.amp_scale_idx.saturating_sub(1);
+                    }
+                    while self.scroll_accum_y <= -SCROLL_STEP_PX {
+                        self.scroll_accum_y += SCROLL_STEP_PX;
+                        // scroll down → zoom out (larger µV range)
+                        self.display.amp_scale_idx =
+                            (self.display.amp_scale_idx + 1).min(max_idx);
+                    }
+                }
+
+                // Drain X-axis accumulator → time window steps
+                {
+                    let max_idx = panels::TIME_WINDOWS.len() - 1;
+                    while self.scroll_accum_t >= SCROLL_STEP_PX {
+                        self.scroll_accum_t -= SCROLL_STEP_PX;
+                        // scroll up → shorter time window
+                        self.display.time_scale_idx =
+                            self.display.time_scale_idx.saturating_sub(1);
+                    }
+                    while self.scroll_accum_t <= -SCROLL_STEP_PX {
+                        self.scroll_accum_t += SCROLL_STEP_PX;
+                        // scroll down → longer time window
+                        self.display.time_scale_idx =
+                            (self.display.time_scale_idx + 1).min(max_idx);
+                    }
+                }
+
+                // Drain browse accumulator → paused time position
+                if self.display_paused {
+                    let window_ms = self.display.time_window_ms();
+                    // One step = 80% of the current time window (almost a full page)
+                    let step_s = window_ms * 0.80 / 1000.0;
+                    let live = self.elapsed_seconds();
+                    while self.scroll_accum_browse >= SCROLL_STEP_PX {
+                        self.scroll_accum_browse -= SCROLL_STEP_PX;
+                        // scroll up → forward in time
+                        self.paused_elapsed = (self.paused_elapsed + step_s).min(live);
+                    }
+                    while self.scroll_accum_browse <= -SCROLL_STEP_PX {
+                        self.scroll_accum_browse += SCROLL_STEP_PX;
+                        // scroll down → back in time
+                        self.paused_elapsed = (self.paused_elapsed - step_s).max(0.0);
+                    }
+                } else {
+                    self.scroll_accum_browse = 0.0;
                 }
 
                 // Drag-to-browse when paused: horizontal drag shifts the view time

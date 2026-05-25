@@ -20,23 +20,29 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-25 (session 8 — GUI visual optimization planning)
+Last updated: 2026-05-25 (session 9 — GUI visual optimization complete)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
 
-### Session 8 focus: GUI visual optimization
+### Session 9: GUI visual optimization (ALL COMPLETE)
 
 See `docs/16-gui-optimization-plan.md` for the full plan with acceptance criteria.
 
-Priority order:
-1. Min-max decimation (preserve spikes when zoomed out)
-2. Persistent FilterChain state (eliminate left-edge transient)
-3. Voltage scale bar
-4. Dynamic channel spacing
-5. Extended color palette (64 channels)
-6. Drag-to-browse when paused
+All 3 rounds implemented:
+1. Min-max decimation (preserve spikes when zoomed out) -- DONE
+2. Filter warmup margin (eliminate left-edge transient) -- DONE
+3. Voltage scale bar -- DONE
+4. Dynamic channel spacing (+/- keys, slider) -- DONE
+5. Extended color palette (32 distinct colors) -- DONE
+6. Drag-to-browse when paused -- DONE
+
+### Session 9 commits on `dev`
+
+- `3a5b830` — Dynamic channel spacing: configurable via slider and +/- keys
+- `8697e23` — Expand channel palette to 32 distinct colors
+- `6c1ee6a` — Drag-to-browse history when display is paused
 
 ### Session 6 changes (waveform / UX polish)
 
@@ -61,9 +67,11 @@ Priority order:
 | `P`       | Pause / resume display                   |
 | `F`       | Toggle performance overlay               |
 | `[` `]`   | Decrease / increase time window          |
+| `+` `-`   | Increase / decrease channel spacing      |
 | `1`–`9`   | Quick-set visible channels               |
 | Wheel     | Increase / decrease time window          |
 | Hover     | Highlight channel + tooltip              |
+| Drag      | Browse history (when paused)             |
 
 ### Files most relevant to this session
 

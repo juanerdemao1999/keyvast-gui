@@ -80,6 +80,12 @@ pub struct KvApp {
     pub display_paused: bool,
     /// The elapsed time captured the moment the display was paused.
     paused_elapsed: f64,
+    /// Left edge of the current sweep window (ms since acquisition start).
+    ///
+    /// In sweep mode the X bounds are fixed: [sweep_start_ms, sweep_start_ms + window_ms].
+    /// A cursor sweeps right.  When latest_data_time overflows the right edge, the
+    /// sweep resets — matching the default display mode of SpikeGLX and Intan RHX.
+    sweep_start_ms: f64,
     /// Show performance overlay (FPS, render time).
     pub show_perf_overlay: bool,
     // Performance metrics
@@ -115,6 +121,7 @@ impl KvApp {
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
+            sweep_start_ms: 0.0,
             show_perf_overlay: false,
             last_frame: now,
             frame_ms_ema: 16.7,
@@ -134,6 +141,7 @@ impl KvApp {
         self.filtered_history.clear();
         self.filter_chains.clear();
         self.disp_ring.reset();
+        self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
         self.device_preview.stop();
@@ -147,6 +155,7 @@ impl KvApp {
         self.filtered_history.clear();
         self.filter_chains.clear();
         self.disp_ring.reset();
+        self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
         let config = SimulatorConfig::default();
@@ -532,6 +541,22 @@ impl eframe::App for KvApp {
             elapsed_live
         };
 
+        // ── Sweep-mode window management ─────────────────────────
+        // Advance sweep_start_ms when new data has filled the current window.
+        // This keeps x_left / x_right FIXED within a sweep — the entire display
+        // is stationary and only the cursor moves right, matching the SpikeGLX /
+        // Intan RHX default display mode.  When the window fills, the display
+        // resets to a new window (brief flash, once per window duration).
+        if !self.display_paused && self.disp_ring.ready {
+            let latest_ms = self.disp_ring.latest_time_ms();
+            let window_ms = self.display.time_window_ms();
+            if latest_ms >= self.sweep_start_ms + window_ms {
+                // Snap to the most recent complete window boundary
+                self.sweep_start_ms =
+                    (latest_ms / window_ms).floor() * window_ms;
+            }
+        }
+
         // ── Top toolbar ─────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar")
             .frame(
@@ -760,13 +785,22 @@ impl eframe::App for KvApp {
                 }
 
                 let render_start = Instant::now();
+                // In live mode: use sweep_start_ms so x_left/x_right stay
+                // fixed within a window (no scrolling).
+                // In paused mode: use elapsed (wall clock / drag position).
+                let sweep_left_ms = if self.display_paused {
+                    let window_ms = self.display.time_window_ms();
+                    (elapsed * 1000.0 - window_ms).max(0.0)
+                } else {
+                    self.sweep_start_ms
+                };
                 waveform::draw_waveform_area(
                     ui,
                     &self.disp_ring,
                     self.latest_block.as_ref(),
                     &self.display,
                     &self.filters,
-                    elapsed,
+                    sweep_left_ms,
                 );
                 let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
                 self.render_ms_ema = self.render_ms_ema * 0.9 + render_ms * 0.1;

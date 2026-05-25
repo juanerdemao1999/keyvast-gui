@@ -163,6 +163,16 @@ impl DisplayRing {
         self.next_expected = abs;
     }
 
+    /// Absolute time (ms) of the most recent entry in the ring.
+    /// Returns 0.0 if the ring is empty.
+    pub fn latest_time_ms(&self) -> f64 {
+        if self.len == 0 || !self.ready {
+            return 0.0;
+        }
+        (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0
+            / self.sample_rate
+    }
+
     /// Collect display points for `ch` in the time window [t_left_ms, t_right_ms].
     ///
     /// Returns a `Vec<[f64; 2]>` of (time_ms, normalized_y) pairs,
@@ -199,7 +209,28 @@ impl DisplayRing {
         let mut pts = Vec::with_capacity(pts_cap);
 
         let deque = &self.y[ch];
-        let mut i = ri_start;
+
+        // Align the first sample to the global absolute-sample grid.
+        // Without alignment, ri_start shifts slightly each frame (as t0 advances
+        // and x_left advances by slightly different amounts due to floating-point
+        // and integer-block rounding), causing the stride2 phase to drift and
+        // making the rendered trace appear to "jitter" horizontally.
+        //
+        // Fix: snap ri_start to the nearest index where
+        //   (t0 + ri * dwnsp) % (stride2 * dwnsp) == 0
+        // i.e. the absolute sample index is a multiple of stride2 * dwnsp.
+        let stride_abs = stride2 as u64 * self.dwnsp as u64;
+        let abs_start = self.t0 + ri_start as u64 * self.dwnsp as u64;
+        let phase = abs_start % stride_abs;
+        let aligned_ri_start = if phase == 0 {
+            ri_start
+        } else {
+            let skip_abs = stride_abs - phase;
+            let skip_ring = (skip_abs / self.dwnsp as u64) as usize;
+            ri_start + skip_ring
+        };
+
+        let mut i = aligned_ri_start;
         while i < ri_end {
             let t_ms = t0_ms + i as f64 * ms_per_ring;
             // Safety: i < self.len ≤ deque.len()

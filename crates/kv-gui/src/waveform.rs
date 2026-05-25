@@ -54,8 +54,13 @@ struct SpikeMeta {
 
 /// Draw the full waveform area — one large Plot with all channels stacked.
 ///
-/// `elapsed_secs` is the wall-clock time since acquisition started; it drives
-/// the X-axis window edge so scrolling is smooth and continuous.
+/// `sweep_left_ms` is the left edge of the current sweep window (ms since
+/// acquisition start).  The right edge is `sweep_left_ms + time_window_ms`.
+///
+/// In sweep mode these bounds are **fixed** for the duration of one sweep —
+/// the display is stationary and a cursor sweeps from left to right.  This
+/// is the display model used by SpikeGLX and Intan RHX, and eliminates the
+/// "twitching" caused by continuously shifting plot bounds.
 ///
 /// Data is read from `ring` (pre-computed at ingestion time) — no per-frame
 /// block history iteration.
@@ -65,7 +70,7 @@ pub fn draw_waveform_area(
     latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     filters: &FilterSettings,
-    elapsed_secs: f64,
+    sweep_left_ms: f64,
 ) {
     let block = match latest {
         Some(b) => b,
@@ -97,9 +102,14 @@ pub fn draw_waveform_area(
     // amplitude scale and channel spacing are independent controls).
     let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // X-axis window driven by wall clock — smooth continuous scroll
-    let x_right = elapsed_secs * 1000.0; // current time in ms
-    let x_left = (x_right - time_window_ms).max(0.0);
+    // Sweep-mode window: FIXED bounds for the duration of this sweep.
+    // The cursor (ring.latest_time_ms) sweeps from x_left to x_right.
+    // When it overflows, app.rs advances sweep_left_ms and the display resets.
+    let x_left = sweep_left_ms;
+    let x_right = x_left + time_window_ms;
+
+    // Latest ring data time — used to draw the sweep cursor line
+    let cursor_ms = ring.latest_time_ms();
 
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
@@ -232,6 +242,20 @@ pub fn draw_waveform_area(
                     .name(""),
                 );
             }
+        }
+
+        // Sweep cursor — vertical line at the latest data position.
+        // This is the SpikeGLX-style "write cursor" that sweeps right.
+        if cursor_ms > x_left && cursor_ms < x_right {
+            plot_ui.line(
+                Line::new(PlotPoints::from(vec![
+                    [cursor_ms, y_min],
+                    [cursor_ms, y_max],
+                ]))
+                .color(egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80))
+                .width(1.0)
+                .name(""),
+            );
         }
 
         // Draw waveform traces — highlight hovered channel.

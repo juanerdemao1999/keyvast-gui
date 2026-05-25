@@ -268,6 +268,99 @@ pub fn draw_waveform_area(
                     },
                 );
             }
+
+    // Voltage scale bar — small vertical reference on the bottom-right
+    draw_scale_bar(ui, &response, amp_scale, gain);
+}
+
+/// Draw a voltage scale bar in the bottom-right corner of the plot.
+/// The bar height corresponds to the amplitude scale setting (µV).
+fn draw_scale_bar(
+    ui: &egui::Ui,
+    response: &egui_plot::PlotResponse<Option<usize>>,
+    amp_scale_uv: f64,
+    gain: f64,
+) {
+    let painter = ui.painter();
+    let plot_rect = response.response.rect;
+
+    // The scale bar represents amp_scale_uv microvolts.
+    // In normalized units: amp_scale_uv µV / (i16::MAX µV per full-scale) doesn't apply
+    // here because our gain already maps normalized values to plot Y units.
+    // A 1.0 normalized signal → gain plot-units.  We want to show how tall
+    // amp_scale_uv is.  The raw i16 data is divided by i16::MAX, so 1.0 normalized
+    // = i16::MAX ADC counts.  If amp_scale = 1000 µV, and gain maps that to
+    // CHANNEL_SPACING * 3.0 * (1000/amp_scale) = CHANNEL_SPACING * 3.0 plot units.
+    //
+    // Actually simpler: the gain formula is:
+    //   gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale_uv)
+    // A signal of amplitude amp_scale_uv µV in raw ADC ~ amp_scale_uv / (i16::MAX_as_uV)
+    // But we don't know the actual µV/count conversion — we just use normalized values.
+    // For the scale bar, we want bar_height_in_Y_units = (some_reference / i16::MAX) * gain
+    //
+    // Simplification: since the user controls amp_scale as a display parameter,
+    // the bar represents "what amplitude fills one lane height".
+    // One lane half-height in Y-units ≈ CHANNEL_SPACING/2.
+    // The amp_scale combo sets how much µV maps to that height.
+    // So bar_height in Y-units for amp_scale_uv µV = CHANNEL_SPACING / 2 (roughly).
+    //
+    // Let's just pick a fixed fraction of the channel lane and label it with µV.
+    // Bar height = 1/3 of channel spacing in Y units.
+    let bar_y_units = CHANNEL_SPACING / 3.0;
+    let _ = gain; // suppress unused warning; gain isn't needed for the bar positioning
+
+    // Convert bar height from plot Y-units to screen pixels using the transform
+    let top_point = egui_plot::PlotPoint::new(0.0, 0.0);
+    let bot_point = egui_plot::PlotPoint::new(0.0, -bar_y_units);
+    let top_screen = response.transform.position_from_point(&top_point);
+    let bot_screen = response.transform.position_from_point(&bot_point);
+    let bar_height_px = (bot_screen.y - top_screen.y).abs();
+
+    // Only draw if bar is tall enough to be visible (at least 8 px)
+    if bar_height_px < 8.0 {
+        return;
+    }
+
+    // Position: bottom-right corner with some margin
+    let margin = 16.0;
+    let bar_x = plot_rect.right() - margin;
+    let bar_bottom = plot_rect.bottom() - margin - 12.0; // leave room for label
+    let bar_top = bar_bottom - bar_height_px;
+
+    // Draw the vertical bar with small horizontal ticks at top and bottom
+    let bar_color = theme::TEXT_SECONDARY;
+    let stroke = egui::Stroke::new(1.5, bar_color);
+    let tick_w = 4.0;
+
+    // Vertical line
+    painter.line_segment(
+        [egui::pos2(bar_x, bar_top), egui::pos2(bar_x, bar_bottom)],
+        stroke,
+    );
+    // Top tick
+    painter.line_segment(
+        [egui::pos2(bar_x - tick_w, bar_top), egui::pos2(bar_x + tick_w, bar_top)],
+        stroke,
+    );
+    // Bottom tick
+    painter.line_segment(
+        [egui::pos2(bar_x - tick_w, bar_bottom), egui::pos2(bar_x + tick_w, bar_bottom)],
+        stroke,
+    );
+
+    // Label — format µV nicely
+    let label = if amp_scale_uv >= 1000.0 {
+        format!("{:.0} mV", amp_scale_uv / 1000.0)
+    } else {
+        format!("{:.0} µV", amp_scale_uv)
+    };
+    painter.text(
+        egui::pos2(bar_x, bar_bottom + 4.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        egui::FontId::monospace(10.0),
+        bar_color,
+    );
 }
 
 fn format_time_tooltip(ch: usize, time_ms: f64) -> String {

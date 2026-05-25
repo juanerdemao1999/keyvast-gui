@@ -279,8 +279,8 @@ impl KvApp {
         // How many blocks should exist by now
         let target_blocks = self.demo.blocks_for_elapsed(elapsed_total) as u64;
         let needed = target_blocks.saturating_sub(self.demo_blocks_generated);
-        // Cap to avoid frame-time spikes
-        let generate = needed.min(16) as usize;
+        // Cap to avoid frame-time spikes (32 blocks ≈ 68ms at 30kHz/64spc)
+        let generate = needed.min(32) as usize;
 
         let mut last_block: Option<SampleBlock> = None;
         for _ in 0..generate {
@@ -649,10 +649,8 @@ impl eframe::App for KvApp {
                 self.hovered_channel = waveform::draw_waveform_area(
                     ui,
                     &self.block_history,
-                    self.latest_block.as_ref(),
                     &self.display,
                     &self.filters,
-                    elapsed,
                 );
                 let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
                 self.render_ms_ema = self.render_ms_ema * 0.9 + render_ms * 0.1;

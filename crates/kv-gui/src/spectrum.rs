@@ -14,8 +14,10 @@ use kv_types::SampleBlock;
 use crate::dsp::power_spectrum_db;
 use crate::theme;
 
-/// Height of the spectrum panel in logical pixels.
-const SPECTRUM_HEIGHT: f32 = 120.0;
+/// Maximum frequency shown on the spectrum (Hz).
+/// 500 Hz covers the spike band and LFP; above that is mostly noise
+/// for extracellular neural recordings.
+const MAX_DISPLAY_FREQ: f64 = 500.0;
 
 /// Draw the spectrum panel.  `hovered_channel` selects which channel's
 /// data we compute the PSD for.  Returns silently if no channel is hovered
@@ -34,8 +36,8 @@ pub fn draw_spectrum_panel(
         }
     };
 
-    // Collect the most recent samples for this channel from the history
-    // We want at least 512 samples for a useful spectrum; prefer 1024+
+    // Collect the most recent samples for this channel from the history.
+    // Data is interleaved: data[s * channel_count + ch].
     let min_samples = 512;
     let target_samples = 2048;
 
@@ -45,15 +47,14 @@ pub fn draw_spectrum_panel(
             break;
         }
         let spc = block.samples_per_channel;
-        let start = ch * spc;
-        let end = start + spc;
-        // Prepend block samples (we iterate blocks in reverse)
-        let chunk: Vec<f64> = block.data[start..end]
-            .iter()
-            .rev()
-            .map(|&s| s as f64 / 32768.0)
-            .collect();
-        raw.extend(chunk);
+        let ch_count = block.channel_count;
+        // Extract this channel's samples in reverse sample order
+        for s in (0..spc).rev() {
+            let data_idx = s * ch_count + ch;
+            if data_idx < block.data.len() {
+                raw.push(block.data[data_idx] as f64 / i16::MAX as f64);
+            }
+        }
         if raw.len() >= target_samples {
             break;
         }
@@ -64,7 +65,7 @@ pub fn draw_spectrum_panel(
         return;
     }
 
-    // Since we iterated in reverse order, reverse the collected samples
+    // Reverse so samples are in chronological order
     raw.reverse();
     // Trim to target
     if raw.len() > target_samples {
@@ -78,10 +79,11 @@ pub fn draw_spectrum_panel(
         return;
     }
 
-    // Build plot points
+    // Build plot points, capped at MAX_DISPLAY_FREQ
     let points: Vec<[f64; 2]> = freqs
         .iter()
         .zip(psd_db.iter())
+        .filter(|&(&f, _)| f <= MAX_DISPLAY_FREQ)
         .map(|(&f, &db)| [f, db])
         .collect();
 
@@ -104,28 +106,29 @@ pub fn draw_spectrum_panel(
         );
     });
 
+    let plot_height = ui.available_height().max(60.0);
     Plot::new("spectrum_plot")
-        .height(SPECTRUM_HEIGHT - 18.0)
+        .height(plot_height)
         .show_axes([true, true])
         .show_grid([true, true])
         .allow_drag(false)
         .allow_zoom(false)
         .allow_scroll(false)
         .allow_boxed_zoom(false)
-        .x_axis_label("Frequency (Hz)")
-        .y_axis_label("dB")
-        .include_x(0.0)
-        .include_x(sample_rate / 2.0)
-        .include_y(-80.0)
-        .include_y(0.0)
+        .auto_bounds(egui::Vec2b::new(false, false))
+        .x_axis_label("Hz")
         .show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                [0.0, -80.0],
+                [MAX_DISPLAY_FREQ, 5.0],
+            ));
             plot_ui.line(line);
         });
 }
 
 fn draw_placeholder(ui: &mut egui::Ui) {
     let available = ui.available_size();
-    let height = available.y.min(SPECTRUM_HEIGHT);
+    let height = available.y.max(40.0);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(available.x, height),
         egui::Sense::hover(),

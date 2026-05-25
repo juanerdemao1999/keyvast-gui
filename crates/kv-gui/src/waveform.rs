@@ -43,12 +43,10 @@ struct ChannelTrace {
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     filters: &FilterSettings,
-    elapsed_secs: f64,
 ) -> Option<usize> {
-    let block = match latest {
+    let block = match history.back() {
         Some(b) => b,
         None => {
             draw_empty_state(ui);
@@ -69,8 +67,14 @@ pub fn draw_waveform_area(
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
     let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // X-axis window driven by wall clock — smooth continuous scroll
-    let x_right = elapsed_secs * 1000.0; // current time in ms
+    // X-axis window anchored to the latest data timestamp.
+    // Using the actual data edge instead of wall clock prevents the viewport
+    // from racing ahead of data when frame rate drops (which caused the
+    // "compression toward left" visual artifact).
+    let data_edge_ms = (block.timestamp_start + block.samples_per_channel as u64) as f64
+        / block.sample_rate
+        * 1000.0;
+    let x_right = data_edge_ms;
     let x_left = (x_right - time_window_ms).max(0.0);
 
     // Decide pipeline: fast path (raw decimated) or full path (filter/CAR).
@@ -80,7 +84,6 @@ pub fn draw_waveform_area(
     let traces: Vec<ChannelTrace> = if needs_full_pipeline {
         collect_lines_filtered(
             history,
-            latest,
             settings,
             filters,
             visible,
@@ -93,7 +96,6 @@ pub fn draw_waveform_area(
     } else {
         collect_lines_fast(
             history,
-            latest,
             settings,
             visible,
             total_channels,
@@ -352,9 +354,8 @@ fn draw_ttl_markers(
                         [block_time_ms, y_max],
                     ]))
                     .color(color)
-                    .width(1.5)
-                    .style(egui_plot::LineStyle::dashed_loose())
-                    .name(format!("TTL{}", bit));
+                    .width(1.0)
+                    .style(egui_plot::LineStyle::dashed_loose());
                     plot_ui.line(line);
                 }
             }
@@ -373,7 +374,6 @@ fn draw_ttl_markers(
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     visible: usize,
     channel_count: usize,
@@ -396,7 +396,7 @@ fn collect_lines_fast(
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for block in history.iter().chain(latest) {
+        for block in history.iter() {
             if block.channel_count != channel_count {
                 continue;
             }
@@ -445,7 +445,6 @@ fn collect_lines_fast(
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn collect_lines_filtered(
     history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     filters: &FilterSettings,
     visible: usize,
@@ -470,7 +469,7 @@ fn collect_lines_filtered(
     let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
 
     let mut times_initialized = false;
-    for block in history.iter().chain(latest) {
+    for block in history.iter() {
         if block.channel_count != channel_count {
             continue;
         }

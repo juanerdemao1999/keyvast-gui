@@ -626,6 +626,23 @@ impl eframe::App for KvApp {
                         self.toggle_recording();
                     }
 
+                    // Pause button — only shown when running or already paused
+                    if running || self.display_paused {
+                        let pause_label = if self.display_paused {
+                            " Resume "
+                        } else {
+                            " Pause "
+                        };
+                        let pause_color = if self.display_paused {
+                            theme::ACCENT_BLUE
+                        } else {
+                            theme::TEXT_SECONDARY
+                        };
+                        if theme::transport_button(ui, pause_label, pause_color, true) {
+                            self.toggle_pause_display();
+                        }
+                    }
+
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(8.0);
@@ -848,8 +865,8 @@ impl eframe::App for KvApp {
                 // Drain browse accumulator → paused time position
                 if self.display_paused {
                     let window_ms = self.display.time_window_ms();
-                    // One step = 80% of the current time window (almost a full page)
-                    let step_s = window_ms * 0.80 / 1000.0;
+                    // One step = browse_step_pct% of the current time window
+                    let step_s = window_ms * (self.display.browse_step_pct / 100.0) / 1000.0;
                     let live = self.elapsed_seconds();
                     while self.scroll_accum_browse >= SCROLL_STEP_PX {
                         self.scroll_accum_browse -= SCROLL_STEP_PX;

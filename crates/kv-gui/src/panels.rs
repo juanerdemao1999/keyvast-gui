@@ -32,6 +32,9 @@ pub struct DisplaySettings {
     /// When true: hovering over a channel highlights it white and dims others.
     /// When false (default): all channels always render at full brightness.
     pub hover_highlight: bool,
+    /// Scroll step when browsing history while paused, as a percentage of
+    /// the current time window. Default 10 = 10% of window per scroll click.
+    pub browse_step_pct: f64,
     /// Per-channel enable/disable (true = visible).
     pub channel_enabled: Vec<bool>,
     /// Vertical spacing between channel baselines (1.0 = dense, 6.0 = spread).
@@ -55,6 +58,7 @@ impl Default for DisplaySettings {
             show_channel_labels: true,
             overlay_mode: false,
             hover_highlight: false,
+            browse_step_pct: 10.0,
             channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
             channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
         }
@@ -374,6 +378,23 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 egui::RichText::new("Hover hl").size(10.0),
             )
             .on_hover_text("Highlight hovered channel, dim others");
+        });
+
+        // Browse step — how far each scroll click moves when paused
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Browse step")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::Slider::new(&mut display.browse_step_pct, 1.0_f64..=100.0)
+                    .suffix("%")
+                    .step_by(1.0)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("How far each scroll step moves when paused (% of time window)");
         });
     });
 }

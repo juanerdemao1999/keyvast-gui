@@ -26,6 +26,20 @@ The project is in the simulator-first foundation phase. The streaming pipeline, 
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
 
+### Session 11: Waveform rendering overhaul (stride + O(output) collection)
+
+**Signal thickness fix**: Replaced min-max decimation with simple Nth-sample stride (SpikeGLX `draw1Analog` style). Min-max connected min and max as a line strip, causing zigzag / thick appearance. Stride emits 1 point per interval — thin consistent line at all zoom levels.
+
+**Fluidity fix**:
+- Binary search for first visible block: O(log N) vs O(N) across 10,000 history blocks per frame
+- Arithmetic sample indexing within each block: compute first stride-aligned index and step directly, never iterate samples outside the window
+- Overall: O(output_points) per channel, not O(input_samples)
+- MAX_DISPLAY_POINTS reduced from 4096 → 2000
+
+**Research basis**: Intan RHX `waveformdisplaymanager.cpp` and SpikeGLX `MGraph.cpp` source code. Both tools use 1-sample-per-display-unit rendering for normal mode; min-max / binMax is an explicit opt-in secondary mode in SpikeGLX.
+
+**Commit**: `07ee295`
+
 ### Session 10: Incremental filtering + bug fixes
 
 **Problem solved**: Enabling biquad/CAR filters caused frame drops because the entire visible window (5s × 30kHz × 16ch = 2.4M filter ops) was re-processed every frame.

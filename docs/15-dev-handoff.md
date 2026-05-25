@@ -20,11 +20,45 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-25 (session 10 — incremental filtering architecture)
+Last updated: 2026-05-25 (session 13 — sweep mode, rendering stable)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 13: Sweep mode stretch fix
+
+**Problem**: After introducing sweep mode in session 12, data appeared to progressively "stretch/zoom out" as the sweep filled in.
+
+**Root cause**: `stride2 = visible_ring_entries / max_points`. At sweep start, only ~7 ring entries are visible, so stride2=1 (high resolution). By sweep end, 37,500 entries are visible, stride2=18 (coarse). Early data was re-rendered at coarser resolution each frame, making it look stretched.
+
+**Fix**: stride2 now computed from the full **window** capacity, not the currently-filled portion. For a 5s window at 30kHz: window_ring_entries = 37,500, stride2 = 18 (constant from first frame of sweep).
+
+**Commit**: `6472ddd`
+
+---
+
+### Session 12: Sweep mode display + sampling phase fix
+
+**Problems fixed**:
+1. "Twitching/flickering" when scrolling
+2. Sampling phase drift causing horizontal waveform jitter
+
+**Root causes**:
+- Continuous scroll mode changed x_left/x_right every frame → all 32k data points changed pixel positions each frame even when data was unchanged
+- `collect_channel()` ri_start varied ±1-3 ring entries per frame; stride2=18 amplified this into visible phase drift
+
+**Fix 1 — Sweep mode** (SpikeGLX / Intan RHX default):
+- `x_left = sweep_start_ms` and `x_right = x_left + window_ms` stay **fixed** within one sweep
+- A cursor line sweeps from x_left to x_right as new data arrives
+- When cursor overflows, `sweep_start_ms` advances one window and display resets (brief flash, once every 5-20s)
+- Between resets: completely stationary display — no scrolling motion at all
+
+**Fix 2 — Global alignment**: `collect_channel()` snaps `ri_start` to the global absolute-sample grid (`abs_idx % (stride2 * dwnsp) == 0`), eliminating per-frame phase jitter.
+
+**Commits**: `8c98ab3`
+
+---
 
 ### Session 11: Waveform rendering overhaul (stride + O(output) collection)
 

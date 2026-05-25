@@ -290,9 +290,12 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 
 /// **Fast path** — used when no filter / CAR / spike-detection is enabled.
 ///
-/// Per-channel anchored decimation: the same physical samples are picked
-/// each frame, so the visible trace is rock-solid even as the viewport
-/// slides.  Per-channel DC mean is removed at the end.
+/// Min-max decimation: for each stride bucket, we keep the sample with the
+/// minimum value and the sample with the maximum value, emitted in time
+/// order.  This guarantees that short transients (spikes) are never lost
+/// during zoom-out, matching the approach used by Intan RHX.
+///
+/// When stride == 1 (zoomed in enough), all samples pass through directly.
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
@@ -311,7 +314,9 @@ fn collect_lines_fast(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+    // Target ~MAX_DISPLAY_POINTS output points; with min-max each bucket
+    // emits 2 points, so we use half the budget for bucket count.
+    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
@@ -319,34 +324,106 @@ fn collect_lines_fast(
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for block in history.iter().chain(latest) {
-            if block.channel_count != channel_count {
-                continue;
-            }
-            let spc = block.samples_per_channel;
-            let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-            let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-            if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
-                continue;
-            }
-            for s in 0..spc {
-                let abs_idx = block.timestamp_start + s as u64;
-                if stride > 1 && !abs_idx.is_multiple_of(stride) {
+
+        if stride <= 1 {
+            // No decimation needed — emit every sample in the window
+            for block in history.iter().chain(latest) {
+                if block.channel_count != channel_count {
                     continue;
                 }
-                let time_ms = abs_idx as f64 * ms_per_sample;
-                if time_ms < t_left_ms || time_ms > t_right_ms {
+                let spc = block.samples_per_channel;
+                let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
+                let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
+                if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
                     continue;
                 }
-                let data_idx = s * channel_count + ch;
-                let value = if data_idx < block.data.len() {
-                    block.data[data_idx] as f64 / i16::MAX as f64
-                } else {
-                    0.0
-                };
-                pts.push([time_ms, value]);
+                for s in 0..spc {
+                    let abs_idx = block.timestamp_start + s as u64;
+                    let time_ms = abs_idx as f64 * ms_per_sample;
+                    if time_ms < t_left_ms || time_ms > t_right_ms {
+                        continue;
+                    }
+                    let data_idx = s * channel_count + ch;
+                    let value = if data_idx < block.data.len() {
+                        block.data[data_idx] as f64 / i16::MAX as f64
+                    } else {
+                        0.0
+                    };
+                    pts.push([time_ms, value]);
+                }
+            }
+        } else {
+            // Min-max decimation: partition samples into stride-sized buckets,
+            // keep the min and max sample from each bucket (in time order).
+            let mut bucket_min_val: f64 = f64::MAX;
+            let mut bucket_max_val: f64 = f64::MIN;
+            let mut bucket_min_time: f64 = 0.0;
+            let mut bucket_max_time: f64 = 0.0;
+            let mut bucket_has_data = false;
+            let mut last_bucket_id: u64 = u64::MAX;
+
+            for block in history.iter().chain(latest) {
+                if block.channel_count != channel_count {
+                    continue;
+                }
+                let spc = block.samples_per_channel;
+                let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
+                let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
+                if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
+                    continue;
+                }
+                for s in 0..spc {
+                    let abs_idx = block.timestamp_start + s as u64;
+                    let time_ms = abs_idx as f64 * ms_per_sample;
+                    if time_ms < t_left_ms || time_ms > t_right_ms {
+                        continue;
+                    }
+                    let data_idx = s * channel_count + ch;
+                    let value = if data_idx < block.data.len() {
+                        block.data[data_idx] as f64 / i16::MAX as f64
+                    } else {
+                        0.0
+                    };
+
+                    let bucket_id = abs_idx / stride;
+                    if bucket_id != last_bucket_id {
+                        // Flush previous bucket
+                        if bucket_has_data {
+                            emit_minmax(
+                                &mut pts,
+                                bucket_min_time, bucket_min_val,
+                                bucket_max_time, bucket_max_val,
+                            );
+                        }
+                        // Start new bucket
+                        bucket_min_val = value;
+                        bucket_max_val = value;
+                        bucket_min_time = time_ms;
+                        bucket_max_time = time_ms;
+                        bucket_has_data = true;
+                        last_bucket_id = bucket_id;
+                    } else {
+                        if value < bucket_min_val {
+                            bucket_min_val = value;
+                            bucket_min_time = time_ms;
+                        }
+                        if value > bucket_max_val {
+                            bucket_max_val = value;
+                            bucket_max_time = time_ms;
+                        }
+                    }
+                }
+            }
+            // Flush last bucket
+            if bucket_has_data {
+                emit_minmax(
+                    &mut pts,
+                    bucket_min_time, bucket_min_val,
+                    bucket_max_time, bucket_max_val,
+                );
             }
         }
+
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
             channel: ch,
@@ -356,6 +433,26 @@ fn collect_lines_fast(
         });
     }
     traces
+}
+
+/// Emit min and max points from a bucket in time order.  If min and max
+/// occur at the same time (identical sample), emit only one point.
+#[inline]
+fn emit_minmax(
+    pts: &mut Vec<[f64; 2]>,
+    min_time: f64, min_val: f64,
+    max_time: f64, max_val: f64,
+) {
+    if (min_time - max_time).abs() < 1e-9 {
+        // Same sample is both min and max (flat bucket or single sample)
+        pts.push([min_time, min_val]);
+    } else if min_time < max_time {
+        pts.push([min_time, min_val]);
+        pts.push([max_time, max_val]);
+    } else {
+        pts.push([max_time, max_val]);
+        pts.push([min_time, min_val]);
+    }
 }
 
 /// **Full pipeline** — used when any HP/LP/Notch/CAR is enabled.
@@ -384,7 +481,6 @@ fn collect_lines_filtered(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
 
     // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
     // once for the maximum window length to avoid reallocation churn.
@@ -501,19 +597,70 @@ fn collect_lines_filtered(
         }
     }
 
-    // Anchored decimation + DC removal + gain/offset, per channel.
+    // Min-max decimation + DC removal + gain/offset, per channel.
+    // Use half budget for bucket count since each bucket emits 2 points.
+    let stride_filtered = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
+
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
         if !settings.is_channel_enabled(ch) {
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for (i, &abs_idx) in times.iter().enumerate() {
-            if stride > 1 && abs_idx % stride != 0 {
-                continue;
+
+        if stride_filtered <= 1 {
+            // No decimation — emit all filtered samples
+            for (i, &abs_idx) in times.iter().enumerate() {
+                pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
             }
-            pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
+        } else {
+            // Min-max decimation on filtered data
+            let mut bucket_min_val: f64 = f64::MAX;
+            let mut bucket_max_val: f64 = f64::MIN;
+            let mut bucket_min_time: f64 = 0.0;
+            let mut bucket_max_time: f64 = 0.0;
+            let mut bucket_has_data = false;
+            let mut last_bucket_id: u64 = u64::MAX;
+
+            for (i, &abs_idx) in times.iter().enumerate() {
+                let time_ms = abs_idx as f64 * ms_per_sample;
+                let value = buffers[ch][i];
+                let bucket_id = abs_idx / stride_filtered;
+
+                if bucket_id != last_bucket_id {
+                    if bucket_has_data {
+                        emit_minmax(
+                            &mut pts,
+                            bucket_min_time, bucket_min_val,
+                            bucket_max_time, bucket_max_val,
+                        );
+                    }
+                    bucket_min_val = value;
+                    bucket_max_val = value;
+                    bucket_min_time = time_ms;
+                    bucket_max_time = time_ms;
+                    bucket_has_data = true;
+                    last_bucket_id = bucket_id;
+                } else {
+                    if value < bucket_min_val {
+                        bucket_min_val = value;
+                        bucket_min_time = time_ms;
+                    }
+                    if value > bucket_max_val {
+                        bucket_max_val = value;
+                        bucket_max_time = time_ms;
+                    }
+                }
+            }
+            if bucket_has_data {
+                emit_minmax(
+                    &mut pts,
+                    bucket_min_time, bucket_min_val,
+                    bucket_max_time, bucket_max_val,
+                );
+            }
         }
+
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
             channel: ch,

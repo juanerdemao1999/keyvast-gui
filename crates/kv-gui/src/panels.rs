@@ -539,9 +539,13 @@ fn draw_channel_list(
         });
 
         // Scrollable channel checkboxes
+        // min_scrolled_width reserves enough room so the scrollbar never
+        // overlaps the channel name / checkbox content.
         egui::ScrollArea::vertical()
             .max_height(200.0)
+            .min_scrolled_width(160.0)
             .show(ui, |ui| {
+                ui.set_min_width(160.0);
                 for ch in 0..visible {
                     // Ensure vector is big enough
                     while display.channel_enabled.len() <= ch {

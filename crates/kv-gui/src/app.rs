@@ -25,6 +25,7 @@ use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
 use crate::demo::DemoPreview;
+use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, PreviewState};
@@ -65,6 +66,10 @@ pub struct KvApp {
     /// The settings that `filter_chains` was built with.  When the user
     /// changes filter parameters we detect the mismatch and rebuild.
     filter_settings_snapshot: FilterSettings,
+    /// Pre-computed display ring buffer (SpikeGLX WrapBuffer pattern).
+    /// Populated at ingestion time; rendering reads from this instead of
+    /// iterating block_history each frame.
+    disp_ring: DisplayRing,
     // UI state
     display: DisplaySettings,
     filters: FilterSettings,
@@ -103,6 +108,7 @@ impl KvApp {
             latest_stats: None,
             filter_chains: Vec::new(),
             filter_settings_snapshot: filters,
+            disp_ring: DisplayRing::new(16, 30_000.0),
             display: DisplaySettings::default(),
             filters,
             recording: RecordingSettings::default(),
@@ -127,6 +133,7 @@ impl KvApp {
         self.block_history.clear();
         self.filtered_history.clear();
         self.filter_chains.clear();
+        self.disp_ring.reset();
         self.latest_block = None;
         self.latest_stats = None;
         self.device_preview.stop();
@@ -139,6 +146,7 @@ impl KvApp {
         self.block_history.clear();
         self.filtered_history.clear();
         self.filter_chains.clear();
+        self.disp_ring.reset();
         self.latest_block = None;
         self.latest_stats = None;
         let config = SimulatorConfig::default();
@@ -204,6 +212,24 @@ impl KvApp {
         }
         // Keep persistent chains in sync (their state now reflects all history)
         self.filter_chains = chains;
+
+        // Rebuild display ring from the re-filtered history
+        if self.disp_ring.channel_count != channel_count
+            || (self.disp_ring.sample_rate - sample_rate).abs() > 1.0
+        {
+            self.disp_ring.reconfigure(channel_count, sample_rate);
+        } else {
+            self.disp_ring.reset();
+        }
+        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
+        let source = if needs_filter {
+            &self.filtered_history
+        } else {
+            &self.block_history
+        };
+        for block in source.iter() {
+            self.disp_ring.push_block(block);
+        }
     }
 
     /// Apply filter chains to a single block, producing a new filtered block.
@@ -244,7 +270,8 @@ impl KvApp {
         }
     }
 
-    /// Process a new incoming block: store raw, filter incrementally, store filtered.
+    /// Process a new incoming block: store raw, filter incrementally, store filtered,
+    /// and push the display-ready version into the display ring buffer.
     fn ingest_block(&mut self, block: SampleBlock) {
         let ch_count = block.channel_count;
         let sample_rate = block.sample_rate;
@@ -252,6 +279,13 @@ impl KvApp {
         // Detect filter settings change → rebuild chains
         if self.filters != self.filter_settings_snapshot || self.filter_chains.len() != ch_count {
             self.rebuild_filter_chains(sample_rate, ch_count);
+        }
+
+        // Reconfigure display ring if channel count or sample rate changed
+        if self.disp_ring.channel_count != ch_count
+            || (self.disp_ring.sample_rate - sample_rate).abs() > 1.0
+        {
+            self.disp_ring.reconfigure(ch_count, sample_rate);
         }
 
         // Produce filtered version using persistent chains
@@ -262,7 +296,10 @@ impl KvApp {
             block.clone()
         };
 
-        // Store
+        // Feed display ring from the display-ready (filtered or raw) block
+        self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
+
+        // Store raw + filtered history for pause/browse and re-filter
         self.block_history.push_back(block.clone());
         self.filtered_history.push_back(filtered);
         while self.block_history.len() > self.history_capacity {
@@ -723,18 +760,9 @@ impl eframe::App for KvApp {
                 }
 
                 let render_start = Instant::now();
-                // Use pre-filtered history when any filter/CAR is active —
-                // rendering always takes the fast path (no per-frame filtering).
-                let needs_filtered = self.filters.any_filter_enabled()
-                    || self.filters.car_enabled;
-                let display_history = if needs_filtered {
-                    &self.filtered_history
-                } else {
-                    &self.block_history
-                };
                 waveform::draw_waveform_area(
                     ui,
-                    display_history,
+                    &self.disp_ring,
                     self.latest_block.as_ref(),
                     &self.display,
                     &self.filters,

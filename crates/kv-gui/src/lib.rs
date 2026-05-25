@@ -8,6 +8,7 @@
 
 mod app;
 mod demo;
+mod disp_ring;
 mod dsp;
 mod panels;
 mod preview;

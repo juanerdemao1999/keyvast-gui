@@ -14,7 +14,6 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
@@ -67,45 +66,23 @@ pub fn draw_waveform_area(
     let time_window_ms = settings.time_window_ms();
     let ch_spacing = settings.channel_spacing;
 
-    // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
-    let gain = ch_spacing * 3.0 * (1000.0 / amp_scale.max(1.0));
+    // Gain maps normalized i16 data to visual Y-units.  Independent of
+    // ch_spacing so that adjusting spacing does NOT change waveform amplitude.
+    // Uses the default lane height as the reference (like Intan RHX where
+    // amplitude scale and channel spacing are independent controls).
+    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
     // X-axis window driven by wall clock — smooth continuous scroll
     let x_right = elapsed_secs * 1000.0; // current time in ms
     let x_left = (x_right - time_window_ms).max(0.0);
 
-    // Decide pipeline: fast path (raw decimated) or full path (filter/CAR).
-    let needs_full_pipeline =
-        filters.any_filter_enabled() || filters.car_enabled || filters.spike_threshold_enabled;
-
-    let traces: Vec<ChannelTrace> = if needs_full_pipeline {
-        collect_lines_filtered(
-            history,
-            latest,
-            settings,
-            filters,
-            visible,
-            total_channels,
-            block.sample_rate,
-            x_left,
-            x_right,
-            gain,
-            ch_spacing,
-        )
-    } else {
-        collect_lines_fast(
-            history,
-            latest,
-            settings,
-            visible,
-            total_channels,
-            block.sample_rate,
-            x_left,
-            x_right,
-            gain,
-            ch_spacing,
-        )
-    };
+    // Data is pre-filtered by app.rs (incremental pipeline) — always use
+    // the fast decimation path.  Spike threshold detection runs inline on
+    // the (already-filtered) decimated data when enabled.
+    let traces = collect_lines_fast(
+        history, latest, settings, filters, visible, total_channels,
+        block.sample_rate, x_left, x_right, gain, ch_spacing,
+    );
 
     // Y axis bounds
     let y_min = -(visible as f64) * ch_spacing + ch_spacing * 0.5;
@@ -283,16 +260,19 @@ fn draw_scale_bar(
     ui: &egui::Ui,
     response: &egui_plot::PlotResponse<Option<usize>>,
     amp_scale_uv: f64,
-    ch_spacing: f64,
+    _ch_spacing: f64,
 ) {
     let painter = ui.painter();
     let plot_rect = response.response.rect;
 
-    // The scale bar represents amp_scale_uv microvolts.
-    // Bar height = 1/3 of channel spacing in Y units.
-    // The amp_scale combo sets how much µV maps to one lane height,
-    // so 1/3 of that is amp_scale_uv / 3 µV.
-    let bar_y_units = ch_spacing / 3.0;
+    // The scale bar shows the amp_scale setting as a visual reference.
+    // gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000 / amp_scale).
+    // A normalized amplitude of amp_scale/1000 (the "unit" signal) maps to:
+    //   (amp_scale/1000) * gain = DEFAULT_CHANNEL_SPACING * 3.0 Y-units.
+    // So the bar representing amp_scale µV has height DEFAULT_CHANNEL_SPACING * 3.0.
+    // That's the entire lane (too tall). Instead show amp_scale/3 µV (1/3 lane):
+    let bar_y_units = DEFAULT_CHANNEL_SPACING;
+    let bar_voltage_uv = amp_scale_uv / 3.0;
 
     // Convert bar height from plot Y-units to screen pixels using the transform
     let top_point = egui_plot::PlotPoint::new(0.0, 0.0);
@@ -333,11 +313,11 @@ fn draw_scale_bar(
         stroke,
     );
 
-    // Label — format µV nicely
-    let label = if amp_scale_uv >= 1000.0 {
-        format!("{:.0} mV", amp_scale_uv / 1000.0)
+    // Label — format µV nicely (bar represents 1/3 of amp_scale)
+    let label = if bar_voltage_uv >= 1000.0 {
+        format!("{:.0} mV", bar_voltage_uv / 1000.0)
     } else {
-        format!("{:.0} µV", amp_scale_uv)
+        format!("{:.0} µV", bar_voltage_uv)
     };
     painter.text(
         egui::pos2(bar_x, bar_bottom + 4.0),
@@ -366,7 +346,7 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 
 // ── Data collection ─────────────────────────────────────────────────
 
-/// **Fast path** — used when no filter / CAR / spike-detection is enabled.
+/// **Fast path** — always used for rendering (data is pre-filtered by app).
 ///
 /// Min-max decimation: for each stride bucket, we keep the sample with the
 /// minimum value and the sample with the maximum value, emitted in time
@@ -374,11 +354,13 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 /// during zoom-out, matching the approach used by Intan RHX.
 ///
 /// When stride == 1 (zoomed in enough), all samples pass through directly.
+/// Spike detection (sigma + threshold crossings) is computed inline when enabled.
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
     latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
+    filters: &FilterSettings,
     visible: usize,
     channel_count: usize,
     sample_rate: f64,
@@ -503,12 +485,38 @@ fn collect_lines_fast(
             }
         }
 
+        // Spike detection on the raw (pre-finalize) points when enabled.
+        // Using un-offset, un-gained values (normalized amplitude).
+        let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
+            let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
+            let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
+            let sig = var.sqrt();
+            let thresh = -filters.spike_threshold_sigma * sig;
+            let refractory = (sample_rate * 0.001).max(1.0) as usize;
+            let mut count = 0u32;
+            let mut last_cross: Option<usize> = None;
+            let mut prev = 0.0;
+            for (i, p) in pts.iter().enumerate() {
+                let centered = p[1] - mean;
+                if i > 0 && prev >= thresh && centered < thresh
+                    && last_cross.is_none_or(|l| i - l >= refractory)
+                {
+                    count = count.saturating_add(1);
+                    last_cross = Some(i);
+                }
+                prev = centered;
+            }
+            (Some(sig), count)
+        } else {
+            (None, 0)
+        };
+
         finalize_channel(&mut pts, ch, gain, ch_spacing);
         traces.push(ChannelTrace {
             channel: ch,
             points: pts,
-            sigma: None,
-            spike_count: 0,
+            sigma,
+            spike_count,
         });
     }
     traces
@@ -534,236 +542,6 @@ fn emit_minmax(
     }
 }
 
-/// **Full pipeline** — used when any HP/LP/Notch/CAR is enabled.
-///
-/// Collects raw samples from the visible window plus a 50 ms warm-up margin
-/// to the left.  CAR and biquad filters are applied to the full buffer in
-/// sample order; the warm-up gives the filter enough time to reach steady
-/// state before the displayed portion, eliminating edge transients.
-/// Only samples within the visible window are decimated and rendered.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn collect_lines_filtered(
-    history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
-    settings: &DisplaySettings,
-    filters: &FilterSettings,
-    visible: usize,
-    channel_count: usize,
-    sample_rate: f64,
-    t_left_ms: f64,
-    t_right_ms: f64,
-    gain: f64,
-    ch_spacing: f64,
-) -> Vec<ChannelTrace> {
-    let ms_per_sample = if sample_rate > 0.0 {
-        1000.0 / sample_rate
-    } else {
-        1.0
-    };
-    let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-
-    // Warm-up margin: collect extra samples before the visible window so
-    // the filter reaches steady state before the displayed portion.
-    // 50 ms is enough for a 300 Hz HP biquad to settle (3*tau ≈ 1.6 ms).
-    let warmup_ms: f64 = 50.0;
-    let collect_left_ms = (t_left_ms - warmup_ms).max(0.0);
-
-    // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
-    // once for the maximum window length to avoid reallocation churn.
-    let cap = window_samples as usize + (warmup_ms / ms_per_sample) as usize + 1024;
-    let mut times: Vec<u64> = Vec::with_capacity(cap);
-    let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
-
-    let mut times_initialized = false;
-    for block in history.iter().chain(latest) {
-        if block.channel_count != channel_count {
-            continue;
-        }
-        let spc = block.samples_per_channel;
-        let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-        let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-        // Use collect_left_ms (with warmup) for collection range
-        if block_end_ms < collect_left_ms || block_start_ms > t_right_ms {
-            continue;
-        }
-        for s in 0..spc {
-            let abs_idx = block.timestamp_start + s as u64;
-            let time_ms = abs_idx as f64 * ms_per_sample;
-            if time_ms < collect_left_ms || time_ms > t_right_ms {
-                continue;
-            }
-            times.push(abs_idx);
-            for (slot, ch) in (0..visible).enumerate() {
-                let data_idx = s * channel_count + ch;
-                let v = if data_idx < block.data.len() {
-                    block.data[data_idx] as f64 / i16::MAX as f64
-                } else {
-                    0.0
-                };
-                buffers[slot].push(v);
-            }
-        }
-        times_initialized = true;
-    }
-    if !times_initialized || times.is_empty() {
-        return Vec::new();
-    }
-
-    // CAR: subtract the mean of all visible-and-enabled channels at each
-    // time index from every channel.  Common neuroscience practice for
-    // removing common-mode noise.
-    if filters.car_enabled {
-        let n = times.len();
-        for i in 0..n {
-            let mut sum = 0.0;
-            let mut count = 0;
-            for ch in 0..visible {
-                if !settings.is_channel_enabled(ch) {
-                    continue;
-                }
-                sum += buffers[ch][i];
-                count += 1;
-            }
-            if count > 0 {
-                let mean = sum / count as f64;
-                for ch in 0..visible {
-                    buffers[ch][i] -= mean;
-                }
-            }
-        }
-    }
-
-    // Apply per-channel filter chain in sample order.  The warm-up margin
-    // ensures the filter has settled by the time we reach the visible window.
-    if filters.any_filter_enabled() {
-        for ch in 0..visible {
-            if !settings.is_channel_enabled(ch) {
-                continue;
-            }
-            let mut chain = make_chain(filters, sample_rate);
-            for v in &mut buffers[ch] {
-                *v = chain.process(*v);
-            }
-        }
-    }
-
-    // Determine the index boundary where the warmup ends and visible window begins
-    let t_left_sample = (t_left_ms / ms_per_sample).ceil() as u64;
-    let visible_start_idx = times.iter().position(|&t| t >= t_left_sample).unwrap_or(0);
-
-    // Per-channel sigma + spike detection on filtered data within the visible window.
-    // Using DC-removed RMS, then negative-going threshold crossings with a
-    // ~1 ms refractory period (32 samples at 32 kHz / 30 at 30 kHz).
-    let refractory_samples = (sample_rate * 0.001).max(1.0) as usize;
-    let mut sigmas: Vec<Option<f64>> = vec![None; visible];
-    let mut spike_counts: Vec<u32> = vec![0; visible];
-    if filters.spike_threshold_enabled {
-        for ch in 0..visible {
-            if !settings.is_channel_enabled(ch) {
-                continue;
-            }
-            let buf = &buffers[ch][visible_start_idx..];
-            if buf.is_empty() {
-                continue;
-            }
-            // DC mean (we DC-remove for sigma estimation only — buf is left untouched here)
-            let mean: f64 = buf.iter().sum::<f64>() / buf.len() as f64;
-            let var: f64 =
-                buf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / buf.len() as f64;
-            let sigma = var.sqrt();
-            sigmas[ch] = Some(sigma);
-
-            let thresh = -filters.spike_threshold_sigma * sigma;
-            let mut last_crossing: Option<usize> = None;
-            let mut prev_centered = 0.0;
-            for (i, v) in buf.iter().enumerate() {
-                let centered = v - mean;
-                if i > 0 && prev_centered >= thresh && centered < thresh
-                    && last_crossing.is_none_or(|l| i - l >= refractory_samples) {
-                        spike_counts[ch] = spike_counts[ch].saturating_add(1);
-                        last_crossing = Some(i);
-                    }
-                prev_centered = centered;
-            }
-        }
-    }
-
-    // Min-max decimation + DC removal + gain/offset, per channel.
-    // Only emit points from the visible window (skip warmup margin).
-    // Use half budget for bucket count since each bucket emits 2 points.
-    let stride_filtered = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
-
-    let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
-    for ch in 0..visible {
-        if !settings.is_channel_enabled(ch) {
-            continue;
-        }
-        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-
-        if stride_filtered <= 1 {
-            // No decimation — emit all filtered samples in visible window
-            for (i, &abs_idx) in times.iter().enumerate().skip(visible_start_idx) {
-                pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
-            }
-        } else {
-            // Min-max decimation on filtered data (visible window only)
-            let mut bucket_min_val: f64 = f64::MAX;
-            let mut bucket_max_val: f64 = f64::MIN;
-            let mut bucket_min_time: f64 = 0.0;
-            let mut bucket_max_time: f64 = 0.0;
-            let mut bucket_has_data = false;
-            let mut last_bucket_id: u64 = u64::MAX;
-
-            for (i, &abs_idx) in times.iter().enumerate().skip(visible_start_idx) {
-                let time_ms = abs_idx as f64 * ms_per_sample;
-                let value = buffers[ch][i];
-                let bucket_id = abs_idx / stride_filtered;
-
-                if bucket_id != last_bucket_id {
-                    if bucket_has_data {
-                        emit_minmax(
-                            &mut pts,
-                            bucket_min_time, bucket_min_val,
-                            bucket_max_time, bucket_max_val,
-                        );
-                    }
-                    bucket_min_val = value;
-                    bucket_max_val = value;
-                    bucket_min_time = time_ms;
-                    bucket_max_time = time_ms;
-                    bucket_has_data = true;
-                    last_bucket_id = bucket_id;
-                } else {
-                    if value < bucket_min_val {
-                        bucket_min_val = value;
-                        bucket_min_time = time_ms;
-                    }
-                    if value > bucket_max_val {
-                        bucket_max_val = value;
-                        bucket_max_time = time_ms;
-                    }
-                }
-            }
-            if bucket_has_data {
-                emit_minmax(
-                    &mut pts,
-                    bucket_min_time, bucket_min_val,
-                    bucket_max_time, bucket_max_val,
-                );
-            }
-        }
-
-        finalize_channel(&mut pts, ch, gain, ch_spacing);
-        traces.push(ChannelTrace {
-            channel: ch,
-            points: pts,
-            sigma: sigmas[ch],
-            spike_count: spike_counts[ch],
-        });
-    }
-    traces
-}
-
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
 fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64) {
     if pts.is_empty() {
@@ -774,24 +552,6 @@ fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64)
     for p in pts.iter_mut() {
         p[1] = (p[1] - mean) * gain + y_offset;
     }
-}
-
-/// Build a fresh `FilterChain` from the user's settings.
-fn make_chain(filters: &FilterSettings, sample_rate: f64) -> FilterChain {
-    let mut c = FilterChain::passthrough();
-    if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
-        c.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-        c.hp_enabled = true;
-    }
-    if filters.lp_enabled && filters.lp_cutoff_hz < sample_rate / 2.0 {
-        c.lp = Biquad::lowpass(filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-        c.lp_enabled = true;
-    }
-    if filters.notch_enabled {
-        c.notch = Biquad::notch(filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-        c.notch_enabled = true;
-    }
-    c
 }
 
 // ── Empty state ─────────────────────────────────────────────────────

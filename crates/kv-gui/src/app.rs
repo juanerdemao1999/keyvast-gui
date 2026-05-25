@@ -25,6 +25,7 @@ use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
 use crate::demo::DemoPreview;
+use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, PreviewState};
 use crate::theme;
@@ -53,9 +54,17 @@ pub struct KvApp {
     device_preview: PreviewState,
     // Shared view state
     block_history: VecDeque<SampleBlock>,
+    /// Pre-filtered version of block_history (kept in sync).
+    filtered_history: VecDeque<SampleBlock>,
     history_capacity: usize,
     latest_block: Option<SampleBlock>,
     latest_stats: Option<BlockStats>,
+    // Persistent filter state — chains are maintained between frames so
+    // only newly-arrived samples need to be processed (O(new) not O(window)).
+    filter_chains: Vec<FilterChain>,
+    /// The settings that `filter_chains` was built with.  When the user
+    /// changes filter parameters we detect the mismatch and rebuild.
+    filter_settings_snapshot: FilterSettings,
     // UI state
     display: DisplaySettings,
     filters: FilterSettings,
@@ -77,6 +86,7 @@ pub struct KvApp {
 impl KvApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let now = Instant::now();
+        let filters = FilterSettings::default();
         Self {
             mode: AcqMode::Demo,
             demo: DemoPreview::default_neural(),
@@ -87,11 +97,14 @@ impl KvApp {
             device_preview: PreviewState::new(),
             // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
             block_history: VecDeque::with_capacity(10_000),
+            filtered_history: VecDeque::with_capacity(10_000),
             history_capacity: 10_000,
             latest_block: None,
             latest_stats: None,
+            filter_chains: Vec::new(),
+            filter_settings_snapshot: filters,
             display: DisplaySettings::default(),
-            filters: FilterSettings::default(),
+            filters,
             recording: RecordingSettings::default(),
             theme_applied: false,
             display_paused: false,
@@ -112,6 +125,8 @@ impl KvApp {
         self.demo_start_time = Instant::now();
         self.demo_blocks_generated = 0;
         self.block_history.clear();
+        self.filtered_history.clear();
+        self.filter_chains.clear();
         self.latest_block = None;
         self.latest_stats = None;
         self.device_preview.stop();
@@ -122,6 +137,8 @@ impl KvApp {
         self.mode = AcqMode::Device;
         self.demo_started = false;
         self.block_history.clear();
+        self.filtered_history.clear();
+        self.filter_chains.clear();
         self.latest_block = None;
         self.latest_stats = None;
         let config = SimulatorConfig::default();
@@ -131,6 +148,129 @@ impl KvApp {
     fn stop_all(&mut self) {
         self.demo_started = false;
         self.device_preview.stop();
+    }
+
+    /// Rebuild filter chains from the current FilterSettings.
+    fn rebuild_filter_chains(&mut self, sample_rate: f64, channel_count: usize) {
+        self.filter_chains.clear();
+        for _ in 0..channel_count {
+            let mut chain = FilterChain::passthrough();
+            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
+                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                chain.hp_enabled = true;
+            }
+            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
+                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                chain.lp_enabled = true;
+            }
+            if self.filters.notch_enabled {
+                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
+                chain.notch_enabled = true;
+            }
+            self.filter_chains.push(chain);
+        }
+        self.filter_settings_snapshot = self.filters;
+        // Re-filter existing history with new chains
+        self.refilter_history();
+    }
+
+    /// Re-filter the entire block_history (called when filter settings change).
+    fn refilter_history(&mut self) {
+        self.filtered_history.clear();
+        // Rebuild chains fresh for the re-filter pass
+        let sample_rate = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+        let channel_count = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+        let mut chains: Vec<FilterChain> = Vec::with_capacity(channel_count);
+        for _ in 0..channel_count {
+            let mut chain = FilterChain::passthrough();
+            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
+                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                chain.hp_enabled = true;
+            }
+            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
+                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                chain.lp_enabled = true;
+            }
+            if self.filters.notch_enabled {
+                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
+                chain.notch_enabled = true;
+            }
+            chains.push(chain);
+        }
+        let car_enabled = self.filters.car_enabled;
+        for block in self.block_history.iter() {
+            let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
+            self.filtered_history.push_back(filtered);
+        }
+        // Keep persistent chains in sync (their state now reflects all history)
+        self.filter_chains = chains;
+    }
+
+    /// Apply filter chains to a single block, producing a new filtered block.
+    fn filter_block_with_chains(
+        block: &SampleBlock,
+        chains: &mut [FilterChain],
+        car_enabled: bool,
+    ) -> SampleBlock {
+        let ch_count = block.channel_count;
+        let spc = block.samples_per_channel;
+        let mut data = block.data.clone();
+
+        for s in 0..spc {
+            // CAR: subtract mean across channels at this time step
+            if car_enabled && ch_count > 0 {
+                let base = s * ch_count;
+                let mut sum: f64 = 0.0;
+                for ch in 0..ch_count {
+                    sum += data[base + ch] as f64;
+                }
+                let mean = sum / ch_count as f64;
+                for ch in 0..ch_count {
+                    data[base + ch] = (data[base + ch] as f64 - mean) as i16;
+                }
+            }
+            // Per-channel biquad filter
+            for ch in 0..ch_count.min(chains.len()) {
+                let idx = s * ch_count + ch;
+                let x = data[idx] as f64 / i16::MAX as f64;
+                let y = chains[ch].process(x);
+                data[idx] = (y * i16::MAX as f64).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+            }
+        }
+
+        SampleBlock {
+            data,
+            ..block.clone()
+        }
+    }
+
+    /// Process a new incoming block: store raw, filter incrementally, store filtered.
+    fn ingest_block(&mut self, block: SampleBlock) {
+        let ch_count = block.channel_count;
+        let sample_rate = block.sample_rate;
+
+        // Detect filter settings change → rebuild chains
+        if self.filters != self.filter_settings_snapshot || self.filter_chains.len() != ch_count {
+            self.rebuild_filter_chains(sample_rate, ch_count);
+        }
+
+        // Produce filtered version using persistent chains
+        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
+        let filtered = if needs_filter {
+            Self::filter_block_with_chains(&block, &mut self.filter_chains, self.filters.car_enabled)
+        } else {
+            block.clone()
+        };
+
+        // Store
+        self.block_history.push_back(block.clone());
+        self.filtered_history.push_back(filtered);
+        while self.block_history.len() > self.history_capacity {
+            self.block_history.pop_front();
+            self.filtered_history.pop_front();
+        }
+
+        self.latest_block = Some(block);
     }
 
     fn is_running(&self) -> bool {
@@ -220,38 +360,28 @@ impl KvApp {
         // Cap to avoid frame-time spikes
         let generate = needed.min(16) as usize;
 
-        let mut last_block: Option<SampleBlock> = None;
         for _ in 0..generate {
             let block = self.demo.next_block();
-            self.block_history.push_back(block.clone());
-            while self.block_history.len() > self.history_capacity {
-                self.block_history.pop_front();
-            }
-            last_block = Some(block);
+            self.ingest_block(block);
             self.demo_blocks_generated += 1;
         }
 
-        if let Some(block) = last_block {
+        if let Some(ref block) = self.latest_block {
             let stats = crate::preview::compute_block_stats(
-                &block,
+                block,
                 self.demo_blocks_generated,
                 elapsed_total,
             );
             self.latest_stats = Some(stats);
-            self.latest_block = Some(block);
         }
     }
 
     /// Poll device preview and update shared state.
     fn tick_device(&mut self) {
         if self.device_preview.poll() {
-            if let Some(ref block) = self.device_preview.latest_block {
-                self.block_history.push_back(block.clone());
-                while self.block_history.len() > self.history_capacity {
-                    self.block_history.pop_front();
-                }
+            if let Some(block) = self.device_preview.latest_block.clone() {
+                self.ingest_block(block);
             }
-            self.latest_block = self.device_preview.latest_block.clone();
             self.latest_stats = self.device_preview.latest_stats.clone();
         }
     }
@@ -348,6 +478,13 @@ impl eframe::App for KvApp {
         match self.mode {
             AcqMode::Demo => self.tick_demo(),
             AcqMode::Device => self.tick_device(),
+        }
+
+        // Detect filter settings change (user toggled in UI) — re-filter history
+        if self.filters != self.filter_settings_snapshot {
+            let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+            let ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+            self.rebuild_filter_chains(sr, ch);
         }
 
         let elapsed_live = self.elapsed_seconds();
@@ -586,9 +723,18 @@ impl eframe::App for KvApp {
                 }
 
                 let render_start = Instant::now();
+                // Use pre-filtered history when any filter/CAR is active —
+                // rendering always takes the fast path (no per-frame filtering).
+                let needs_filtered = self.filters.any_filter_enabled()
+                    || self.filters.car_enabled;
+                let display_history = if needs_filtered {
+                    &self.filtered_history
+                } else {
+                    &self.block_history
+                };
                 waveform::draw_waveform_area(
                     ui,
-                    &self.block_history,
+                    display_history,
                     self.latest_block.as_ref(),
                     &self.display,
                     &self.filters,

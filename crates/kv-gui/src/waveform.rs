@@ -264,11 +264,13 @@ pub fn draw_waveform_area(
             let base_color = theme::channel_color(trace.channel);
             let is_hovered = hovered_ch == Some(trace.channel);
             let (color, width) = if is_hovered {
-                (egui::Color32::WHITE, 1.8)
+                (egui::Color32::WHITE, 2.0)
             } else if hovered_ch.is_some() {
-                (dim_color(base_color, 0.45), 1.0)
+                // When another channel is hovered, dim the rest slightly
+                (dim_color(base_color, 0.35), 1.0)
             } else {
-                (base_color, 1.2)
+                // Default: full brightness, slightly bolder
+                (brighten_color(base_color, 1.3), 1.5)
             };
             plot_ui.line(
                 Line::new(PlotPoints::from(trace.points))
@@ -414,6 +416,14 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
     let r = (c.r() as f32 * factor) as u8;
     let g = (c.g() as f32 * factor) as u8;
     let b = (c.b() as f32 * factor) as u8;
+    egui::Color32::from_rgb(r, g, b)
+}
+
+/// Brighten a color by `factor` (1.0 = unchanged, >1.0 = brighter), clamped to 255.
+fn brighten_color(c: egui::Color32, factor: f32) -> egui::Color32 {
+    let r = (c.r() as f32 * factor).min(255.0) as u8;
+    let g = (c.g() as f32 * factor).min(255.0) as u8;
+    let b = (c.b() as f32 * factor).min(255.0) as u8;
     egui::Color32::from_rgb(r, g, b)
 }
 

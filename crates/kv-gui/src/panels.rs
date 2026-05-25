@@ -6,6 +6,7 @@
 
 use eframe::egui;
 use kv_types::SampleBlock;
+use rfd;
 
 use crate::preview::BlockStats;
 use crate::theme;
@@ -596,7 +597,7 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
             ui.label(egui::RichText::new(label).size(11.0).color(label_color));
         });
 
-        // Output directory
+        // Output directory — text field + folder picker button
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Dir:")
@@ -605,9 +606,21 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
             );
             ui.add(
                 egui::TextEdit::singleline(&mut recording.output_dir)
-                    .desired_width(140.0)
+                    .desired_width(110.0)
                     .font(egui::FontId::monospace(10.0)),
             );
+            if ui
+                .button(egui::RichText::new("📁").size(13.0))
+                .on_hover_text("Browse for output folder")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select recording output folder")
+                    .pick_folder()
+                {
+                    recording.output_dir = path.to_string_lossy().into_owned();
+                }
+            }
         });
 
         // Arm / Record / Stop buttons

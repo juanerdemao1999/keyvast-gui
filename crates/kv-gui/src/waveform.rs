@@ -312,8 +312,26 @@ pub fn draw_waveform_area(
         && let Some(hovered_ch) = response.inner
             && let Some(ptr_pos) = response.response.hover_pos()
     {
-        let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
-        let tip = format_time_tooltip(hovered_ch, time_at_cursor);
+        let plot_val = response.transform.value_from_position(ptr_pos);
+        let time_at_cursor = plot_val.x;
+
+        // Reverse the gain/offset transform to recover amplitude in µV.
+        // finalize_channel applies: y_plot = value_norm * gain + y_offset
+        // where y_offset = -(ch * ch_spacing).
+        // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
+        // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
+        let y_baseline = -(hovered_ch as f64) * ch_spacing;
+        let delta_y = plot_val.y - y_baseline;
+        let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
+        let amp_str = if amp_uv.abs() >= 1000.0 {
+            format!("{:+.2} mV", amp_uv / 1000.0)
+        } else {
+            format!("{:+.1} µV", amp_uv)
+        };
+
+        let tip = format!("{}  {}",
+            format_time_tooltip(hovered_ch, time_at_cursor),
+            amp_str);
         let plot_rect = response.response.rect;
         let painter = ui.painter();
         let text_pos = plot_rect.left_top() + egui::vec2(10.0, 8.0);

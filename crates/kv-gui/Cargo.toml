@@ -10,9 +10,6 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.31"
 egui_plot = "0.31"
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-dirs = "6"
 kv-buffer = { path = "../kv-buffer" }
 kv-core = { path = "../kv-core" }
 kv-simulator = { path = "../kv-simulator" }

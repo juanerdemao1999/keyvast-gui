@@ -132,12 +132,6 @@ impl DemoGenerator {
         let pid = self.packet_id;
         self.packet_id += 1;
 
-        // TTL pulse generation:
-        //   Bit 0: 1 Hz square wave (50% duty)
-        //   Bit 1: 0.5 Hz pulse (20% duty)
-        //   Bit 2: 2 Hz pulse (10% duty)
-        let ttl_bits = generate_ttl(timestamp_start, sr);
-
         SampleBlock {
             device_id: "demo-neural".to_string(),
             stream_id: 0,
@@ -147,7 +141,7 @@ impl DemoGenerator {
             channel_count: ch_count,
             samples_per_channel: spc,
             data,
-            ttl_bits,
+            ttl_bits: 0,
         }
     }
 }
@@ -247,37 +241,6 @@ fn generate_sample(
 
     // Clamp to i16
     value.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16
-}
-
-/// Generate a TTL bitmask for a block starting at `timestamp`.
-///
-/// Creates periodic digital pulses on three lines:
-///   - Bit 0: 1 Hz square wave (50% duty cycle)
-///   - Bit 1: 0.5 Hz pulse (20% duty cycle)
-///   - Bit 2: 2 Hz pulse (10% duty cycle)
-fn generate_ttl(timestamp: u64, sample_rate: f64) -> u32 {
-    let t = timestamp as f64 / sample_rate;
-    let mut bits = 0u32;
-
-    // Bit 0: 1 Hz, 50% duty
-    let phase0 = t % 1.0;
-    if phase0 < 0.5 {
-        bits |= 1;
-    }
-
-    // Bit 1: 0.5 Hz, 20% duty
-    let phase1 = t % 2.0;
-    if phase1 < 0.4 {
-        bits |= 2;
-    }
-
-    // Bit 2: 2 Hz, 10% duty
-    let phase2 = t % 0.5;
-    if phase2 < 0.05 {
-        bits |= 4;
-    }
-
-    bits
 }
 
 /// State for the demo mode preview.

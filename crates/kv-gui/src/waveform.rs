@@ -19,8 +19,7 @@ use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
 /// Maximum rendered points per channel (decimation target for performance).
-/// Min-max decimation emits 2 points per interval, so 6000 ≈ 3000 intervals.
-const MAX_DISPLAY_POINTS: usize = 6000;
+const MAX_DISPLAY_POINTS: usize = 4096;
 
 /// Vertical spacing (in normalized units) between channel baselines.
 const CHANNEL_SPACING: f64 = 2.2;
@@ -44,14 +43,16 @@ struct ChannelTrace {
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     history: &VecDeque<SampleBlock>,
+    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     filters: &FilterSettings,
-) -> Option<usize> {
-    let block = match history.back() {
+    elapsed_secs: f64,
+) {
+    let block = match latest {
         Some(b) => b,
         None => {
             draw_empty_state(ui);
-            return None;
+            return;
         }
     };
 
@@ -59,7 +60,7 @@ pub fn draw_waveform_area(
     let visible = settings.visible_channels.min(total_channels);
     if visible == 0 {
         draw_empty_state(ui);
-        return None;
+        return;
     }
 
     let amp_scale = settings.amp_scale_uv();
@@ -68,14 +69,8 @@ pub fn draw_waveform_area(
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
     let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // X-axis window anchored to the latest data timestamp.
-    // Using the actual data edge instead of wall clock prevents the viewport
-    // from racing ahead of data when frame rate drops (which caused the
-    // "compression toward left" visual artifact).
-    let data_edge_ms = (block.timestamp_start + block.samples_per_channel as u64) as f64
-        / block.sample_rate
-        * 1000.0;
-    let x_right = data_edge_ms;
+    // X-axis window driven by wall clock — smooth continuous scroll
+    let x_right = elapsed_secs * 1000.0; // current time in ms
     let x_left = (x_right - time_window_ms).max(0.0);
 
     // Decide pipeline: fast path (raw decimated) or full path (filter/CAR).
@@ -85,6 +80,7 @@ pub fn draw_waveform_area(
     let traces: Vec<ChannelTrace> = if needs_full_pipeline {
         collect_lines_filtered(
             history,
+            latest,
             settings,
             filters,
             visible,
@@ -97,6 +93,7 @@ pub fn draw_waveform_area(
     } else {
         collect_lines_fast(
             history,
+            latest,
             settings,
             visible,
             total_channels,
@@ -208,11 +205,6 @@ pub fn draw_waveform_area(
             }
         }
 
-        // Draw TTL event markers (rising edges as vertical lines)
-        if settings.show_grid {
-            draw_ttl_markers(plot_ui, history, block.sample_rate, x_left, x_right, y_min, y_max);
-        }
-
         // Draw waveform traces — highlight hovered channel
         for trace in &traces {
             let base_color = theme::channel_color(trace.channel);
@@ -257,9 +249,9 @@ pub fn draw_waveform_area(
     }
 
     // Tooltip with the hovered channel + time
-    if response.response.hovered() {
-        if let Some(hovered_ch) = response.inner {
-            if let Some(ptr_pos) = response.response.hover_pos() {
+    if response.response.hovered()
+        && let Some(hovered_ch) = response.inner
+            && let Some(ptr_pos) = response.response.hover_pos() {
                 let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
                 let tip = format_time_tooltip(hovered_ch, time_at_cursor);
                 egui::containers::popup::show_tooltip_at_pointer(
@@ -276,13 +268,6 @@ pub fn draw_waveform_area(
                     },
                 );
             }
-            Some(hovered_ch)
-        } else {
-            None
-        }
-    } else {
-        None
-    }
 }
 
 fn format_time_tooltip(ch: usize, time_ms: f64) -> String {
@@ -301,83 +286,17 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
-// ── TTL markers ─────────────────────────────────────────────────────
-
-/// Colors for TTL lines 0-7.
-const TTL_COLORS: [egui::Color32; 8] = [
-    egui::Color32::from_rgb(0, 255, 128),   // Green
-    egui::Color32::from_rgb(255, 200, 0),   // Gold
-    egui::Color32::from_rgb(0, 180, 255),   // Cyan
-    egui::Color32::from_rgb(255, 100, 200), // Pink
-    egui::Color32::from_rgb(180, 100, 255), // Purple
-    egui::Color32::from_rgb(255, 128, 0),   // Orange
-    egui::Color32::from_rgb(100, 255, 200), // Mint
-    egui::Color32::from_rgb(255, 255, 100), // Yellow
-];
-
-/// Draw vertical lines at TTL rising edges within the visible time window.
-fn draw_ttl_markers(
-    plot_ui: &mut egui_plot::PlotUi,
-    history: &VecDeque<SampleBlock>,
-    sample_rate: f64,
-    x_left: f64,
-    x_right: f64,
-    y_min: f64,
-    y_max: f64,
-) {
-    if history.is_empty() || sample_rate <= 0.0 {
-        return;
-    }
-
-    // We detect rising edges by comparing consecutive blocks' TTL bits.
-    let mut prev_ttl: u32 = 0;
-    for (idx, block) in history.iter().enumerate() {
-        let block_time_ms = block.timestamp_start as f64 / sample_rate * 1000.0;
-        let block_end_ms = (block.timestamp_start + block.samples_per_channel as u64) as f64
-            / sample_rate
-            * 1000.0;
-
-        // Skip blocks entirely outside visible window
-        if block_end_ms < x_left || block_time_ms > x_right {
-            prev_ttl = block.ttl_bits;
-            continue;
-        }
-
-        // Detect rising edges (bits that went from 0 to 1)
-        let rising = block.ttl_bits & !prev_ttl;
-        if rising != 0 && idx > 0 {
-            // Draw a vertical line for each rising edge
-            for bit in 0..8u32 {
-                if (rising >> bit) & 1 == 1 {
-                    let color = TTL_COLORS[bit as usize];
-                    let line = Line::new(PlotPoints::from(vec![
-                        [block_time_ms, y_min],
-                        [block_time_ms, y_max],
-                    ]))
-                    .color(color)
-                    .width(1.0)
-                    .style(egui_plot::LineStyle::dashed_loose());
-                    plot_ui.line(line);
-                }
-            }
-        }
-        prev_ttl = block.ttl_bits;
-    }
-}
-
 // ── Data collection ─────────────────────────────────────────────────
 
 /// **Fast path** — used when no filter / CAR / spike-detection is enabled.
 ///
-/// Uses **min-max decimation**: for each stride interval, we emit two
-/// points — the minimum and maximum sample values.  This guarantees that
-/// spikes, transients, and oscillation envelopes are never lost, matching
-/// the approach used by Intan RHX, Open Ephys, and LabChart.
-///
-/// When stride == 1 (no decimation needed), all samples are passed through.
+/// Per-channel anchored decimation: the same physical samples are picked
+/// each frame, so the visible trace is rock-solid even as the viewport
+/// slides.  Per-channel DC mean is removed at the end.
 #[allow(clippy::too_many_arguments)]
 fn collect_lines_fast(
     history: &VecDeque<SampleBlock>,
+    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     visible: usize,
     channel_count: usize,
@@ -392,9 +311,7 @@ fn collect_lines_fast(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    // Each min-max pair is 2 points, so budget = MAX_DISPLAY_POINTS / 2 intervals
-    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
-    let no_decimate = stride <= 1;
+    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
@@ -402,15 +319,7 @@ fn collect_lines_fast(
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-
-        // Min-max accumulation state for the current stride interval
-        let mut iv_min: f64 = f64::MAX;
-        let mut iv_max: f64 = f64::MIN;
-        let mut iv_t_min: f64 = 0.0;
-        let mut iv_t_max: f64 = 0.0;
-        let mut iv_id: u64 = u64::MAX;
-
-        for block in history.iter() {
+        for block in history.iter().chain(latest) {
             if block.channel_count != channel_count {
                 continue;
             }
@@ -422,6 +331,9 @@ fn collect_lines_fast(
             }
             for s in 0..spc {
                 let abs_idx = block.timestamp_start + s as u64;
+                if stride > 1 && !abs_idx.is_multiple_of(stride) {
+                    continue;
+                }
                 let time_ms = abs_idx as f64 * ms_per_sample;
                 if time_ms < t_left_ms || time_ms > t_right_ms {
                     continue;
@@ -432,42 +344,9 @@ fn collect_lines_fast(
                 } else {
                     0.0
                 };
-
-                if no_decimate {
-                    pts.push([time_ms, value]);
-                    continue;
-                }
-
-                let interval = abs_idx / stride;
-                if iv_id == u64::MAX {
-                    iv_id = interval;
-                    iv_min = value;
-                    iv_max = value;
-                    iv_t_min = time_ms;
-                    iv_t_max = time_ms;
-                } else if interval != iv_id {
-                    emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
-                    iv_id = interval;
-                    iv_min = value;
-                    iv_max = value;
-                    iv_t_min = time_ms;
-                    iv_t_max = time_ms;
-                } else {
-                    if value < iv_min {
-                        iv_min = value;
-                        iv_t_min = time_ms;
-                    }
-                    if value > iv_max {
-                        iv_max = value;
-                        iv_t_max = time_ms;
-                    }
-                }
+                pts.push([time_ms, value]);
             }
         }
-        if iv_id != u64::MAX && !no_decimate {
-            emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
-        }
-
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
             channel: ch,
@@ -489,6 +368,7 @@ fn collect_lines_fast(
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn collect_lines_filtered(
     history: &VecDeque<SampleBlock>,
+    latest: Option<&SampleBlock>,
     settings: &DisplaySettings,
     filters: &FilterSettings,
     visible: usize,
@@ -504,8 +384,7 @@ fn collect_lines_filtered(
         1.0
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
-    let no_decimate = stride <= 1;
+    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
 
     // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
     // once for the maximum window length to avoid reallocation churn.
@@ -514,7 +393,7 @@ fn collect_lines_filtered(
     let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
 
     let mut times_initialized = false;
-    for block in history.iter() {
+    for block in history.iter().chain(latest) {
         if block.channel_count != channel_count {
             continue;
         }
@@ -622,57 +501,18 @@ fn collect_lines_filtered(
         }
     }
 
-    // Min-max decimation + DC removal + gain/offset, per channel.
+    // Anchored decimation + DC removal + gain/offset, per channel.
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
     for ch in 0..visible {
         if !settings.is_channel_enabled(ch) {
             continue;
         }
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        if no_decimate {
-            for (i, &abs_idx) in times.iter().enumerate() {
-                pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
+        for (i, &abs_idx) in times.iter().enumerate() {
+            if stride > 1 && abs_idx % stride != 0 {
+                continue;
             }
-        } else {
-            let mut iv_min: f64 = f64::MAX;
-            let mut iv_max: f64 = f64::MIN;
-            let mut iv_t_min: f64 = 0.0;
-            let mut iv_t_max: f64 = 0.0;
-            let mut iv_id: u64 = u64::MAX;
-
-            for (i, &abs_idx) in times.iter().enumerate() {
-                let interval = abs_idx / stride;
-                let t = abs_idx as f64 * ms_per_sample;
-                let v = buffers[ch][i];
-
-                if iv_id == u64::MAX {
-                    iv_id = interval;
-                    iv_min = v;
-                    iv_max = v;
-                    iv_t_min = t;
-                    iv_t_max = t;
-                } else if interval != iv_id {
-                    // Flush
-                    emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
-                    iv_id = interval;
-                    iv_min = v;
-                    iv_max = v;
-                    iv_t_min = t;
-                    iv_t_max = t;
-                } else {
-                    if v < iv_min {
-                        iv_min = v;
-                        iv_t_min = t;
-                    }
-                    if v > iv_max {
-                        iv_max = v;
-                        iv_t_max = t;
-                    }
-                }
-            }
-            if iv_id != u64::MAX {
-                emit_minmax(&mut pts, iv_min, iv_max, iv_t_min, iv_t_max);
-            }
+            pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
         }
         finalize_channel(&mut pts, ch, gain);
         traces.push(ChannelTrace {
@@ -683,23 +523,6 @@ fn collect_lines_filtered(
         });
     }
     traces
-}
-
-/// Emit a min-max pair for one decimation interval.  The point that came
-/// first in time is emitted first so the polyline stays monotonic in X.
-#[inline]
-fn emit_minmax(pts: &mut Vec<[f64; 2]>, min: f64, max: f64, t_min: f64, t_max: f64) {
-    if t_min <= t_max {
-        pts.push([t_min, min]);
-        if (max - min).abs() > 1e-12 {
-            pts.push([t_max, max]);
-        }
-    } else {
-        pts.push([t_max, max]);
-        if (max - min).abs() > 1e-12 {
-            pts.push([t_min, min]);
-        }
-    }
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.

@@ -20,11 +20,31 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-25 (session 9 — GUI visual optimization complete)
+Last updated: 2026-05-25 (session 10 — incremental filtering architecture)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 10: Incremental filtering + bug fixes
+
+**Problem solved**: Enabling biquad/CAR filters caused frame drops because the entire visible window (5s × 30kHz × 16ch = 2.4M filter ops) was re-processed every frame.
+
+**New architecture**:
+- `app.rs` maintains `filtered_history: VecDeque<SampleBlock>` alongside `block_history`
+- `filter_chains: Vec<FilterChain>` — persistent per-channel filter state (survives across frames)
+- Filtering happens at ingest time (`ingest_block()`) — only new blocks are processed (O(new_block) per frame)
+- When user changes filter settings, `rebuild_filter_chains()` detects the mismatch and re-filters the entire history once
+- `waveform.rs` always uses the fast path (min-max decimation only) — no per-frame filtering logic
+- Render code selects `filtered_history` or `block_history` based on whether any filter is enabled
+
+**Bug fixes in same commit**:
+- Gain/ch_spacing decoupling: gain formula now uses fixed `DEFAULT_CHANNEL_SPACING` constant (not `ch_spacing * 3.0`), so amplitude is independent of the channel spacing slider
+- Scale bar label accuracy: bar shows 1/3 lane height = amp_scale/3 µV; label now correctly reflects the actual bar voltage
+
+### Session 10 commits on `dev`
+
+- `b9b622d` — Incremental filtering architecture + scale bar accuracy fix
 
 ### Session 9: GUI visual optimization (ALL COMPLETE)
 

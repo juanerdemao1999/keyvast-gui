@@ -548,9 +548,15 @@ impl eframe::App for KvApp {
             .show(ctx, |ui| {
                 let plot_rect = ui.available_rect_before_wrap();
 
-                // Mouse wheel over the plot adjusts the time window
+                // Mouse wheel over the plot adjusts the time window;
+                // drag when paused scrolls through history.
+                let sense = if self.display_paused {
+                    egui::Sense::click_and_drag()
+                } else {
+                    egui::Sense::hover()
+                };
                 let scroll_response =
-                    ui.interact(plot_rect, egui::Id::new("waveform_wheel"), egui::Sense::hover());
+                    ui.interact(plot_rect, egui::Id::new("waveform_wheel"), sense);
                 if scroll_response.hovered() {
                     let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                     if scroll.abs() > 1.0 {
@@ -562,6 +568,20 @@ impl eframe::App for KvApp {
                             self.display.time_scale_idx =
                                 self.display.time_scale_idx.saturating_sub(1);
                         }
+                    }
+                }
+                // Drag-to-browse when paused: horizontal drag shifts the view time
+                if self.display_paused && scroll_response.dragged() {
+                    let drag_px = scroll_response.drag_delta().x;
+                    let plot_width = plot_rect.width().max(1.0);
+                    let time_window_ms = self.display.time_window_ms();
+                    // dragging right → go back in time (reduce paused_elapsed)
+                    let dt_ms = (drag_px as f64 / plot_width as f64) * time_window_ms;
+                    self.paused_elapsed = (self.paused_elapsed - dt_ms / 1000.0).max(0.0);
+                    // Clamp to live time (can't look into the future)
+                    let live = self.elapsed_seconds();
+                    if self.paused_elapsed > live {
+                        self.paused_elapsed = live;
                     }
                 }
 

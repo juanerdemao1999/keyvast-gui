@@ -12,6 +12,7 @@
 //!   G      — Toggle grid
 //!   P      — Pause/resume display (acquisition continues)
 //!   F      — Toggle performance overlay (FPS / render time)
+//!   S      — Toggle spectrum panel (hover a channel to see PSD)
 //!   [ / ]  — Decrease / increase time window
 //!   1..9   — Quick-set visible channels (x4: 4,8,12,16,20,24,28,32,36)
 //!
@@ -24,9 +25,11 @@ use eframe::egui;
 use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
+use crate::config::{self, GuiConfig};
 use crate::demo::DemoPreview;
-use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
+use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState, NOTCH_FREQS};
 use crate::preview::{BlockStats, PreviewState};
+use crate::spectrum;
 use crate::theme;
 use crate::waveform;
 
@@ -68,6 +71,10 @@ pub struct KvApp {
     paused_elapsed: f64,
     /// Show performance overlay (FPS, render time).
     pub show_perf_overlay: bool,
+    /// Show the frequency spectrum panel at the bottom.
+    pub show_spectrum: bool,
+    /// Which channel is currently hovered in the waveform display.
+    hovered_channel: Option<usize>,
     // Performance metrics
     last_frame: Instant,
     frame_ms_ema: f64,
@@ -77,6 +84,32 @@ pub struct KvApp {
 impl KvApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let now = Instant::now();
+        let cfg = config::load();
+
+        let display = DisplaySettings {
+            visible_channels: cfg.display.visible_channels,
+            time_scale_idx: cfg.display.time_window_idx.min(panels::TIME_WINDOWS.len() - 1),
+            amp_scale_idx: cfg.display.amp_scale_idx.min(panels::AMP_SCALES.len() - 1),
+            show_grid: cfg.display.show_grid,
+            show_channel_labels: cfg.display.show_channel_labels,
+            ..DisplaySettings::default()
+        };
+        let notch_idx = NOTCH_FREQS
+            .iter()
+            .position(|&f| (f - cfg.filters.notch_freq).abs() < 1.0)
+            .unwrap_or(0);
+        let filters = FilterSettings {
+            hp_enabled: cfg.filters.hp_enabled,
+            hp_cutoff_hz: cfg.filters.hp_freq,
+            lp_enabled: cfg.filters.lp_enabled,
+            lp_cutoff_hz: cfg.filters.lp_freq,
+            notch_enabled: cfg.filters.notch_enabled,
+            notch_idx,
+            car_enabled: cfg.filters.car_enabled,
+            spike_threshold_enabled: cfg.filters.spike_threshold_enabled,
+            spike_threshold_sigma: cfg.filters.spike_threshold_sigma,
+        };
+
         Self {
             mode: AcqMode::Demo,
             demo: DemoPreview::default_neural(),
@@ -85,21 +118,50 @@ impl KvApp {
             demo_blocks_generated: 0,
             demo_start_time: now,
             device_preview: PreviewState::new(),
-            // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
             block_history: VecDeque::with_capacity(10_000),
             history_capacity: 10_000,
             latest_block: None,
             latest_stats: None,
-            display: DisplaySettings::default(),
-            filters: FilterSettings::default(),
+            display,
+            filters,
             recording: RecordingSettings::default(),
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
-            show_perf_overlay: false,
+            show_perf_overlay: cfg.ui.show_perf_overlay,
+            show_spectrum: cfg.ui.show_spectrum,
+            hovered_channel: None,
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
+        }
+    }
+
+    /// Snapshot current settings to a `GuiConfig` for persistence.
+    fn to_config(&self) -> GuiConfig {
+        GuiConfig {
+            display: config::DisplayConfig {
+                visible_channels: self.display.visible_channels,
+                time_window_idx: self.display.time_scale_idx,
+                amp_scale_idx: self.display.amp_scale_idx,
+                show_grid: self.display.show_grid,
+                show_channel_labels: self.display.show_channel_labels,
+            },
+            filters: config::FilterConfig {
+                hp_enabled: self.filters.hp_enabled,
+                hp_freq: self.filters.hp_cutoff_hz,
+                lp_enabled: self.filters.lp_enabled,
+                lp_freq: self.filters.lp_cutoff_hz,
+                notch_enabled: self.filters.notch_enabled,
+                notch_freq: self.filters.notch_freq_hz(),
+                car_enabled: self.filters.car_enabled,
+                spike_threshold_enabled: self.filters.spike_threshold_enabled,
+                spike_threshold_sigma: self.filters.spike_threshold_sigma,
+            },
+            ui: config::UiConfig {
+                show_spectrum: self.show_spectrum,
+                show_perf_overlay: self.show_perf_overlay,
+            },
         }
     }
 
@@ -278,6 +340,9 @@ impl KvApp {
             }
             if i.key_pressed(egui::Key::F) {
                 self.show_perf_overlay = !self.show_perf_overlay;
+            }
+            if i.key_pressed(egui::Key::S) {
+                self.show_spectrum = !self.show_spectrum;
             }
             // [ / ] for time window prev/next
             if i.key_pressed(egui::Key::OpenBracket) {
@@ -491,6 +556,32 @@ impl eframe::App for KvApp {
                 );
             });
 
+        // ── Spectrum panel (bottom, above status bar) ──────────
+        if self.show_spectrum {
+            let sample_rate = self
+                .latest_block
+                .as_ref()
+                .map(|b| b.sample_rate)
+                .unwrap_or(30_000.0);
+            egui::TopBottomPanel::bottom("spectrum_panel")
+                .resizable(true)
+                .default_height(120.0)
+                .height_range(80.0..=250.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BG_DARKEST)
+                        .inner_margin(egui::Margin::symmetric(4, 2)),
+                )
+                .show(ctx, |ui| {
+                    spectrum::draw_spectrum_panel(
+                        ui,
+                        &self.block_history,
+                        self.hovered_channel,
+                        sample_rate,
+                    );
+                });
+        }
+
         // ── Left control panel ──────────────────────────────────
         egui::SidePanel::left("control_panel")
             .resizable(true)
@@ -555,7 +646,7 @@ impl eframe::App for KvApp {
                 }
 
                 let render_start = Instant::now();
-                waveform::draw_waveform_area(
+                self.hovered_channel = waveform::draw_waveform_area(
                     ui,
                     &self.block_history,
                     self.latest_block.as_ref(),
@@ -586,6 +677,10 @@ impl eframe::App for KvApp {
         if self.is_running() || self.display_paused {
             ctx.request_repaint();
         }
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        config::save(&self.to_config());
     }
 }
 

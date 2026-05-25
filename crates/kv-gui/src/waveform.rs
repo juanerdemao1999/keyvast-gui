@@ -47,12 +47,12 @@ pub fn draw_waveform_area(
     settings: &DisplaySettings,
     filters: &FilterSettings,
     elapsed_secs: f64,
-) {
+) -> Option<usize> {
     let block = match latest {
         Some(b) => b,
         None => {
             draw_empty_state(ui);
-            return;
+            return None;
         }
     };
 
@@ -60,7 +60,7 @@ pub fn draw_waveform_area(
     let visible = settings.visible_channels.min(total_channels);
     if visible == 0 {
         draw_empty_state(ui);
-        return;
+        return None;
     }
 
     let amp_scale = settings.amp_scale_uv();
@@ -205,6 +205,11 @@ pub fn draw_waveform_area(
             }
         }
 
+        // Draw TTL event markers (rising edges as vertical lines)
+        if settings.show_grid {
+            draw_ttl_markers(plot_ui, history, block.sample_rate, x_left, x_right, y_min, y_max);
+        }
+
         // Draw waveform traces — highlight hovered channel
         for trace in &traces {
             let base_color = theme::channel_color(trace.channel);
@@ -249,9 +254,9 @@ pub fn draw_waveform_area(
     }
 
     // Tooltip with the hovered channel + time
-    if response.response.hovered()
-        && let Some(hovered_ch) = response.inner
-            && let Some(ptr_pos) = response.response.hover_pos() {
+    if response.response.hovered() {
+        if let Some(hovered_ch) = response.inner {
+            if let Some(ptr_pos) = response.response.hover_pos() {
                 let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
                 let tip = format_time_tooltip(hovered_ch, time_at_cursor);
                 egui::containers::popup::show_tooltip_at_pointer(
@@ -268,6 +273,13 @@ pub fn draw_waveform_area(
                     },
                 );
             }
+            Some(hovered_ch)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
 }
 
 fn format_time_tooltip(ch: usize, time_ms: f64) -> String {
@@ -284,6 +296,71 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
     let g = (c.g() as f32 * factor) as u8;
     let b = (c.b() as f32 * factor) as u8;
     egui::Color32::from_rgb(r, g, b)
+}
+
+// ── TTL markers ─────────────────────────────────────────────────────
+
+/// Colors for TTL lines 0-7.
+const TTL_COLORS: [egui::Color32; 8] = [
+    egui::Color32::from_rgb(0, 255, 128),   // Green
+    egui::Color32::from_rgb(255, 200, 0),   // Gold
+    egui::Color32::from_rgb(0, 180, 255),   // Cyan
+    egui::Color32::from_rgb(255, 100, 200), // Pink
+    egui::Color32::from_rgb(180, 100, 255), // Purple
+    egui::Color32::from_rgb(255, 128, 0),   // Orange
+    egui::Color32::from_rgb(100, 255, 200), // Mint
+    egui::Color32::from_rgb(255, 255, 100), // Yellow
+];
+
+/// Draw vertical lines at TTL rising edges within the visible time window.
+fn draw_ttl_markers(
+    plot_ui: &mut egui_plot::PlotUi,
+    history: &VecDeque<SampleBlock>,
+    sample_rate: f64,
+    x_left: f64,
+    x_right: f64,
+    y_min: f64,
+    y_max: f64,
+) {
+    if history.is_empty() || sample_rate <= 0.0 {
+        return;
+    }
+
+    // We detect rising edges by comparing consecutive blocks' TTL bits.
+    let mut prev_ttl: u32 = 0;
+    for (idx, block) in history.iter().enumerate() {
+        let block_time_ms = block.timestamp_start as f64 / sample_rate * 1000.0;
+        let block_end_ms = (block.timestamp_start + block.samples_per_channel as u64) as f64
+            / sample_rate
+            * 1000.0;
+
+        // Skip blocks entirely outside visible window
+        if block_end_ms < x_left || block_time_ms > x_right {
+            prev_ttl = block.ttl_bits;
+            continue;
+        }
+
+        // Detect rising edges (bits that went from 0 to 1)
+        let rising = block.ttl_bits & !prev_ttl;
+        if rising != 0 && idx > 0 {
+            // Draw a vertical line for each rising edge
+            for bit in 0..8u32 {
+                if (rising >> bit) & 1 == 1 {
+                    let color = TTL_COLORS[bit as usize];
+                    let line = Line::new(PlotPoints::from(vec![
+                        [block_time_ms, y_min],
+                        [block_time_ms, y_max],
+                    ]))
+                    .color(color)
+                    .width(1.5)
+                    .style(egui_plot::LineStyle::dashed_loose())
+                    .name(format!("TTL{}", bit));
+                    plot_ui.line(line);
+                }
+            }
+        }
+        prev_ttl = block.ttl_bits;
+    }
 }
 
 // ── Data collection ─────────────────────────────────────────────────

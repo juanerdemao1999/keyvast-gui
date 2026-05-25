@@ -20,9 +20,48 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 6 — GUI polish + signal processing)
+Last updated: 2026-05-25 (session 7 — GUI Tier-4: FFT, spectrum, TTL, config persistence)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1 through Tier-4 features (visualization, interaction, signal-processing, spectral analysis, TTL events, configuration persistence).
+
+### Session 7 changes (Tier-4: FFT, spectrum panel, TTL, config)
+
+- **Cooley-Tukey FFT** (`dsp.rs`) — in-place radix-2 FFT with inline `Cplx` type (no external `num-complex` dep), Hann window, and `power_spectrum_db()` that returns one-sided PSD in dB. 5 new unit tests (Cplx arithmetic, DC signal, pure tone bin detection, 500 Hz tone PSD peak, Hann window symmetry). Total DSP tests: 14.
+- **Frequency spectrum panel** (`spectrum.rs`, new) — bottom panel (toggled with `S` key) that computes and plots the PSD of the hovered waveform channel in real time. Collects up to 2048 samples from the history ring buffer, applies Hann + FFT, plots dB vs Hz with `egui_plot`. Resizable 80-250px. Shows placeholder text when no channel is hovered.
+- **TTL event overlay** (`waveform.rs`) — detects rising edges in `SampleBlock.ttl_bits` across consecutive history blocks and draws color-coded dashed vertical lines on the waveform plot (8 TTL lines, distinct colors).
+- **Demo TTL pulse generation** (`demo.rs`) — three periodic TTL lines: bit 0 at 1 Hz/50% duty, bit 1 at 0.5 Hz/20% duty, bit 2 at 2 Hz/10% duty, producing visible event markers in demo mode.
+- **Configuration persistence** (`config.rs`, new) — saves/loads GUI settings (display, filters, UI toggles) as TOML in the platform config directory (`%APPDATA%\keyvast\gui.toml` on Windows). Settings auto-load on startup and auto-save on exit. Uses `serde` + `toml` + `dirs` crates. Graceful degradation on missing/corrupt config.
+- **Waveform returns hovered channel** — `draw_waveform_area()` now returns `Option<usize>` so the app can pass the hovered channel to the spectrum panel.
+
+### New keyboard shortcuts (session 7)
+
+| Key | Action |
+|-----|--------|
+| `S` | Toggle spectrum panel |
+
+### New dependencies (session 7)
+
+| Crate | Version | Purpose |
+|-------|---------|---------|
+| `serde` | 1.x (with `derive`) | Serialize/deserialize config |
+| `toml` | 0.8.x | TOML format for config file |
+| `dirs` | 6.x | Platform config directory |
+
+### Files most relevant to session 7
+
+- `crates/kv-gui/src/dsp.rs` — FFT, Cplx, Hann window, power_spectrum_db + 5 new tests
+- `crates/kv-gui/src/spectrum.rs` — **new** — frequency spectrum bottom panel
+- `crates/kv-gui/src/config.rs` — **new** — TOML config persistence
+- `crates/kv-gui/src/app.rs` — config load/save wiring, spectrum panel integration, hovered_channel state
+- `crates/kv-gui/src/waveform.rs` — TTL marker overlay, return hovered channel
+- `crates/kv-gui/src/demo.rs` — TTL pulse generation (3 lines)
+- `crates/kv-gui/Cargo.toml` — new deps (serde, toml, dirs)
+
+### Test counts (session 7)
+
+- **kv-gui**: 14 tests (9 biquad + 5 FFT/spectrum)
+- **Workspace total**: 89 tests, all passing
+- **Clippy**: clean (6 pre-existing dead-code warnings only)
 
 ### Session 6 changes (waveform / UX polish)
 
@@ -46,6 +85,7 @@ The project is in the simulator-first foundation phase. The streaming pipeline, 
 | `G`       | Toggle grid                              |
 | `P`       | Pause / resume display                   |
 | `F`       | Toggle performance overlay               |
+| `S`       | Toggle spectrum panel                    |
 | `[` `]`   | Decrease / increase time window          |
 | `1`–`9`   | Quick-set visible channels               |
 | Wheel     | Increase / decrease time window          |

@@ -7,10 +7,12 @@
 //! signals (spikes, LFP, bursts) for demonstration without hardware.
 
 mod app;
+pub mod config;
 mod demo;
 mod dsp;
 mod panels;
 mod preview;
+mod spectrum;
 mod theme;
 mod waveform;
 

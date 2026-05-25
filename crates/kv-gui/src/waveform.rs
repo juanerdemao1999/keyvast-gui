@@ -425,8 +425,8 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
 /// search, no per-sample timestamp comparison.  The ring stores pre-decimated
 /// f32 values already filtered by the incremental pipeline.
 ///
-/// Secondary stride is applied inside `ring.collect_channel()` when the
-/// ring resolution is finer than MAX_DISPLAY_POINTS for the current window.
+/// Secondary stride is fixed for the full sweep window so the decimation
+/// level stays constant as data fills in during a sweep.
 ///
 /// Spike detection (sigma + threshold crossings) runs inline when enabled.
 #[allow(clippy::too_many_arguments)]
@@ -441,6 +441,14 @@ fn collect_from_ring(
     gain: f64,
     ch_spacing: f64,
 ) -> Vec<ChannelTrace> {
+    // Pre-compute the full-window ring-entry count for stable stride2.
+    // stride2 must be based on the *intended* window width, not the currently
+    // filled portion, otherwise stride2 grows during a sweep and early data
+    // appears progressively coarser (the "stretch/zoom" visual artifact).
+    let ms_per_ring = ring.dwnsp as f64 * 1000.0 / ring.sample_rate.max(1.0);
+    let window_ring_entries =
+        ((t_right_ms - t_left_ms) / ms_per_ring).ceil() as usize + 1;
+
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
 
     for ch in 0..visible {
@@ -449,7 +457,8 @@ fn collect_from_ring(
         }
 
         // Read display-ready points from the ring (O(output_points))
-        let mut pts = ring.collect_channel(ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS);
+        let mut pts =
+            ring.collect_channel(ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries);
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
         let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {

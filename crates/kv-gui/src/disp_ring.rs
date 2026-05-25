@@ -175,6 +175,14 @@ impl DisplayRing {
 
     /// Collect display points for `ch` in the time window [t_left_ms, t_right_ms].
     ///
+    /// `window_ring_entries` is the **full** window size expressed in ring slots:
+    ///   `(t_right_ms - t_left_ms) / ms_per_ring`
+    ///
+    /// This value drives the secondary stride, which must be computed over the
+    /// *intended* window, NOT the currently-filled portion.  Using the filled
+    /// portion would cause stride2 to grow during a sweep (early data appears
+    /// coarse while new data is fine, creating a "stretch/zoom" visual artifact).
+    ///
     /// Returns a `Vec<[f64; 2]>` of (time_ms, normalized_y) pairs,
     /// decimated to at most `max_points` entries using a secondary stride.
     /// The y values are **un-offset, un-gained** normalized amplitudes in [-1, 1].
@@ -184,6 +192,7 @@ impl DisplayRing {
         t_left_ms: f64,
         t_right_ms: f64,
         max_points: usize,
+        window_ring_entries: usize,
     ) -> Vec<[f64; 2]> {
         if ch >= self.channel_count || self.len == 0 || !self.ready {
             return Vec::new();
@@ -202,9 +211,11 @@ impl DisplayRing {
             return Vec::new();
         }
 
+        // Secondary stride based on the FULL window, not just current fill level.
+        // This keeps stride2 constant for the entire sweep duration.
+        let stride_denom = window_ring_entries.max(ri_end - ri_start);
+        let stride2 = (stride_denom / max_points).max(1);
         let visible = ri_end - ri_start;
-        // Secondary stride (applied on top of RING_DWNSP)
-        let stride2 = (visible / max_points).max(1);
         let pts_cap = (visible + stride2 - 1) / stride2;
         let mut pts = Vec::with_capacity(pts_cap);
 

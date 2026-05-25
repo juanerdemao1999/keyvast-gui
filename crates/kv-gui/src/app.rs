@@ -304,6 +304,17 @@ impl KvApp {
                     self.display.visible_channels = num;
                 }
             }
+            // +/- for channel spacing
+            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                self.display.channel_spacing =
+                    (self.display.channel_spacing + panels::SPACING_STEP)
+                        .min(panels::SPACING_MAX);
+            }
+            if i.key_pressed(egui::Key::Minus) {
+                self.display.channel_spacing =
+                    (self.display.channel_spacing - panels::SPACING_STEP)
+                        .max(panels::SPACING_MIN);
+            }
         });
     }
 }

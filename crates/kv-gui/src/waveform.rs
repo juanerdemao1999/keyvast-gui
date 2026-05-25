@@ -21,8 +21,8 @@ use crate::theme;
 /// Maximum rendered points per channel (decimation target for performance).
 const MAX_DISPLAY_POINTS: usize = 4096;
 
-/// Vertical spacing (in normalized units) between channel baselines.
-const CHANNEL_SPACING: f64 = 2.2;
+/// Default vertical spacing (in normalized units) between channel baselines.
+pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
 
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
@@ -65,9 +65,10 @@ pub fn draw_waveform_area(
 
     let amp_scale = settings.amp_scale_uv();
     let time_window_ms = settings.time_window_ms();
+    let ch_spacing = settings.channel_spacing;
 
     // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
-    let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
+    let gain = ch_spacing * 3.0 * (1000.0 / amp_scale.max(1.0));
 
     // X-axis window driven by wall clock — smooth continuous scroll
     let x_right = elapsed_secs * 1000.0; // current time in ms
@@ -89,6 +90,7 @@ pub fn draw_waveform_area(
             x_left,
             x_right,
             gain,
+            ch_spacing,
         )
     } else {
         collect_lines_fast(
@@ -101,18 +103,20 @@ pub fn draw_waveform_area(
             x_left,
             x_right,
             gain,
+            ch_spacing,
         )
     };
 
     // Y axis bounds
-    let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
-    let y_max = CHANNEL_SPACING * 0.5;
+    let y_min = -(visible as f64) * ch_spacing + ch_spacing * 0.5;
+    let y_max = ch_spacing * 0.5;
 
     // Channel label formatter for Y-axis
     let ch_count_for_fmt = visible;
+    let spacing_for_fmt = ch_spacing;
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
         let val = mark.value;
-        let ch_idx = (-val / CHANNEL_SPACING).round() as i64;
+        let ch_idx = (-val / spacing_for_fmt).round() as i64;
         if ch_idx >= 0 && (ch_idx as usize) < ch_count_for_fmt {
             format!("CH{}", ch_idx)
         } else {
@@ -164,7 +168,7 @@ pub fn draw_waveform_area(
                 if !settings.is_channel_enabled(ch) {
                     continue;
                 }
-                let y_off = -(ch as f64) * CHANNEL_SPACING;
+                let y_off = -(ch as f64) * ch_spacing;
                 let zero_line = Line::new(PlotPoints::from(vec![
                     [x_left, y_off],
                     [x_right, y_off],
@@ -178,7 +182,7 @@ pub fn draw_waveform_area(
 
         // Determine which channel the cursor is hovering over (Y → channel)
         let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
-            let ch_idx = (-pos.y / CHANNEL_SPACING).round() as i64;
+            let ch_idx = (-pos.y / ch_spacing).round() as i64;
             if ch_idx >= 0 && (ch_idx as usize) < visible {
                 Some(ch_idx as usize)
             } else {
@@ -190,7 +194,7 @@ pub fn draw_waveform_area(
         if filters.spike_threshold_enabled {
             for trace in &traces {
                 if let Some(sigma) = trace.sigma {
-                    let y_off = -(trace.channel as f64) * CHANNEL_SPACING;
+                    let y_off = -(trace.channel as f64) * ch_spacing;
                     let thresh_y =
                         -filters.spike_threshold_sigma * sigma * gain + y_off;
                     let line = Line::new(PlotPoints::from(vec![
@@ -234,7 +238,7 @@ pub fn draw_waveform_area(
             if trace.spike_count == 0 {
                 continue;
             }
-            let y_lane = -(trace.channel as f64) * CHANNEL_SPACING;
+            let y_lane = -(trace.channel as f64) * ch_spacing;
             let plot_pos = egui_plot::PlotPoint::new(x_right, y_lane);
             let screen_pos = response.transform.position_from_point(&plot_pos);
             let badge_pos = screen_pos + egui::vec2(-6.0, -1.0);
@@ -270,7 +274,7 @@ pub fn draw_waveform_area(
             }
 
     // Voltage scale bar — small vertical reference on the bottom-right
-    draw_scale_bar(ui, &response, amp_scale, gain);
+    draw_scale_bar(ui, &response, amp_scale, ch_spacing);
 }
 
 /// Draw a voltage scale bar in the bottom-right corner of the plot.
@@ -279,35 +283,16 @@ fn draw_scale_bar(
     ui: &egui::Ui,
     response: &egui_plot::PlotResponse<Option<usize>>,
     amp_scale_uv: f64,
-    gain: f64,
+    ch_spacing: f64,
 ) {
     let painter = ui.painter();
     let plot_rect = response.response.rect;
 
     // The scale bar represents amp_scale_uv microvolts.
-    // In normalized units: amp_scale_uv µV / (i16::MAX µV per full-scale) doesn't apply
-    // here because our gain already maps normalized values to plot Y units.
-    // A 1.0 normalized signal → gain plot-units.  We want to show how tall
-    // amp_scale_uv is.  The raw i16 data is divided by i16::MAX, so 1.0 normalized
-    // = i16::MAX ADC counts.  If amp_scale = 1000 µV, and gain maps that to
-    // CHANNEL_SPACING * 3.0 * (1000/amp_scale) = CHANNEL_SPACING * 3.0 plot units.
-    //
-    // Actually simpler: the gain formula is:
-    //   gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale_uv)
-    // A signal of amplitude amp_scale_uv µV in raw ADC ~ amp_scale_uv / (i16::MAX_as_uV)
-    // But we don't know the actual µV/count conversion — we just use normalized values.
-    // For the scale bar, we want bar_height_in_Y_units = (some_reference / i16::MAX) * gain
-    //
-    // Simplification: since the user controls amp_scale as a display parameter,
-    // the bar represents "what amplitude fills one lane height".
-    // One lane half-height in Y-units ≈ CHANNEL_SPACING/2.
-    // The amp_scale combo sets how much µV maps to that height.
-    // So bar_height in Y-units for amp_scale_uv µV = CHANNEL_SPACING / 2 (roughly).
-    //
-    // Let's just pick a fixed fraction of the channel lane and label it with µV.
     // Bar height = 1/3 of channel spacing in Y units.
-    let bar_y_units = CHANNEL_SPACING / 3.0;
-    let _ = gain; // suppress unused warning; gain isn't needed for the bar positioning
+    // The amp_scale combo sets how much µV maps to one lane height,
+    // so 1/3 of that is amp_scale_uv / 3 µV.
+    let bar_y_units = ch_spacing / 3.0;
 
     // Convert bar height from plot Y-units to screen pixels using the transform
     let top_point = egui_plot::PlotPoint::new(0.0, 0.0);
@@ -400,6 +385,7 @@ fn collect_lines_fast(
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
+    ch_spacing: f64,
 ) -> Vec<ChannelTrace> {
     let ms_per_sample = if sample_rate > 0.0 {
         1000.0 / sample_rate
@@ -517,7 +503,7 @@ fn collect_lines_fast(
             }
         }
 
-        finalize_channel(&mut pts, ch, gain);
+        finalize_channel(&mut pts, ch, gain, ch_spacing);
         traces.push(ChannelTrace {
             channel: ch,
             points: pts,
@@ -567,6 +553,7 @@ fn collect_lines_filtered(
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
+    ch_spacing: f64,
 ) -> Vec<ChannelTrace> {
     let ms_per_sample = if sample_rate > 0.0 {
         1000.0 / sample_rate
@@ -766,7 +753,7 @@ fn collect_lines_filtered(
             }
         }
 
-        finalize_channel(&mut pts, ch, gain);
+        finalize_channel(&mut pts, ch, gain, ch_spacing);
         traces.push(ChannelTrace {
             channel: ch,
             points: pts,
@@ -778,12 +765,12 @@ fn collect_lines_filtered(
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
-fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64) {
+fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64) {
     if pts.is_empty() {
         return;
     }
     let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-    let y_offset = -(ch as f64) * CHANNEL_SPACING;
+    let y_offset = -(ch as f64) * ch_spacing;
     for p in pts.iter_mut() {
         p[1] = (p[1] - mean) * gain + y_offset;
     }

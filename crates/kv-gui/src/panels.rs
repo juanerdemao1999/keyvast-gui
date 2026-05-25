@@ -31,7 +31,16 @@ pub struct DisplaySettings {
     pub overlay_mode: bool,
     /// Per-channel enable/disable (true = visible).
     pub channel_enabled: Vec<bool>,
+    /// Vertical spacing between channel baselines (1.0 = dense, 6.0 = spread).
+    pub channel_spacing: f64,
 }
+
+/// Minimum allowed channel spacing.
+pub const SPACING_MIN: f64 = 1.0;
+/// Maximum allowed channel spacing.
+pub const SPACING_MAX: f64 = 6.0;
+/// Step for keyboard +/- adjustment.
+pub const SPACING_STEP: f64 = 0.2;
 
 impl Default for DisplaySettings {
     fn default() -> Self {
@@ -43,6 +52,7 @@ impl Default for DisplaySettings {
             show_channel_labels: true,
             overlay_mode: false,
             channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
+            channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
         }
     }
 }
@@ -327,6 +337,20 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                         ui.selectable_value(&mut display.amp_scale_idx, i, format_uv(uv));
                     }
                 });
+        });
+
+        // Channel spacing — slider
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Spacing")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::Slider::new(&mut display.channel_spacing, SPACING_MIN..=SPACING_MAX)
+                    .step_by(SPACING_STEP)
+                    .trailing_fill(true),
+            );
         });
 
         ui.add_space(2.0);

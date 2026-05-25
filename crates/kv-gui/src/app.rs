@@ -747,8 +747,27 @@ impl eframe::App for KvApp {
             .show(ctx, |ui| {
                 let plot_rect = ui.available_rect_before_wrap();
 
-                // Mouse wheel over the plot adjusts the time window;
-                // drag when paused scrolls through history.
+                // ── Zone-aware scroll + drag ─────────────────────────
+                // The waveform widget is divided into three interaction zones:
+                //
+                //   ┌──────────┬──────────────────────────────────────┐
+                //   │  Y-axis  │                                      │
+                //   │  strip   │        Main waveform area            │
+                //   │ (~55 px) │                                      │
+                //   ├──────────┼──────────────────────────────────────┤
+                //   │          │     X-axis strip (~28 px)            │
+                //   └──────────┴──────────────────────────────────────┘
+                //
+                //  Y-axis strip  → scroll adjusts amplitude scale (Y zoom)
+                //  X-axis strip  → scroll adjusts time window (X zoom)
+                //  Main area     → when paused: scroll browses time history
+                //                  when running: no scroll action
+                //  Drag (paused) → horizontal drag browses history
+
+                // Approximate axis-strip dimensions (pixel guesses for egui_plot layout)
+                const Y_STRIP_W: f32 = 55.0; // Y-axis label column
+                const X_STRIP_H: f32 = 28.0; // X-axis label row
+
                 let sense = if self.display_paused {
                     egui::Sense::click_and_drag()
                 } else {
@@ -756,19 +775,59 @@ impl eframe::App for KvApp {
                 };
                 let scroll_response =
                     ui.interact(plot_rect, egui::Id::new("waveform_wheel"), sense);
-                if scroll_response.hovered() {
-                    let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                    if scroll.abs() > 1.0 {
-                        let max_idx = panels::TIME_WINDOWS.len() - 1;
-                        if scroll < 0.0 {
-                            self.display.time_scale_idx =
-                                (self.display.time_scale_idx + 1).min(max_idx);
-                        } else {
-                            self.display.time_scale_idx =
-                                self.display.time_scale_idx.saturating_sub(1);
+
+                // Determine which zone the cursor is currently in
+                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+                let cursor_pos = ctx.input(|i| i.pointer.hover_pos());
+
+                if scroll.abs() > 1.0 {
+                    if let Some(pos) = cursor_pos {
+                        if plot_rect.contains(pos) {
+                            let in_y_strip = pos.x < plot_rect.left() + Y_STRIP_W;
+                            let in_x_strip = pos.y > plot_rect.bottom() - X_STRIP_H;
+
+                            if in_y_strip && !in_x_strip {
+                                // Y-axis strip: scroll adjusts amplitude scale
+                                let max_idx = panels::AMP_SCALES.len() - 1;
+                                if scroll < 0.0 {
+                                    // scroll down → zoom out (larger µV range)
+                                    self.display.amp_scale_idx =
+                                        (self.display.amp_scale_idx + 1).min(max_idx);
+                                } else {
+                                    // scroll up → zoom in (smaller µV range)
+                                    self.display.amp_scale_idx =
+                                        self.display.amp_scale_idx.saturating_sub(1);
+                                }
+                            } else if in_x_strip {
+                                // X-axis strip: scroll adjusts time window
+                                let max_idx = panels::TIME_WINDOWS.len() - 1;
+                                if scroll < 0.0 {
+                                    self.display.time_scale_idx =
+                                        (self.display.time_scale_idx + 1).min(max_idx);
+                                } else {
+                                    self.display.time_scale_idx =
+                                        self.display.time_scale_idx.saturating_sub(1);
+                                }
+                            } else if self.display_paused {
+                                // Main area when paused: scroll browses time history
+                                let window_ms = self.display.time_window_ms();
+                                // One scroll step = 10% of the current time window
+                                let step_s = window_ms * 0.10 / 1000.0;
+                                if scroll < 0.0 {
+                                    // scroll down → go back in time
+                                    self.paused_elapsed =
+                                        (self.paused_elapsed - step_s).max(0.0);
+                                } else {
+                                    // scroll up → go forward in time
+                                    let live = self.elapsed_seconds();
+                                    self.paused_elapsed =
+                                        (self.paused_elapsed + step_s).min(live);
+                                }
+                            }
                         }
                     }
                 }
+
                 // Drag-to-browse when paused: horizontal drag shifts the view time
                 if self.display_paused && scroll_response.dragged() {
                     let drag_px = scroll_response.drag_delta().x;

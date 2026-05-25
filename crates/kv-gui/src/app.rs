@@ -24,6 +24,8 @@ use eframe::egui;
 use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
+use kv_recorder::StreamingRecorder;
+
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
@@ -74,6 +76,8 @@ pub struct KvApp {
     display: DisplaySettings,
     filters: FilterSettings,
     recording: RecordingSettings,
+    /// Active streaming recorder — Some while RecordingState::Recording.
+    active_recorder: Option<StreamingRecorder>,
     theme_applied: bool,
     /// When true, the waveform display is frozen at the current view but
     /// acquisition and recording continue uninterrupted.
@@ -125,6 +129,7 @@ impl KvApp {
             display: DisplaySettings::default(),
             filters,
             recording: RecordingSettings::default(),
+            active_recorder: None,
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
@@ -173,6 +178,20 @@ impl KvApp {
     }
 
     fn stop_all(&mut self) {
+        // Finalize any active recording before stopping acquisition
+        if self.recording.state == RecordingState::Recording {
+            if let Some(rec) = self.active_recorder.take() {
+                match rec.finish() {
+                    Ok(summary) => eprintln!(
+                        "[recorder] Auto-stopped: {} blocks saved → {}",
+                        summary.recording.block_count,
+                        summary.recording.raw_path.display()
+                    ),
+                    Err(e) => eprintln!("[recorder] Auto-stop finish error: {e}"),
+                }
+            }
+            self.recording.state = RecordingState::Idle;
+        }
         self.demo_started = false;
         self.device_preview.stop();
     }
@@ -318,6 +337,25 @@ impl KvApp {
         // Feed display ring from the display-ready (filtered or raw) block
         self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
 
+        // Feed raw block to the streaming recorder if active
+        if self.recording.state == RecordingState::Recording {
+            if let Some(ref mut rec) = self.active_recorder {
+                match rec.write_block(&block) {
+                    Ok(()) => {
+                        self.recording.recorded_blocks =
+                            self.recording.recorded_blocks.saturating_add(1);
+                        self.recording.recorded_bytes = self
+                            .recording
+                            .recorded_bytes
+                            .saturating_add(block.data.len() as u64 * 2);
+                    }
+                    Err(e) => {
+                        eprintln!("[recorder] write_block error: {e}");
+                    }
+                }
+            }
+        }
+
         // Store raw + filtered history for pause/browse and re-filter
         self.block_history.push_back(block.clone());
         self.filtered_history.push_back(filtered);
@@ -368,11 +406,35 @@ impl KvApp {
                 }
             }
             RecordingState::Armed => {
-                self.recording.state = RecordingState::Recording;
-                self.recording.recorded_blocks = 0;
-                self.recording.recorded_bytes = 0;
+                // Open the output file and start recording
+                match StreamingRecorder::new(&self.recording.output_dir) {
+                    Ok(rec) => {
+                        self.active_recorder = Some(rec);
+                        self.recording.state = RecordingState::Recording;
+                        self.recording.recorded_blocks = 0;
+                        self.recording.recorded_bytes = 0;
+                    }
+                    Err(e) => {
+                        // Log to stderr; in a future version surface this in the UI
+                        eprintln!("[recorder] Failed to open output: {e}");
+                    }
+                }
             }
             RecordingState::Recording => {
+                // Flush and finalize
+                if let Some(rec) = self.active_recorder.take() {
+                    match rec.finish() {
+                        Ok(summary) => {
+                            eprintln!(
+                                "[recorder] Saved {} blocks ({} bytes) → {}",
+                                summary.recording.block_count,
+                                summary.recording.byte_count,
+                                summary.recording.raw_path.display()
+                            );
+                        }
+                        Err(e) => eprintln!("[recorder] Finish error: {e}"),
+                    }
+                }
                 self.recording.state = RecordingState::Idle;
             }
         }

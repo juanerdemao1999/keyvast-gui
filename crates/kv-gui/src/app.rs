@@ -803,12 +803,14 @@ impl eframe::App for KvApp {
             .show(ctx, |ui| {
                 let mut start = false;
                 let mut stop = false;
+                let mut toggle_rec = false;
 
                 panels::draw_left_panel(
                     ui,
                     self.is_running(),
                     &mut start,
                     &mut stop,
+                    &mut toggle_rec,
                     &mut self.display,
                     &mut self.filters,
                     &mut self.recording,
@@ -823,6 +825,9 @@ impl eframe::App for KvApp {
                 }
                 if stop {
                     self.stop_all();
+                }
+                if toggle_rec {
+                    self.toggle_recording();
                 }
             });
 

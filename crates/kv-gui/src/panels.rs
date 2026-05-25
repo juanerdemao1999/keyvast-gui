@@ -170,6 +170,7 @@ pub fn draw_left_panel(
     acquiring: bool,
     start_clicked: &mut bool,
     stop_clicked: &mut bool,
+    toggle_rec: &mut bool,
     display: &mut DisplaySettings,
     filters: &mut FilterSettings,
     recording: &mut RecordingSettings,
@@ -187,7 +188,7 @@ pub fn draw_left_panel(
         ui.add_space(4.0);
         draw_channel_list(ui, display, block);
         ui.add_space(4.0);
-        draw_recording_section(ui, recording, acquiring);
+        draw_recording_section(ui, recording, acquiring, toggle_rec);
     });
 }
 
@@ -576,7 +577,12 @@ fn draw_channel_list(
 
 // ── Recording section ───────────────────────────────────────────────
 
-fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, acquiring: bool) {
+fn draw_recording_section(
+    ui: &mut egui::Ui,
+    recording: &mut RecordingSettings,
+    acquiring: bool,
+    toggle_rec: &mut bool,
+) {
     egui::CollapsingHeader::new(
         egui::RichText::new("RECORDING").size(11.0).strong().color(theme::TEXT_SECONDARY),
     )
@@ -623,29 +629,30 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
             }
         });
 
-        // Arm / Record / Stop buttons
+        // Arm / Record / Stop buttons — all go through toggle_rec so that
+        // app.rs::toggle_recording() handles the actual state transitions
+        // (creating / finishing the StreamingRecorder).
         ui.horizontal(|ui| match recording.state {
             RecordingState::Idle => {
                 if theme::transport_button(ui, " Arm ", theme::ACCENT_YELLOW, acquiring) {
-                    recording.state = RecordingState::Armed;
+                    *toggle_rec = true;
                 }
             }
             RecordingState::Armed => {
                 if theme::transport_button(ui, "Record", theme::BTN_RECORD, true) {
-                    recording.state = RecordingState::Recording;
-                    recording.recorded_blocks = 0;
-                    recording.recorded_bytes = 0;
+                    *toggle_rec = true;
                 }
                 if ui
                     .button(egui::RichText::new("Disarm").size(11.0))
                     .clicked()
                 {
+                    // Disarm: go directly back to Idle without creating a file
                     recording.state = RecordingState::Idle;
                 }
             }
             RecordingState::Recording => {
                 if theme::transport_button(ui, "Stop Rec", theme::BTN_STOP, true) {
-                    recording.state = RecordingState::Idle;
+                    *toggle_rec = true;
                 }
             }
         });

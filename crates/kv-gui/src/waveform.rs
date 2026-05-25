@@ -263,13 +263,15 @@ pub fn draw_waveform_area(
         for trace in traces {
             let base_color = theme::channel_color(trace.channel);
             let is_hovered = hovered_ch == Some(trace.channel);
-            let (color, width) = if is_hovered {
+            // Default: all channels always at full brightness (1.3× base color).
+            // Hover highlight mode (settings.hover_highlight) must be ON for
+            // dimming to activate — matches professional tool conventions where
+            // the waveform display is always fully lit until user requests focus.
+            let (color, width) = if settings.hover_highlight && is_hovered {
                 (egui::Color32::WHITE, 2.0)
-            } else if hovered_ch.is_some() {
-                // When another channel is hovered, dim the rest slightly
+            } else if settings.hover_highlight && hovered_ch.is_some() {
                 (dim_color(base_color, 0.35), 1.0)
             } else {
-                // Default: full brightness, slightly bolder
                 (brighten_color(base_color, 1.3), 1.5)
             };
             plot_ui.line(
@@ -304,26 +306,37 @@ pub fn draw_waveform_area(
         }
     }
 
-    // Tooltip with the hovered channel + time
+    // Hover info overlay — drawn in the top-left corner of the plot so it
+    // never covers the waveform under the cursor.
     if response.response.hovered()
         && let Some(hovered_ch) = response.inner
-            && let Some(ptr_pos) = response.response.hover_pos() {
-                let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
-                let tip = format_time_tooltip(hovered_ch, time_at_cursor);
-                egui::containers::popup::show_tooltip_at_pointer(
-                    ui.ctx(),
-                    ui.layer_id(),
-                    egui::Id::new("waveform_hover_tooltip"),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(tip)
-                                .monospace()
-                                .size(11.0)
-                                .color(theme::TEXT_PRIMARY),
-                        );
-                    },
-                );
-            }
+            && let Some(ptr_pos) = response.response.hover_pos()
+    {
+        let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
+        let tip = format_time_tooltip(hovered_ch, time_at_cursor);
+        let plot_rect = response.response.rect;
+        let painter = ui.painter();
+        let text_pos = plot_rect.left_top() + egui::vec2(10.0, 8.0);
+        // Background pill
+        let font = egui::FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(tip.clone(), font.clone(), theme::TEXT_PRIMARY);
+        let bg_rect = egui::Rect::from_min_size(
+            text_pos - egui::vec2(4.0, 2.0),
+            galley.size() + egui::vec2(8.0, 4.0),
+        );
+        painter.rect_filled(
+            bg_rect,
+            egui::CornerRadius::same(3),
+            egui::Color32::from_rgba_premultiplied(18, 18, 24, 210),
+        );
+        painter.text(
+            text_pos,
+            egui::Align2::LEFT_TOP,
+            tip,
+            font,
+            theme::TEXT_PRIMARY,
+        );
+    }
 
     // Voltage scale bar — small vertical reference on the bottom-right
     draw_scale_bar(ui, &response, amp_scale, ch_spacing);

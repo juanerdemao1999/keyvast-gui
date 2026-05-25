@@ -29,6 +29,9 @@ pub struct DisplaySettings {
     pub show_grid: bool,
     pub show_channel_labels: bool,
     pub overlay_mode: bool,
+    /// When true: hovering over a channel highlights it white and dims others.
+    /// When false (default): all channels always render at full brightness.
+    pub hover_highlight: bool,
     /// Per-channel enable/disable (true = visible).
     pub channel_enabled: Vec<bool>,
     /// Vertical spacing between channel baselines (1.0 = dense, 6.0 = spread).
@@ -51,6 +54,7 @@ impl Default for DisplaySettings {
             show_grid: true,
             show_channel_labels: true,
             overlay_mode: false,
+            hover_highlight: false,
             channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
             channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
         }
@@ -355,7 +359,7 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
 
         ui.add_space(2.0);
 
-        // Toggles on one row
+        // Toggles
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut display.show_grid,
@@ -365,6 +369,11 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 &mut display.show_channel_labels,
                 egui::RichText::new("Labels").size(10.0),
             );
+            ui.checkbox(
+                &mut display.hover_highlight,
+                egui::RichText::new("Hover hl").size(10.0),
+            )
+            .on_hover_text("Highlight hovered channel, dim others");
         });
     });
 }

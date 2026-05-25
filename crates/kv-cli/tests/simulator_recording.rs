@@ -10,6 +10,7 @@ use kv_cli::{
     blocks_for_duration, parse_args, run_benchmark, run_directory_name_utc, run_simulator_pipeline,
     run_simulator_recording, run_simulator_stream,
 };
+use kv_recorder::KVRAW_DATA_OFFSET;
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET};
 
 #[test]
@@ -30,6 +31,7 @@ fn simulator_recording_writes_raw_metadata_and_integrity_summary() {
     assert_eq!(result.integrity.summary.observed_packets, 3);
     assert_eq!(result.integrity.summary.missing_packets, 0);
     assert_eq!(result.integrity.summary.written_samples, expected_samples);
+    // Batch recorder (write_recording) still uses separate JSON + raw files
     assert_eq!(
         fs::metadata(output_dir.join("recording.kvraw"))
             .expect("raw file should exist")
@@ -311,7 +313,8 @@ fn simulator_stream_writes_all_output_files_with_streaming_benchmark() {
     assert_eq!(result.recorder_dropped_blocks, 0);
 
     assert!(output_dir.join("recording.kvraw").exists());
-    assert!(output_dir.join("recording.json").exists());
+    // run_simulator_stream uses StreamingRecorder (KVRAW v2): metadata embedded, no JSON file
+    assert!(!output_dir.join("recording.json").exists());
     assert!(output_dir.join("integrity.json").exists());
     assert!(output_dir.join("log.txt").exists());
     assert!(output_dir.join("events.csv").exists());

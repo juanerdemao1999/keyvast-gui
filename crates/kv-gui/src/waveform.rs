@@ -457,11 +457,11 @@ fn emit_minmax(
 
 /// **Full pipeline** — used when any HP/LP/Notch/CAR is enabled.
 ///
-/// Collects every raw sample within the visible window for every channel
-/// (no decimation yet), optionally subtracts the common-average reference
-/// at each time index, runs each channel through its own biquad chain in
-/// sample order to maintain phase coherence, then anchored-decimates the
-/// filtered result for rendering.
+/// Collects raw samples from the visible window plus a 50 ms warm-up margin
+/// to the left.  CAR and biquad filters are applied to the full buffer in
+/// sample order; the warm-up gives the filter enough time to reach steady
+/// state before the displayed portion, eliminating edge transients.
+/// Only samples within the visible window are decimated and rendered.
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn collect_lines_filtered(
     history: &VecDeque<SampleBlock>,
@@ -482,9 +482,15 @@ fn collect_lines_filtered(
     };
     let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
 
+    // Warm-up margin: collect extra samples before the visible window so
+    // the filter reaches steady state before the displayed portion.
+    // 50 ms is enough for a 300 Hz HP biquad to settle (3*tau ≈ 1.6 ms).
+    let warmup_ms: f64 = 50.0;
+    let collect_left_ms = (t_left_ms - warmup_ms).max(0.0);
+
     // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
     // once for the maximum window length to avoid reallocation churn.
-    let cap = window_samples as usize + 1024;
+    let cap = window_samples as usize + (warmup_ms / ms_per_sample) as usize + 1024;
     let mut times: Vec<u64> = Vec::with_capacity(cap);
     let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
 
@@ -496,13 +502,14 @@ fn collect_lines_filtered(
         let spc = block.samples_per_channel;
         let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
         let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-        if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
+        // Use collect_left_ms (with warmup) for collection range
+        if block_end_ms < collect_left_ms || block_start_ms > t_right_ms {
             continue;
         }
         for s in 0..spc {
             let abs_idx = block.timestamp_start + s as u64;
             let time_ms = abs_idx as f64 * ms_per_sample;
-            if time_ms < t_left_ms || time_ms > t_right_ms {
+            if time_ms < collect_left_ms || time_ms > t_right_ms {
                 continue;
             }
             times.push(abs_idx);
@@ -546,8 +553,8 @@ fn collect_lines_filtered(
         }
     }
 
-    // Apply per-channel filter chain in sample order.  Note: filter state
-    // is fresh each frame, so the leftmost ~10 ms have a small transient.
+    // Apply per-channel filter chain in sample order.  The warm-up margin
+    // ensures the filter has settled by the time we reach the visible window.
     if filters.any_filter_enabled() {
         for ch in 0..visible {
             if !settings.is_channel_enabled(ch) {
@@ -560,7 +567,11 @@ fn collect_lines_filtered(
         }
     }
 
-    // Per-channel sigma + spike detection on full-resolution filtered data.
+    // Determine the index boundary where the warmup ends and visible window begins
+    let t_left_sample = (t_left_ms / ms_per_sample).ceil() as u64;
+    let visible_start_idx = times.iter().position(|&t| t >= t_left_sample).unwrap_or(0);
+
+    // Per-channel sigma + spike detection on filtered data within the visible window.
     // Using DC-removed RMS, then negative-going threshold crossings with a
     // ~1 ms refractory period (32 samples at 32 kHz / 30 at 30 kHz).
     let refractory_samples = (sample_rate * 0.001).max(1.0) as usize;
@@ -571,7 +582,7 @@ fn collect_lines_filtered(
             if !settings.is_channel_enabled(ch) {
                 continue;
             }
-            let buf = &buffers[ch];
+            let buf = &buffers[ch][visible_start_idx..];
             if buf.is_empty() {
                 continue;
             }
@@ -598,6 +609,7 @@ fn collect_lines_filtered(
     }
 
     // Min-max decimation + DC removal + gain/offset, per channel.
+    // Only emit points from the visible window (skip warmup margin).
     // Use half budget for bucket count since each bucket emits 2 points.
     let stride_filtered = (window_samples / (MAX_DISPLAY_POINTS as u64 / 2)).max(1);
 
@@ -609,12 +621,12 @@ fn collect_lines_filtered(
         let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
 
         if stride_filtered <= 1 {
-            // No decimation — emit all filtered samples
-            for (i, &abs_idx) in times.iter().enumerate() {
+            // No decimation — emit all filtered samples in visible window
+            for (i, &abs_idx) in times.iter().enumerate().skip(visible_start_idx) {
                 pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
             }
         } else {
-            // Min-max decimation on filtered data
+            // Min-max decimation on filtered data (visible window only)
             let mut bucket_min_val: f64 = f64::MAX;
             let mut bucket_max_val: f64 = f64::MIN;
             let mut bucket_min_time: f64 = 0.0;
@@ -622,7 +634,7 @@ fn collect_lines_filtered(
             let mut bucket_has_data = false;
             let mut last_bucket_id: u64 = u64::MAX;
 
-            for (i, &abs_idx) in times.iter().enumerate() {
+            for (i, &abs_idx) in times.iter().enumerate().skip(visible_start_idx) {
                 let time_ms = abs_idx as f64 * ms_per_sample;
                 let value = buffers[ch][i];
                 let bucket_id = abs_idx / stride_filtered;

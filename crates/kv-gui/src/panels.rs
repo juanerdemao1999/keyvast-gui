@@ -73,7 +73,7 @@ impl DisplaySettings {
 /// Notch frequency presets — line noise on most regions.
 pub const NOTCH_FREQS: &[f64] = &[50.0, 60.0];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FilterSettings {
     pub hp_enabled: bool,
     pub hp_cutoff_hz: f64,

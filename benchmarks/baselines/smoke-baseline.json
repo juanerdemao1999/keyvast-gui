@@ -1,0 +1,20 @@
+{
+  "measurement_kind": "measured_streaming",
+  "duration_seconds": 0.100787,
+  "channel_count": 64,
+  "sample_rate": 30000.0,
+  "expected_samples": 19202048,
+  "written_samples": 19202048,
+  "missing_packets": 0,
+  "crc_errors": 0,
+  "timestamp_discontinuities": 0,
+  "byte_count": 38404096,
+  "average_write_mb_s": 381.043670,
+  "max_write_latency_ms": 0.100000,
+  "p50_write_latency_ms": 0.015000,
+  "p95_write_latency_ms": 0.044000,
+  "p99_write_latency_ms": 0.058000,
+  "max_buffer_occupancy": 0.000000,
+  "cpu_percent_avg": 186.036636,
+  "memory_mb_max": 4.312500
+}

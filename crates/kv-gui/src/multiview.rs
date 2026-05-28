@@ -25,6 +25,7 @@ use egui_tiles::UiResponse;
 
 use crate::disp_ring::DisplayRing;
 use crate::panels::{AMP_SCALES, DisplaySettings, FilterSettings, TIME_WINDOWS};
+use crate::spike_overlay::{self, SpikeSnippetStore};
 use crate::theme;
 use crate::waveform;
 use kv_types::SampleBlock;
@@ -123,6 +124,8 @@ pub struct KvTileBehavior<'a> {
     pub show_perf_overlay: bool,
     pub render_ms_ema:     &'a mut f64,
     pub block_history_len: usize,
+    // Spike snippet store (read-only from the behavior)
+    pub snippet_store: &'a SpikeSnippetStore,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
 }
@@ -153,15 +156,10 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 UiResponse::None
             }
 
-            TileKind::SpikeOverlay { .. } => {
-                // Phase 2 placeholder
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("Spike Overlay — coming in Phase 2")
-                            .size(13.0)
-                            .color(theme::TEXT_DIM),
-                    );
-                });
+            TileKind::SpikeOverlay { channels, pre_ms, post_ms, max_snippets } => {
+                self.draw_spike_overlay_pane(
+                    ui, _tile_id, channels, pre_ms, post_ms, max_snippets,
+                );
                 UiResponse::None
             }
         }
@@ -422,6 +420,93 @@ impl<'a> KvTileBehavior<'a> {
             egui::FontId::proportional(10.0),
             theme::TEXT_DIM,
         );
+    }
+
+    /// Spike Overlay pane: channel selector, parameter controls, and snippet plot.
+    fn draw_spike_overlay_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        tile_id: egui_tiles::TileId,
+        channels: &mut Vec<usize>,
+        pre_ms: &mut f32,
+        post_ms: &mut f32,
+        max_snippets: &mut usize,
+    ) {
+        let total_ch = self.snippet_store.channel_count();
+        let tile_salt = tile_id.0 as usize;
+
+        // ── Config strip (top ~80 px) ────────────────────────────────
+        ui.horizontal(|ui| {
+            // Threshold sigma
+            ui.label(egui::RichText::new("σ").size(11.0).color(theme::TEXT_DIM));
+            // We can't mutate snippet_store directly here (it's &'a), so we
+            // show sigma as read-only for now; mutable controls are Phase 3.
+            ui.label(
+                egui::RichText::new(format!("{:.1}", self.snippet_store.sigma))
+                    .size(11.0)
+                    .monospace()
+                    .color(theme::TEXT_SECONDARY),
+            )
+            .on_hover_text("Detection threshold (σ × per-channel RMS). Edit in Settings.");
+
+            ui.separator();
+
+            // Pre/post window labels (read from store, tile shows them)
+            ui.label(egui::RichText::new("pre").size(10.0).color(theme::TEXT_DIM));
+            ui.label(
+                egui::RichText::new(format!("{:.1} ms", self.snippet_store.pre_ms()))
+                    .size(10.0).monospace().color(theme::TEXT_SECONDARY),
+            );
+            ui.separator();
+            ui.label(egui::RichText::new("post").size(10.0).color(theme::TEXT_DIM));
+            ui.label(
+                egui::RichText::new(format!("{:.1} ms", self.snippet_store.post_ms()))
+                    .size(10.0).monospace().color(theme::TEXT_SECONDARY),
+            );
+
+            // Suppress unused warnings — pre_ms / post_ms / max_snippets are
+            // stored in pane for future per-tile override; store drives actual detection.
+            let _ = *pre_ms;
+            let _ = *post_ms;
+            let _ = *max_snippets;
+        });
+
+        ui.separator();
+
+        // ── Channel selector (collapsible) ───────────────────────────
+        egui::CollapsingHeader::new(
+            egui::RichText::new(format!("Channels  ({})", channels.len()))
+                .size(10.0)
+                .color(theme::TEXT_DIM),
+        )
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for ch in 0..total_ch {
+                    let selected = channels.contains(&ch);
+                    let label = egui::RichText::new(format!("CH{ch}"))
+                        .size(10.0)
+                        .color(if selected { theme::channel_color(ch) } else { theme::TEXT_DIM });
+                    if ui
+                        .selectable_label(selected, label)
+                        .on_hover_text(format!("Toggle CH{ch}"))
+                        .clicked()
+                    {
+                        if selected {
+                            channels.retain(|&c| c != ch);
+                        } else {
+                            channels.push(ch);
+                            channels.sort_unstable();
+                        }
+                    }
+                }
+            });
+        });
+
+        ui.separator();
+
+        // ── Snippet plot ─────────────────────────────────────────────
+        spike_overlay::draw_spike_overlay(ui, self.snippet_store, channels, tile_salt);
     }
 }
 

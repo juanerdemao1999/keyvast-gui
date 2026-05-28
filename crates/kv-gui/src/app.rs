@@ -31,6 +31,7 @@ use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::live_pipeline::{self, LivePipelineHandle, RecorderCmd, RecorderEvent};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
+use crate::spike_overlay::SpikeSnippetStore;
 use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, compute_block_stats};
 use crate::theme;
@@ -83,6 +84,8 @@ pub struct KvApp {
     /// egui_tiles layout tree — held as Option so it can be temporarily taken
     /// out during update() to allow field-level borrows alongside it.
     tile_tree: Option<egui_tiles::Tree<TileKind>>,
+    /// Spike snippet store — fed from the AP-filtered blocks each ingest.
+    snippet_store: SpikeSnippetStore,
     // UI state
     display: DisplaySettings,
     filters: FilterSettings,
@@ -141,6 +144,7 @@ impl KvApp {
             filter_chains_lfp: Vec::new(),
             filter_chains_ap: Vec::new(),
             tile_tree: Some(multiview::make_initial_tree(16)),
+            snippet_store: SpikeSnippetStore::new(16, 30_000.0),
             display: DisplaySettings::default(),
             filters,
             recording: RecordingSettings::default(),
@@ -175,6 +179,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.snippet_store.reconfigure(16, 30_000.0);
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -194,6 +199,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.snippet_store.reconfigure(16, 30_000.0);
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -416,6 +422,12 @@ impl KvApp {
 
         let ap_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
         self.disp_ring_ap.push_block(&ap_block);
+
+        // Feed AP-filtered block to the spike snippet detector.
+        if self.snippet_store.channel_count() != ch_count {
+            self.snippet_store.reconfigure(ch_count, sample_rate);
+        }
+        self.snippet_store.process_block(&ap_block);
 
         // Feed raw block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
@@ -760,6 +772,9 @@ impl eframe::App for KvApp {
             AcqMode::Device => self.tick_device(),
         }
 
+        // Advance snippet ages each frame (drives fade-out animation).
+        self.snippet_store.advance_frames();
+
         // Detect filter settings change (user toggled in UI) — re-filter history
         if self.filters != self.filter_settings_snapshot {
             let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
@@ -1039,6 +1054,7 @@ impl eframe::App for KvApp {
                         show_perf_overlay: self.show_perf_overlay,
                         render_ms_ema:     &mut self.render_ms_ema,
                         block_history_len: self.block_history.len(),
+                        snippet_store: &self.snippet_store,
                         pending_add:   &mut pending_add,
                     };
                     tree.ui(&mut behavior, ui);

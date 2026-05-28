@@ -30,10 +30,11 @@ use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::live_pipeline::{self, LivePipelineHandle, RecorderCmd, RecorderEvent};
+use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
 use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
 use crate::preview::{BlockStats, compute_block_stats};
 use crate::theme;
-use crate::waveform;
+
 
 // ── Acquisition mode ────────────────────────────────────────────────
 
@@ -69,10 +70,19 @@ pub struct KvApp {
     /// The settings that `filter_chains` was built with.  When the user
     /// changes filter parameters we detect the mismatch and rebuild.
     filter_settings_snapshot: FilterSettings,
-    /// Pre-computed display ring buffer (SpikeGLX WrapBuffer pattern).
-    /// Populated at ingestion time; rendering reads from this instead of
-    /// iterating block_history each frame.
+    /// Pre-computed display ring buffer — user-configured filter (main tile).
     disp_ring: DisplayRing,
+    /// Fixed LP 250 Hz ring for the LFP tile.
+    disp_ring_lfp: DisplayRing,
+    /// Fixed HP 300 Hz ring for the AP / spike tile.
+    disp_ring_ap: DisplayRing,
+    /// Persistent filter chains for the fixed LFP ring.
+    filter_chains_lfp: Vec<FilterChain>,
+    /// Persistent filter chains for the fixed AP ring.
+    filter_chains_ap: Vec<FilterChain>,
+    /// egui_tiles layout tree — held as Option so it can be temporarily taken
+    /// out during update() to allow field-level borrows alongside it.
+    tile_tree: Option<egui_tiles::Tree<TileKind>>,
     // UI state
     display: DisplaySettings,
     filters: FilterSettings,
@@ -99,13 +109,6 @@ pub struct KvApp {
     sweep_start_ms: f64,
     /// Show performance overlay (FPS, render time).
     pub show_perf_overlay: bool,
-    // Scroll accumulators — prevent smooth_scroll_delta from firing multiple
-    // discrete steps per physical mouse-wheel click.
-    // Each accumulator fills from smooth_scroll_delta; a step fires when
-    // |accum| reaches SCROLL_STEP_PX, then that amount is subtracted.
-    scroll_accum_y: f32,   // Y-axis amplitude zoom
-    scroll_accum_t: f32,   // X-axis time window zoom
-    scroll_accum_browse: f32, // paused time browse
     // Performance metrics
     last_frame: Instant,
     frame_ms_ema: f64,
@@ -133,6 +136,11 @@ impl KvApp {
             filter_chains: Vec::new(),
             filter_settings_snapshot: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
+            disp_ring_lfp: DisplayRing::new(16, 30_000.0),
+            disp_ring_ap: DisplayRing::new(16, 30_000.0),
+            filter_chains_lfp: Vec::new(),
+            filter_chains_ap: Vec::new(),
+            tile_tree: Some(multiview::make_initial_tree(16)),
             display: DisplaySettings::default(),
             filters,
             recording: RecordingSettings::default(),
@@ -145,9 +153,6 @@ impl KvApp {
             paused_elapsed: 0.0,
             sweep_start_ms: 0.0,
             show_perf_overlay: false,
-            scroll_accum_y: 0.0,
-            scroll_accum_t: 0.0,
-            scroll_accum_browse: 0.0,
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
@@ -165,7 +170,11 @@ impl KvApp {
         self.block_history.clear();
         self.filtered_history.clear();
         self.filter_chains.clear();
+        self.filter_chains_lfp.clear();
+        self.filter_chains_ap.clear();
         self.disp_ring.reset();
+        self.disp_ring_lfp.reset();
+        self.disp_ring_ap.reset();
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -180,7 +189,11 @@ impl KvApp {
         self.block_history.clear();
         self.filtered_history.clear();
         self.filter_chains.clear();
+        self.filter_chains_lfp.clear();
+        self.filter_chains_ap.clear();
         self.disp_ring.reset();
+        self.disp_ring_lfp.reset();
+        self.disp_ring_ap.reset();
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -213,6 +226,34 @@ impl KvApp {
         self.demo_started = false;
         // Dropping the handle stops both producer and recorder threads cleanly.
         self.live_pipeline = None;
+    }
+
+    /// Build LP 250 Hz filter chains (used by the fixed LFP ring).
+    fn build_lfp_chains(channel_count: usize, sample_rate: f64) -> Vec<FilterChain> {
+        (0..channel_count)
+            .map(|_| {
+                let mut chain = FilterChain::passthrough();
+                if sample_rate > 500.0 {
+                    chain.lp = Biquad::lowpass(250.0, sample_rate, Q_BUTTERWORTH);
+                    chain.lp_enabled = true;
+                }
+                chain
+            })
+            .collect()
+    }
+
+    /// Build HP 300 Hz filter chains (used by the fixed AP / spike ring).
+    fn build_ap_chains(channel_count: usize, sample_rate: f64) -> Vec<FilterChain> {
+        (0..channel_count)
+            .map(|_| {
+                let mut chain = FilterChain::passthrough();
+                if sample_rate > 600.0 {
+                    chain.hp = Biquad::highpass(300.0, sample_rate, Q_BUTTERWORTH);
+                    chain.hp_enabled = true;
+                }
+                chain
+            })
+            .collect()
     }
 
     /// Rebuild filter chains from the current FilterSettings.
@@ -338,11 +379,24 @@ impl KvApp {
             self.rebuild_filter_chains(sample_rate, ch_count);
         }
 
-        // Reconfigure display ring if channel count or sample rate changed
-        if self.disp_ring.channel_count != ch_count
-            || (self.disp_ring.sample_rate - sample_rate).abs() > 1.0
-        {
+        // Reconfigure all display rings if channel count or sample rate changed.
+        let ring_needs_reconfigure = self.disp_ring.channel_count != ch_count
+            || (self.disp_ring.sample_rate - sample_rate).abs() > 1.0;
+        if ring_needs_reconfigure {
             self.disp_ring.reconfigure(ch_count, sample_rate);
+            self.disp_ring_lfp.reconfigure(ch_count, sample_rate);
+            self.disp_ring_ap.reconfigure(ch_count, sample_rate);
+            // Rebuild fixed chains to match new channel count / sample rate.
+            self.filter_chains_lfp = Self::build_lfp_chains(ch_count, sample_rate);
+            self.filter_chains_ap  = Self::build_ap_chains(ch_count, sample_rate);
+        } else {
+            // Lazy-initialise fixed chains on first block.
+            if self.filter_chains_lfp.len() != ch_count {
+                self.filter_chains_lfp = Self::build_lfp_chains(ch_count, sample_rate);
+            }
+            if self.filter_chains_ap.len() != ch_count {
+                self.filter_chains_ap = Self::build_ap_chains(ch_count, sample_rate);
+            }
         }
 
         // Produce filtered version using persistent chains
@@ -353,8 +407,15 @@ impl KvApp {
             block.clone()
         };
 
-        // Feed display ring from the display-ready (filtered or raw) block
+        // Feed main display ring from the display-ready (filtered or raw) block.
         self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
+
+        // Feed fixed-filter rings (always incremental, never CAR).
+        let lfp_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
+        self.disp_ring_lfp.push_block(&lfp_block);
+
+        let ap_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
+        self.disp_ring_ap.push_block(&ap_block);
 
         // Feed raw block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
@@ -945,174 +1006,56 @@ impl eframe::App for KvApp {
                 }
             });
 
-        // ── Central waveform area ───────────────────────────────
+        // ── Multi-view tile canvas ──────────────────────────────
+        //
+        // The CentralPanel now hosts an egui_tiles Tree.  All waveform tiles
+        // share the same sweep_start_ms time axis.  The tile tree is temporarily
+        // taken out of self so that KvTileBehavior can hold field-level borrows
+        // of self simultaneously.
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(theme::BG_DARKEST)
-                    .inner_margin(egui::Margin::symmetric(4, 4)),
+                    .inner_margin(egui::Margin::symmetric(2, 2)),
             )
             .show(ctx, |ui| {
-                let plot_rect = ui.available_rect_before_wrap();
+                let mut tree = self.tile_tree.take().expect("tile_tree always present");
 
-                // ── Zone-aware scroll + drag ─────────────────────────
-                // The waveform widget is divided into three interaction zones:
-                //
-                //   ┌──────────┬──────────────────────────────────────┐
-                //   │  Y-axis  │                                      │
-                //   │  strip   │        Main waveform area            │
-                //   │ (~55 px) │                                      │
-                //   ├──────────┼──────────────────────────────────────┤
-                //   │          │     X-axis strip (~28 px)            │
-                //   └──────────┴──────────────────────────────────────┘
-                //
-                //  Y-axis strip  → scroll adjusts amplitude scale (Y zoom)
-                //  X-axis strip  → scroll adjusts time window (X zoom)
-                //  Main area     → when paused: scroll browses time history
-                //                  when running: no scroll action
-                //  Drag (paused) → horizontal drag browses history
-                //
-                // Accumulator pattern: smooth_scroll_delta spreads one physical
-                // wheel click across several frames.  We accumulate and only
-                // fire a step when |accum| crosses SCROLL_STEP_PX, then subtract
-                // that threshold (not reset) so fast scrolling still works.
+                let elapsed_secs = self.elapsed_seconds();
+                let mut pending_add: Option<AddViewRequest> = None;
 
-                const Y_STRIP_W: f32 = 55.0;  // Y-axis label column width
-                const X_STRIP_H: f32 = 28.0;  // X-axis label row height
-                const SCROLL_STEP_PX: f32 = 30.0; // pixels per discrete step
-
-                let sense = if self.display_paused {
-                    egui::Sense::click_and_drag()
-                } else {
-                    egui::Sense::hover()
-                };
-                let scroll_response =
-                    ui.interact(plot_rect, egui::Id::new("waveform_wheel"), sense);
-
-                let raw_scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                let cursor_pos = ctx.input(|i| i.pointer.hover_pos());
-
-                // Route raw scroll into the correct accumulator
-                if raw_scroll.abs() > 0.5 {
-                    if let Some(pos) = cursor_pos {
-                        if plot_rect.contains(pos) {
-                            let in_y_strip = pos.x < plot_rect.left() + Y_STRIP_W;
-                            let in_x_strip = pos.y > plot_rect.bottom() - X_STRIP_H;
-                            if in_y_strip && !in_x_strip {
-                                self.scroll_accum_y += raw_scroll;
-                            } else if in_x_strip {
-                                self.scroll_accum_t += raw_scroll;
-                            } else if self.display_paused {
-                                self.scroll_accum_browse += raw_scroll;
-                            }
-                        }
-                    }
-                }
-
-                // Drain Y-axis accumulator → amplitude scale steps
                 {
-                    let max_idx = panels::AMP_SCALES.len() - 1;
-                    while self.scroll_accum_y >= SCROLL_STEP_PX {
-                        self.scroll_accum_y -= SCROLL_STEP_PX;
-                        // scroll up → zoom in (smaller µV range)
-                        self.display.amp_scale_idx =
-                            self.display.amp_scale_idx.saturating_sub(1);
-                    }
-                    while self.scroll_accum_y <= -SCROLL_STEP_PX {
-                        self.scroll_accum_y += SCROLL_STEP_PX;
-                        // scroll down → zoom out (larger µV range)
-                        self.display.amp_scale_idx =
-                            (self.display.amp_scale_idx + 1).min(max_idx);
-                    }
+                    let mut behavior = KvTileBehavior {
+                        disp_ring:     &self.disp_ring,
+                        disp_ring_lfp: &self.disp_ring_lfp,
+                        disp_ring_ap:  &self.disp_ring_ap,
+                        latest_block:  self.latest_block.as_ref(),
+                        display:       &mut self.display,
+                        filters:       &self.filters,
+                        display_paused: self.display_paused,
+                        paused_elapsed: &mut self.paused_elapsed,
+                        sweep_start_ms: self.sweep_start_ms,
+                        elapsed_secs,
+                        show_perf_overlay: self.show_perf_overlay,
+                        render_ms_ema:     &mut self.render_ms_ema,
+                        block_history_len: self.block_history.len(),
+                        pending_add:   &mut pending_add,
+                    };
+                    tree.ui(&mut behavior, ui);
                 }
 
-                // Drain X-axis accumulator → time window steps
-                {
-                    let max_idx = panels::TIME_WINDOWS.len() - 1;
-                    while self.scroll_accum_t >= SCROLL_STEP_PX {
-                        self.scroll_accum_t -= SCROLL_STEP_PX;
-                        // scroll up → shorter time window
-                        self.display.time_scale_idx =
-                            self.display.time_scale_idx.saturating_sub(1);
-                    }
-                    while self.scroll_accum_t <= -SCROLL_STEP_PX {
-                        self.scroll_accum_t += SCROLL_STEP_PX;
-                        // scroll down → longer time window
-                        self.display.time_scale_idx =
-                            (self.display.time_scale_idx + 1).min(max_idx);
-                    }
+                // Process any add-view request that came out of the tile UI.
+                if let Some(req) = pending_add {
+                    let visible = self.display.visible_channels;
+                    let kind = match req {
+                        AddViewRequest::Lfp => TileKind::new_lfp(visible),
+                        AddViewRequest::Ap  => TileKind::new_ap(visible),
+                        AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
+                    };
+                    multiview::add_view_to_tree(&mut tree, kind);
                 }
 
-                // Drain browse accumulator → paused time position
-                if self.display_paused {
-                    let window_ms = self.display.time_window_ms();
-                    // One step = browse_step_pct% of the current time window
-                    let step_s = window_ms * (self.display.browse_step_pct / 100.0) / 1000.0;
-                    let live = self.elapsed_seconds();
-                    while self.scroll_accum_browse >= SCROLL_STEP_PX {
-                        self.scroll_accum_browse -= SCROLL_STEP_PX;
-                        // scroll up → forward in time
-                        self.paused_elapsed = (self.paused_elapsed + step_s).min(live);
-                    }
-                    while self.scroll_accum_browse <= -SCROLL_STEP_PX {
-                        self.scroll_accum_browse += SCROLL_STEP_PX;
-                        // scroll down → back in time
-                        self.paused_elapsed = (self.paused_elapsed - step_s).max(0.0);
-                    }
-                } else {
-                    self.scroll_accum_browse = 0.0;
-                }
-
-                // Drag-to-browse when paused: horizontal drag shifts the view time
-                if self.display_paused && scroll_response.dragged() {
-                    let drag_px = scroll_response.drag_delta().x;
-                    let plot_width = plot_rect.width().max(1.0);
-                    let time_window_ms = self.display.time_window_ms();
-                    // dragging right → go back in time (reduce paused_elapsed)
-                    let dt_ms = (drag_px as f64 / plot_width as f64) * time_window_ms;
-                    self.paused_elapsed = (self.paused_elapsed - dt_ms / 1000.0).max(0.0);
-                    // Clamp to live time (can't look into the future)
-                    let live = self.elapsed_seconds();
-                    if self.paused_elapsed > live {
-                        self.paused_elapsed = live;
-                    }
-                }
-
-                let render_start = Instant::now();
-                // In live mode: use sweep_start_ms so x_left/x_right stay
-                // fixed within a window (no scrolling).
-                // In paused mode: use elapsed (wall clock / drag position).
-                let sweep_left_ms = if self.display_paused {
-                    let window_ms = self.display.time_window_ms();
-                    (elapsed * 1000.0 - window_ms).max(0.0)
-                } else {
-                    self.sweep_start_ms
-                };
-                waveform::draw_waveform_area(
-                    ui,
-                    &self.disp_ring,
-                    self.latest_block.as_ref(),
-                    &self.display,
-                    &self.filters,
-                    sweep_left_ms,
-                );
-                let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
-                self.render_ms_ema = self.render_ms_ema * 0.9 + render_ms * 0.1;
-
-                // Pause indicator overlay
-                if self.display_paused {
-                    draw_paused_overlay(ui, plot_rect);
-                }
-                // Performance overlay
-                if self.show_perf_overlay {
-                    draw_perf_overlay(
-                        ui,
-                        plot_rect,
-                        self.frame_ms_ema,
-                        self.render_ms_ema,
-                        self.block_history.len(),
-                    );
-                }
+                self.tile_tree = Some(tree);
             });
 
         // Request continuous repaints while running (or paused — for overlay)
@@ -1122,53 +1065,4 @@ impl eframe::App for KvApp {
     }
 }
 
-// ── Overlays ────────────────────────────────────────────────────────
-
-fn draw_paused_overlay(ui: &egui::Ui, rect: egui::Rect) {
-    let badge_pos = rect.center_top() + egui::vec2(0.0, 18.0);
-    let painter = ui.painter();
-    let text = "  PAUSED  (press P to resume)  ";
-    painter.text(
-        badge_pos,
-        egui::Align2::CENTER_CENTER,
-        text,
-        egui::FontId::proportional(13.0),
-        theme::ACCENT_YELLOW,
-    );
-}
-
-fn draw_perf_overlay(
-    ui: &egui::Ui,
-    rect: egui::Rect,
-    frame_ms: f64,
-    render_ms: f64,
-    history_blocks: usize,
-) {
-    let painter = ui.painter();
-    let pos = rect.right_top() + egui::vec2(-8.0, 8.0);
-    let fps = if frame_ms > 0.01 { 1000.0 / frame_ms } else { 0.0 };
-    let lines = [
-        format!("FPS    {:>6.1}", fps),
-        format!("Frame  {:>5.1} ms", frame_ms),
-        format!("Render {:>5.1} ms", render_ms),
-        format!("Hist   {:>5} blk", history_blocks),
-    ];
-
-    // Background panel
-    let bg = egui::Rect::from_min_size(pos + egui::vec2(-110.0, -2.0), egui::vec2(108.0, 60.0));
-    painter.rect_filled(
-        bg,
-        egui::CornerRadius::same(3),
-        egui::Color32::from_rgba_premultiplied(20, 20, 26, 200),
-    );
-
-    for (i, line) in lines.iter().enumerate() {
-        painter.text(
-            pos + egui::vec2(-6.0, 4.0 + i as f32 * 13.0),
-            egui::Align2::RIGHT_TOP,
-            line,
-            egui::FontId::monospace(11.0),
-            theme::TEXT_PRIMARY,
-        );
-    }
-}
+// Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

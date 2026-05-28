@@ -232,7 +232,8 @@ current sweep position).
 | Date | Phase | What was done | Commit |
 |------|-------|---------------|--------|
 | 2026-05-28 | Planning | Created this document; design finalised | (pending) |
-| 2026-05-28 | Phase 1 | Verified `egui_tiles 0.12.0` + `eframe 0.31` compatibility; added dependency | (pending) |
+| 2026-05-28 | Phase 1 | Verified `egui_tiles 0.12.0` + `eframe 0.31` compatibility; added dependency | cba005b |
+| 2026-05-28 | Phase 1 | Implemented: 3× DisplayRing, LFP/AP FilterChains, `multiview.rs` (TileKind + KvTileBehavior), egui_tiles CentralPanel replacement, "+ Add View" menu, per-tile channel scroll; all 84 tests pass | (pending) |
 
 ---
 

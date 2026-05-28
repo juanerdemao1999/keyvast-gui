@@ -33,7 +33,11 @@ pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
 
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
+    /// Physical channel index (for colour, label, hover matching).
     channel: usize,
+    /// Slot position in the display stack (0 = top lane, 1 = next, …).
+    /// Used for Y-axis offset; independent of the physical channel number.
+    display_pos: usize,
     points: Vec<[f64; 2]>,
     /// RMS sigma in normalized-input units (only set when threshold is enabled).
     sigma: Option<f64>,
@@ -43,7 +47,11 @@ struct ChannelTrace {
 
 /// Spike metadata retained after `points` is moved into a `Line`.
 struct SpikeMeta {
+    /// Physical channel index (used for badge label; dead_code until spike overlay is wired up).
+    #[allow(dead_code)]
     channel: usize,
+    /// Display-stack position (same as ChannelTrace::display_pos).
+    display_pos: usize,
     #[allow(dead_code)]
     sigma: f64,
     spike_count: u32,
@@ -68,6 +76,7 @@ pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     ring: &DisplayRing,
     latest: Option<&SampleBlock>,
+    start_ch: usize, // first physical channel to display (0 = no scroll offset)
     settings: &DisplaySettings,
     filters: &FilterSettings,
     sweep_left_ms: f64,
@@ -86,7 +95,9 @@ pub fn draw_waveform_area(
     }
 
     let total_channels = block.channel_count;
-    let visible = settings.visible_channels.min(total_channels);
+    // Clamp start_ch so we never go past the last channel.
+    let start_ch = start_ch.min(total_channels.saturating_sub(1));
+    let visible = settings.visible_channels.min(total_channels.saturating_sub(start_ch));
     if visible == 0 {
         draw_empty_state(ui);
         return;
@@ -114,7 +125,7 @@ pub fn draw_waveform_area(
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
     let traces = collect_from_ring(
-        ring, settings, filters, visible,
+        ring, settings, filters, start_ch, visible,
         block.sample_rate, x_left, x_right, gain, ch_spacing,
     );
 
@@ -122,14 +133,17 @@ pub fn draw_waveform_area(
     let y_min = -(visible as f64) * ch_spacing + ch_spacing * 0.5;
     let y_max = ch_spacing * 0.5;
 
-    // Channel label formatter for Y-axis
+    // Channel label formatter for Y-axis.
+    // Y = -(display_pos * ch_spacing), so display_pos = round(-Y / ch_spacing).
+    // Physical channel = start_ch + display_pos.
     let ch_count_for_fmt = visible;
     let spacing_for_fmt = ch_spacing;
+    let start_ch_for_fmt = start_ch;
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
         let val = mark.value;
-        let ch_idx = (-val / spacing_for_fmt).round() as i64;
-        if ch_idx >= 0 && (ch_idx as usize) < ch_count_for_fmt {
-            format!("CH{}", ch_idx)
+        let disp_pos = (-val / spacing_for_fmt).round() as i64;
+        if disp_pos >= 0 && (disp_pos as usize) < ch_count_for_fmt {
+            format!("CH{}", start_ch_for_fmt + disp_pos as usize)
         } else {
             String::new()
         }
@@ -169,15 +183,17 @@ pub fn draw_waveform_area(
         .y_axis_formatter(y_formatter)
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
-    // Extract spike metadata BEFORE consuming traces (points will be moved into Lines)
+    // Extract spike metadata BEFORE consuming traces (points will be moved into Lines).
+    // Y position is keyed on display_pos (not physical channel).
     let spike_metas: Vec<SpikeMeta> = if filters.spike_threshold_enabled {
         traces
             .iter()
             .filter_map(|t| {
                 t.sigma.map(|sigma| {
-                    let y_off = -(t.channel as f64) * ch_spacing;
+                    let y_off = -(t.display_pos as f64) * ch_spacing;
                     SpikeMeta {
                         channel: t.channel,
+                        display_pos: t.display_pos,
                         sigma,
                         spike_count: t.spike_count,
                         thresh_y: -filters.spike_threshold_sigma * sigma * gain + y_off,
@@ -200,11 +216,12 @@ pub fn draw_waveform_area(
             [x_right, y_max],
         ));
 
-        // Determine which channel the cursor is hovering over (Y → channel)
+        // Determine which channel the cursor is hovering over.
+        // Returns the PHYSICAL channel index for consistent comparison with trace.channel.
         let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
-            let ch_idx = (-pos.y / ch_spacing).round() as i64;
-            if ch_idx >= 0 && (ch_idx as usize) < visible {
-                Some(ch_idx as usize)
+            let disp_pos = (-pos.y / ch_spacing).round() as i64;
+            if disp_pos >= 0 && (disp_pos as usize) < visible {
+                Some(start_ch + disp_pos as usize)
             } else {
                 None
             }
@@ -225,13 +242,14 @@ pub fn draw_waveform_area(
         }
 
         // Draw zero-reference lines as egui_plot Lines (needed for correct
-        // plot-coordinate rendering behind traces)
+        // plot-coordinate rendering behind traces).
+        // Use display_pos for Y-offset; check physical channel for enable/disable.
         if settings.show_grid {
-            for ch in 0..visible {
-                if !settings.is_channel_enabled(ch) {
+            for disp_pos in 0..visible {
+                if !settings.is_channel_enabled(start_ch + disp_pos) {
                     continue;
                 }
-                let y_off = -(ch as f64) * ch_spacing;
+                let y_off = -(disp_pos as f64) * ch_spacing;
                 plot_ui.line(
                     Line::new(PlotPoints::from(vec![
                         [x_left, y_off],
@@ -285,14 +303,15 @@ pub fn draw_waveform_area(
         hovered_ch
     });
 
-    // Spike-count badges on the right edge of each lane (overlay painted in screen space)
+    // Spike-count badges on the right edge of each lane (overlay painted in screen space).
+    // Y position uses display_pos, not physical channel.
     if filters.spike_threshold_enabled {
         let painter = ui.painter();
         for meta in &spike_metas {
             if meta.spike_count == 0 {
                 continue;
             }
-            let y_lane = -(meta.channel as f64) * ch_spacing;
+            let y_lane = -(meta.display_pos as f64) * ch_spacing;
             let plot_pos = egui_plot::PlotPoint::new(x_right, y_lane);
             let screen_pos = response.transform.position_from_point(&plot_pos);
             let badge_pos = screen_pos + egui::vec2(-6.0, -1.0);
@@ -320,7 +339,9 @@ pub fn draw_waveform_area(
         // where y_offset = -(ch * ch_spacing).
         // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
         // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
-        let y_baseline = -(hovered_ch as f64) * ch_spacing;
+        // hovered_ch is the physical channel; display_pos = physical_ch - start_ch.
+        let disp_pos = hovered_ch.saturating_sub(start_ch);
+        let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
         let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
         let amp_str = if amp_uv.abs() >= 1000.0 {
@@ -475,6 +496,7 @@ fn collect_from_ring(
     ring: &DisplayRing,
     settings: &DisplaySettings,
     filters: &FilterSettings,
+    start_ch: usize,
     visible: usize,
     sample_rate: f64,
     t_left_ms: f64,
@@ -492,14 +514,18 @@ fn collect_from_ring(
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
 
-    for ch in 0..visible {
-        if !settings.is_channel_enabled(ch) {
+    for disp_pos in 0..visible {
+        let phys_ch = start_ch + disp_pos;
+
+        // Per-channel enable/disable is indexed by physical channel.
+        if !settings.is_channel_enabled(phys_ch) {
             continue;
         }
 
-        // Read display-ready points from the ring (O(output_points))
-        let mut pts =
-            ring.collect_channel(ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries);
+        // Read display-ready points from the ring using the PHYSICAL channel index.
+        let mut pts = ring.collect_channel(
+            phys_ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries,
+        );
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
         let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
@@ -529,9 +555,11 @@ fn collect_from_ring(
             (None, 0)
         };
 
-        finalize_channel(&mut pts, ch, gain, ch_spacing);
+        // finalize_channel applies Y-offset using DISPLAY position (not physical channel).
+        finalize_channel(&mut pts, disp_pos, gain, ch_spacing);
         traces.push(ChannelTrace {
-            channel: ch,
+            channel: phys_ch,
+            display_pos: disp_pos,
             points: pts,
             sigma,
             spike_count,

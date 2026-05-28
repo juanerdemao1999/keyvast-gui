@@ -20,11 +20,23 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-27 (session 14 — endurance test PASSED)
+Last updated: 2026-05-28 (session 15 — multi-view plan documented, Phase 1 starting)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 15: Multi-view tile display — planning complete, implementation starting
+
+**Goal**: Replace single `CentralPanel` waveform with a draggable `egui_tiles` layout
+supporting LFP (LP 250 Hz), AP/Spike (HP 300 Hz), and Spike Overlay (threshold snippet)
+tiles alongside the existing main waveform.
+
+**Design doc**: `docs/17-multiview-plan.md`
+
+**Status**: Phase 1 starting — egui_tiles skeleton + LFP/AP rings.
+
+---
 
 ### Session 14: 2-hour endurance test — MVP acceptance #11 PASSED
 
@@ -443,25 +455,35 @@ Current test count:
 
 ## How To Resume
 
-The full benchmark pipeline and professional GUI are feature-complete. The GUI was refactored in session 5 (layout) and session 6 (smooth scrolling, freeze, perf overlay, hover, decimation fix) to match Tier-1 features of Intan RHX / Open Ephys. Tier-3 signal processing (filters, CAR, spike detection) is the next planned GUI work. The next useful tasks, in priority order:
+The full benchmark pipeline is complete (all 12 MVP acceptance criteria met including 2h
+endurance).  The GUI dev branch includes recording health monitoring (clock, buffer
+water-mark, error banner) and a live pipeline connecting GUI display to the same data
+source as the recorder.
 
-1. **Visual smoke test**: Run `gui.bat` and verify all the new interactions: smooth scroll (no flicker), `P` to freeze, `F` for perf overlay, scroll-wheel changes time window, hover highlights a channel and shows tooltip.
+**Active work: multi-view tile display** — see `docs/17-multiview-plan.md` for the full
+design.  Implementation is in Phase 1.
 
-2. **Tier-4 GUI / analysis features** (planned, not started):
-   - Filter parameter persistence between sessions (config file)
-   - Real-time FFT / spectrogram inset on hovered channel
-   - Channel grouping (probe layout view) for high channel counts
-   - Multi-window split: zoomed window + overview window
-   - Spike sorting (online): per-channel waveform clustering, ISI histogram
-   - Event marker stream + TTL overlay
+### Phase 1 checklist (current)
 
-3. **Wire GUI to live pipeline**: Device mode uses `PreviewState` which wraps `start_preview()`. Already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition.
+- [ ] Verify `egui_tiles 0.10` + `eframe 0.31` compile compatibility
+- [ ] Add `egui_tiles` to `kv-gui/Cargo.toml`
+- [ ] Add `disp_ring_lfp`, `disp_ring_ap`, `filter_chains_lfp`, `filter_chains_ap` to `KvApp`
+- [ ] Update `ingest_block()` to push to all three rings
+- [ ] New `multiview.rs`: `TileKind` enum + `KvTileBehavior : egui_tiles::Behavior`
+- [ ] Replace `CentralPanel` render block with `tile_tree.ui(...)`
+- [ ] Startup tree: single `MainWaveform` node
+- [ ] "+ Add View" dropdown: insert LFP / AP / Spike Overlay tiles
+- [ ] Per-tile channel scroll (mouse wheel adjusts `start_ch`)
+- [ ] `cargo test --workspace` all pass
 
-4. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json`.
+### Remaining backlog (after multi-view)
 
-5. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits.
-
-6. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients.
+1. **Experiment metadata** — animal ID, session, probe type, brain region → `recording.json`
+2. **per-channel RMS** in CHANNELS panel (code exists, never shown)
+3. **TTL digital track overlay**
+4. **Config persistence** — filter/display settings survive restart
+5. **kv-daemon** — background acquisition service
+6. **kv inspect / kv replay** CLI commands
 
 Recommended implementation boundary:
 

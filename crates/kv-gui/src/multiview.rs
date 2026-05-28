@@ -124,8 +124,8 @@ pub struct KvTileBehavior<'a> {
     pub show_perf_overlay: bool,
     pub render_ms_ema:     &'a mut f64,
     pub block_history_len: usize,
-    // Spike snippet store (read-only from the behavior)
-    pub snippet_store: &'a SpikeSnippetStore,
+    // Spike snippet store — mutable so the tile UI can update detection params.
+    pub snippet_store: &'a mut SpikeSnippetStore,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
 }
@@ -185,6 +185,11 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
 
     fn on_tab_close(&mut self, _tiles: &mut egui_tiles::Tiles<TileKind>, _tile_id: egui_tiles::TileId) -> bool {
         true
+    }
+
+    /// Minimum pane size — prevents tiles from being resized to an unusable sliver.
+    fn min_size(&self) -> f32 {
+        80.0
     }
 
     /// "+ Add View" button in the tab bar right area.
@@ -428,48 +433,66 @@ impl<'a> KvTileBehavior<'a> {
         ui: &mut egui::Ui,
         tile_id: egui_tiles::TileId,
         channels: &mut Vec<usize>,
-        pre_ms: &mut f32,
-        post_ms: &mut f32,
-        max_snippets: &mut usize,
+        _pre_ms: &mut f32,
+        _post_ms: &mut f32,
+        _max_snippets: &mut usize,
     ) {
         let total_ch = self.snippet_store.channel_count();
         let tile_salt = tile_id.0 as usize;
 
-        // ── Config strip (top ~80 px) ────────────────────────────────
+        // ── Config strip ─────────────────────────────────────────────
+        // Read current store values into locals so we can borrow snippet_store
+        // mutably for controls then immutably for rendering.
+        let mut sigma        = self.snippet_store.sigma;
+        let mut pre_ms_val   = self.snippet_store.pre_ms();
+        let mut post_ms_val  = self.snippet_store.post_ms();
+        let mut max_snips    = self.snippet_store.max_snippets;
+
+        let mut params_changed = false;
+
         ui.horizontal(|ui| {
-            // Threshold sigma
-            ui.label(egui::RichText::new("σ").size(11.0).color(theme::TEXT_DIM));
-            // We can't mutate snippet_store directly here (it's &'a), so we
-            // show sigma as read-only for now; mutable controls are Phase 3.
-            ui.label(
-                egui::RichText::new(format!("{:.1}", self.snippet_store.sigma))
-                    .size(11.0)
-                    .monospace()
-                    .color(theme::TEXT_SECONDARY),
-            )
-            .on_hover_text("Detection threshold (σ × per-channel RMS). Edit in Settings.");
+            ui.label(egui::RichText::new("σ").size(11.0).color(theme::TEXT_DIM))
+                .on_hover_text("Detection threshold multiplier (−σ × per-channel RMS)");
+            if ui.add(
+                egui::DragValue::new(&mut sigma)
+                    .speed(0.1)
+                    .range(0.5_f32..=20.0)
+                    .suffix("σ"),
+            ).changed() { params_changed = true; }
 
             ui.separator();
 
-            // Pre/post window labels (read from store, tile shows them)
             ui.label(egui::RichText::new("pre").size(10.0).color(theme::TEXT_DIM));
-            ui.label(
-                egui::RichText::new(format!("{:.1} ms", self.snippet_store.pre_ms()))
-                    .size(10.0).monospace().color(theme::TEXT_SECONDARY),
-            );
-            ui.separator();
-            ui.label(egui::RichText::new("post").size(10.0).color(theme::TEXT_DIM));
-            ui.label(
-                egui::RichText::new(format!("{:.1} ms", self.snippet_store.post_ms()))
-                    .size(10.0).monospace().color(theme::TEXT_SECONDARY),
-            );
+            if ui.add(
+                egui::DragValue::new(&mut pre_ms_val)
+                    .speed(0.05)
+                    .range(0.1_f32..=5.0)
+                    .suffix(" ms"),
+            ).changed() { params_changed = true; }
 
-            // Suppress unused warnings — pre_ms / post_ms / max_snippets are
-            // stored in pane for future per-tile override; store drives actual detection.
-            let _ = *pre_ms;
-            let _ = *post_ms;
-            let _ = *max_snippets;
+            ui.label(egui::RichText::new("post").size(10.0).color(theme::TEXT_DIM));
+            if ui.add(
+                egui::DragValue::new(&mut post_ms_val)
+                    .speed(0.05)
+                    .range(0.1_f32..=10.0)
+                    .suffix(" ms"),
+            ).changed() { params_changed = true; }
+
+            ui.separator();
+            ui.label(egui::RichText::new("max").size(10.0).color(theme::TEXT_DIM));
+            if ui.add(
+                egui::DragValue::new(&mut max_snips)
+                    .speed(1)
+                    .range(5_usize..=200),
+            ).changed() { params_changed = true; }
         });
+
+        // Apply any parameter changes back to the store.
+        if params_changed {
+            self.snippet_store.sigma = sigma;
+            self.snippet_store.set_window_ms(pre_ms_val, post_ms_val);
+            self.snippet_store.max_snippets = max_snips;
+        }
 
         ui.separator();
 
@@ -506,7 +529,8 @@ impl<'a> KvTileBehavior<'a> {
         ui.separator();
 
         // ── Snippet plot ─────────────────────────────────────────────
-        spike_overlay::draw_spike_overlay(ui, self.snippet_store, channels, tile_salt);
+        // Reborrow &mut as & for the read-only renderer.
+        spike_overlay::draw_spike_overlay(ui, &*self.snippet_store, channels, tile_salt);
     }
 }
 

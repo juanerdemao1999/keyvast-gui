@@ -1054,7 +1054,7 @@ impl eframe::App for KvApp {
                         show_perf_overlay: self.show_perf_overlay,
                         render_ms_ema:     &mut self.render_ms_ema,
                         block_history_len: self.block_history.len(),
-                        snippet_store: &self.snippet_store,
+                        snippet_store: &mut self.snippet_store,
                         pending_add:   &mut pending_add,
                     };
                     tree.ui(&mut behavior, ui);

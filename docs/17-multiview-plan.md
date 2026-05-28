@@ -234,7 +234,8 @@ current sweep position).
 | 2026-05-28 | Planning | Created this document; design finalised | (pending) |
 | 2026-05-28 | Phase 1 | Verified `egui_tiles 0.12.0` + `eframe 0.31` compatibility; added dependency | cba005b |
 | 2026-05-28 | Phase 1 | Implemented: 3× DisplayRing, LFP/AP FilterChains, `multiview.rs` (TileKind + KvTileBehavior), egui_tiles CentralPanel replacement, "+ Add View" menu, per-tile channel scroll; all 84 tests pass | a29a654 |
-| 2026-05-28 | Phase 2 | Implemented: `spike_overlay.rs` (SpikeSnippetStore, per-channel ChannelBuf, threshold detection, snippet accumulation, fade-out renderer); SpikeOverlay pane_ui (channel selector + param display + egui_plot rendering); all tests pass | (pending) |
+| 2026-05-28 | Phase 2 | Implemented: `spike_overlay.rs` (SpikeSnippetStore, per-channel ChannelBuf, threshold detection, snippet accumulation, fade-out renderer); SpikeOverlay pane_ui (channel selector + param display + egui_plot rendering); all tests pass | bc0c260 |
+| 2026-05-28 | Phase 3 | Interactive σ/pre/post/max controls; min_size(80px) guard; preview.rs dead code removed (PreviewState/start_preview/PreviewHandle → deleted, BlockStats/ChannelStats kept); all tests pass | (pending) |
 
 ---
 

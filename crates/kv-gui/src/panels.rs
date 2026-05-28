@@ -175,6 +175,14 @@ pub fn draw_left_panel(
     filters: &mut FilterSettings,
     recording: &mut RecordingSettings,
     block: Option<&SampleBlock>,
+    // Elapsed recording wall-clock seconds (None when not recording).
+    rec_elapsed_secs: Option<f64>,
+    // Recorder buffer fill level 0.0..=1.0 (from live pipeline).
+    buffer_occupancy: f64,
+    // Last recorder error message, if any.
+    recording_error: Option<&str>,
+    // Set to true by the panel when the user clicks "dismiss error".
+    dismiss_error: &mut bool,
 ) {
     ui.set_min_width(220.0);
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -188,7 +196,16 @@ pub fn draw_left_panel(
         ui.add_space(4.0);
         draw_channel_list(ui, display, block);
         ui.add_space(4.0);
-        draw_recording_section(ui, recording, acquiring, toggle_rec);
+        draw_recording_section(
+            ui,
+            recording,
+            acquiring,
+            toggle_rec,
+            rec_elapsed_secs,
+            buffer_occupancy,
+            recording_error,
+            dismiss_error,
+        );
     });
 }
 
@@ -577,11 +594,16 @@ fn draw_channel_list(
 
 // ── Recording section ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn draw_recording_section(
     ui: &mut egui::Ui,
     recording: &mut RecordingSettings,
     acquiring: bool,
     toggle_rec: &mut bool,
+    rec_elapsed_secs: Option<f64>,
+    buffer_occupancy: f64,
+    recording_error: Option<&str>,
+    dismiss_error: &mut bool,
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("RECORDING").size(11.0).strong().color(theme::TEXT_SECONDARY),
@@ -660,6 +682,89 @@ fn draw_recording_section(
         if recording.state == RecordingState::Recording {
             theme::kv_label(ui, "Blocks", &recording.recorded_blocks.to_string());
             theme::kv_label(ui, "Size", &format_bytes(recording.recorded_bytes));
+
+            // ── Real-time recording clock ────────────────────────
+            if let Some(secs) = rec_elapsed_secs {
+                let h = secs as u64 / 3600;
+                let m = (secs as u64 % 3600) / 60;
+                let s = secs as u64 % 60;
+                theme::kv_label(
+                    ui,
+                    "Duration",
+                    &format!("{h:02}:{m:02}:{s:02}"),
+                );
+            }
+
+            // ── Buffer occupancy water-mark ──────────────────────
+            // Shows how full the recorder's input queue is.
+            // Green = healthy; yellow = disk may be slow; red = near overflow.
+            ui.add_space(4.0);
+            let occ_pct = (buffer_occupancy * 100.0) as u32;
+            let bar_color = if buffer_occupancy > 0.75 {
+                theme::ACCENT_RED
+            } else if buffer_occupancy > 0.40 {
+                theme::ACCENT_YELLOW
+            } else {
+                theme::ACCENT_GREEN
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Buffer")
+                        .size(10.0)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{occ_pct:3}%"))
+                        .size(10.0)
+                        .monospace()
+                        .color(bar_color),
+                );
+            });
+            ui.add(
+                egui::ProgressBar::new(buffer_occupancy as f32)
+                    .fill(bar_color)
+                    .desired_width(ui.available_width()),
+            );
+            if buffer_occupancy > 0.75 {
+                ui.label(
+                    egui::RichText::new("⚠ Disk may be too slow")
+                        .size(9.0)
+                        .color(theme::ACCENT_RED),
+                );
+            }
+        }
+
+        // ── Recorder error banner (dismissable) ──────────────────
+        if let Some(err) = recording_error {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(70, 15, 15))
+                .inner_margin(egui::Margin::same(6))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⚠")
+                                .size(11.0)
+                                .color(theme::ACCENT_RED),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .size(9.5)
+                                .color(egui::Color32::from_rgb(255, 170, 170)),
+                        );
+                    });
+                    if ui
+                        .small_button(
+                            egui::RichText::new("Dismiss").size(9.0),
+                        )
+                        .clicked()
+                    {
+                        *dismiss_error = true;
+                    }
+                });
         }
     });
 }

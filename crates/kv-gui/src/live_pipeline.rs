@@ -45,6 +45,9 @@ pub enum RecorderEvent {
     Stopped { blocks: u64, bytes: u64 },
     /// Error opening or writing the recording.
     Error(String),
+    /// Periodic buffer health report (sent ~5/s while running).
+    /// `occupancy` is 0.0..=1.0 (buffered / capacity).
+    BufferStatus { occupancy: f64 },
 }
 
 // ── Public handle ────────────────────────────────────────────────────
@@ -178,6 +181,9 @@ fn recorder_loop(
     event_tx: mpsc::Sender<RecorderEvent>,
 ) {
     let mut recorder: Option<StreamingRecorder> = None;
+    // Rate-limit BufferStatus events to ~5 per second.
+    let mut last_status_report = Instant::now();
+    const STATUS_INTERVAL: Duration = Duration::from_millis(200);
 
     loop {
         // Handle any pending commands.
@@ -216,10 +222,28 @@ fn recorder_loop(
 
             if let Some(ref mut rec) = recorder {
                 if let Err(e) = rec.write_block(&block) {
-                    eprintln!("[recorder] write_block error: {e}");
+                    let _ = event_tx.send(RecorderEvent::Error(format!("write failed: {e}")));
                 }
             }
             // If not recording, block is silently discarded.
+        }
+
+        // Send buffer occupancy to GUI at ~5 Hz.
+        if last_status_report.elapsed() >= STATUS_INTERVAL {
+            let occupancy = {
+                let buf = shared.lock().expect("buffer lock poisoned");
+                buf.consumer_status(recorder_id)
+                    .map(|s| {
+                        if s.capacity_blocks > 0 {
+                            s.buffered_blocks as f64 / s.capacity_blocks as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .unwrap_or(0.0)
+            };
+            let _ = event_tx.send(RecorderEvent::BufferStatus { occupancy });
+            last_status_report = Instant::now();
         }
 
         thread::sleep(Duration::from_millis(1));

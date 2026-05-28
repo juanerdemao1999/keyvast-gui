@@ -79,6 +79,12 @@ pub struct KvApp {
     recording: RecordingSettings,
     /// Active streaming recorder — Some while RecordingState::Recording.
     active_recorder: Option<StreamingRecorder>,
+    /// Wall-clock instant when the current recording session started.
+    recording_start_time: Option<Instant>,
+    /// Recorder buffer fill level (0.0 = empty, 1.0 = full), updated ~5/s.
+    recorder_buffer_occupancy: f64,
+    /// Latest error from the recorder thread (None = no error / dismissed).
+    recording_error: Option<String>,
     theme_applied: bool,
     /// When true, the waveform display is frozen at the current view but
     /// acquisition and recording continue uninterrupted.
@@ -131,6 +137,9 @@ impl KvApp {
             filters,
             recording: RecordingSettings::default(),
             active_recorder: None,
+            recording_start_time: None,
+            recorder_buffer_occupancy: 0.0,
+            recording_error: None,
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
@@ -425,6 +434,8 @@ impl KvApp {
                         self.recording.state = RecordingState::Recording;
                         self.recording.recorded_blocks = 0;
                         self.recording.recorded_bytes = 0;
+                        self.recording_start_time = Some(Instant::now());
+                        self.recording_error = None;
                     }
                 }
                 AcqMode::Demo => {
@@ -435,8 +446,12 @@ impl KvApp {
                             self.recording.state = RecordingState::Recording;
                             self.recording.recorded_blocks = 0;
                             self.recording.recorded_bytes = 0;
+                            self.recording_start_time = Some(Instant::now());
+                            self.recording_error = None;
                         }
-                        Err(e) => eprintln!("[recorder] Failed to open output: {e}"),
+                        Err(e) => {
+                            self.recording_error = Some(format!("Failed to open output: {e}"));
+                        }
                     }
                 }
             },
@@ -446,6 +461,8 @@ impl KvApp {
                     // State will be updated to Idle via RecorderEvent::Stopped.
                     if let Some(ref pipeline) = self.live_pipeline {
                         let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
+                        self.recording_start_time = None;
+                        self.recorder_buffer_occupancy = 0.0;
                     }
                 }
                 AcqMode::Demo => {
@@ -460,10 +477,15 @@ impl KvApp {
                                     summary.recording.raw_path.display()
                                 );
                             }
-                            Err(e) => eprintln!("[recorder] Finish error: {e}"),
+                            Err(e) => {
+                                self.recording_error =
+                                    Some(format!("Finish error: {e}"));
+                            }
                         }
                     }
                     self.recording.state = RecordingState::Idle;
+                    self.recording_start_time = None;
+                    self.recorder_buffer_occupancy = 0.0;
                 }
             },
         }
@@ -552,17 +574,19 @@ impl KvApp {
         // ── Process recorder events ──────────────────────────────────────────
         for event in recorder_events {
             match event {
-                RecorderEvent::Started => {
-                    eprintln!("[recorder] Recording started.");
-                }
+                RecorderEvent::Started => {}
                 RecorderEvent::Stopped { blocks, bytes } => {
-                    eprintln!("[recorder] Saved {blocks} blocks ({bytes} bytes).");
                     self.recording.recorded_blocks = blocks;
                     self.recording.recorded_bytes = bytes;
                     self.recording.state = RecordingState::Idle;
+                    self.recording_start_time = None;
+                    self.recorder_buffer_occupancy = 0.0;
                 }
                 RecorderEvent::Error(e) => {
-                    eprintln!("[recorder] {e}");
+                    self.recording_error = Some(e);
+                }
+                RecorderEvent::BufferStatus { occupancy } => {
+                    self.recorder_buffer_occupancy = occupancy;
                 }
             }
         }
@@ -882,6 +906,12 @@ impl eframe::App for KvApp {
                 let mut stop = false;
                 let mut toggle_rec = false;
 
+                // Compute elapsed recording seconds for the clock display.
+                let rec_elapsed_secs = self
+                    .recording_start_time
+                    .map(|t| t.elapsed().as_secs_f64());
+
+                let mut dismiss_error = false;
                 panels::draw_left_panel(
                     ui,
                     self.is_running(),
@@ -892,7 +922,14 @@ impl eframe::App for KvApp {
                     &mut self.filters,
                     &mut self.recording,
                     self.latest_block.as_ref(),
+                    rec_elapsed_secs,
+                    self.recorder_buffer_occupancy,
+                    self.recording_error.as_deref(),
+                    &mut dismiss_error,
                 );
+                if dismiss_error {
+                    self.recording_error = None;
+                }
 
                 if start {
                     match self.mode {

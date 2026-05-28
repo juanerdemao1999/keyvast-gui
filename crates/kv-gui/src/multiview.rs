@@ -192,6 +192,15 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
         80.0
     }
 
+    /// Keep the tab bar even when there is only one pane so the
+    /// "+ Add View" button in `top_bar_right_ui` is always visible.
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
+    }
+
     /// "+ Add View" button in the tab bar right area.
     fn top_bar_right_ui(
         &mut self,

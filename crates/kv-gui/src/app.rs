@@ -29,8 +29,9 @@ use kv_recorder::StreamingRecorder;
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::live_pipeline::{self, LivePipelineHandle, RecorderCmd, RecorderEvent};
 use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
-use crate::preview::{BlockStats, PreviewState};
+use crate::preview::{BlockStats, compute_block_stats};
 use crate::theme;
 use crate::waveform;
 
@@ -53,8 +54,8 @@ pub struct KvApp {
     demo_last_tick: Instant,
     demo_blocks_generated: u64,
     demo_start_time: Instant,
-    // Device (simulator backend)
-    device_preview: PreviewState,
+    // Device (live pipeline: producer thread + recorder thread + preview channel)
+    live_pipeline: Option<LivePipelineHandle>,
     // Shared view state
     block_history: VecDeque<SampleBlock>,
     /// Pre-filtered version of block_history (kept in sync).
@@ -116,7 +117,7 @@ impl KvApp {
             demo_last_tick: now,
             demo_blocks_generated: 0,
             demo_start_time: now,
-            device_preview: PreviewState::new(),
+            live_pipeline: None,
             // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
             block_history: VecDeque::with_capacity(10_000),
             filtered_history: VecDeque::with_capacity(10_000),
@@ -159,10 +160,11 @@ impl KvApp {
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
-        self.device_preview.stop();
+        // Stop any live pipeline that was running in Device mode
+        self.live_pipeline = None;
     }
 
-    /// Switch to Device mode and start simulator backend.
+    /// Switch to Device mode: start the live pipeline (producer + recorder threads).
     fn start_device(&mut self) {
         self.mode = AcqMode::Device;
         self.demo_started = false;
@@ -174,26 +176,34 @@ impl KvApp {
         self.latest_block = None;
         self.latest_stats = None;
         let config = SimulatorConfig::default();
-        self.device_preview.start(config);
+        self.live_pipeline = Some(live_pipeline::start_live_pipeline(config));
     }
 
     fn stop_all(&mut self) {
-        // Finalize any active recording before stopping acquisition
+        // Finalize any active recording first.
         if self.recording.state == RecordingState::Recording {
-            if let Some(rec) = self.active_recorder.take() {
-                match rec.finish() {
-                    Ok(summary) => eprintln!(
-                        "[recorder] Auto-stopped: {} blocks saved → {}",
-                        summary.recording.block_count,
-                        summary.recording.raw_path.display()
-                    ),
-                    Err(e) => eprintln!("[recorder] Auto-stop finish error: {e}"),
+            match self.mode {
+                AcqMode::Demo => {
+                    if let Some(rec) = self.active_recorder.take() {
+                        match rec.finish() {
+                            Ok(summary) => eprintln!(
+                                "[recorder] Auto-stopped: {} blocks saved → {}",
+                                summary.recording.block_count,
+                                summary.recording.raw_path.display()
+                            ),
+                            Err(e) => eprintln!("[recorder] Auto-stop finish error: {e}"),
+                        }
+                    }
+                }
+                AcqMode::Device => {
+                    // Recorder thread will finalize on Terminate (sent by pipeline stop below)
                 }
             }
             self.recording.state = RecordingState::Idle;
         }
         self.demo_started = false;
-        self.device_preview.stop();
+        // Dropping the handle stops both producer and recorder threads cleanly.
+        self.live_pipeline = None;
     }
 
     /// Rebuild filter chains from the current FilterSettings.
@@ -337,8 +347,9 @@ impl KvApp {
         // Feed display ring from the display-ready (filtered or raw) block
         self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
 
-        // Feed raw block to the streaming recorder if active
-        if self.recording.state == RecordingState::Recording {
+        // Feed raw block to the streaming recorder — Demo mode only.
+        // Device mode recording is handled by the recorder thread in live_pipeline.
+        if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording {
             if let Some(ref mut rec) = self.active_recorder {
                 match rec.write_block(&block) {
                     Ok(()) => {
@@ -370,7 +381,7 @@ impl KvApp {
     fn is_running(&self) -> bool {
         match self.mode {
             AcqMode::Demo => self.demo_started,
-            AcqMode::Device => self.device_preview.acquiring,
+            AcqMode::Device => self.live_pipeline.is_some(),
         }
     }
 
@@ -405,38 +416,56 @@ impl KvApp {
                     self.recording.state = RecordingState::Armed;
                 }
             }
-            RecordingState::Armed => {
-                // Open the output file and start recording
-                match StreamingRecorder::new(&self.recording.output_dir) {
-                    Ok(rec) => {
-                        self.active_recorder = Some(rec);
+            RecordingState::Armed => match self.mode {
+                AcqMode::Device => {
+                    // Device mode: tell the recorder thread to open the file.
+                    if let Some(ref pipeline) = self.live_pipeline {
+                        let path: std::path::PathBuf = self.recording.output_dir.clone().into();
+                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start(path));
                         self.recording.state = RecordingState::Recording;
                         self.recording.recorded_blocks = 0;
                         self.recording.recorded_bytes = 0;
                     }
-                    Err(e) => {
-                        // Log to stderr; in a future version surface this in the UI
-                        eprintln!("[recorder] Failed to open output: {e}");
-                    }
                 }
-            }
-            RecordingState::Recording => {
-                // Flush and finalize
-                if let Some(rec) = self.active_recorder.take() {
-                    match rec.finish() {
-                        Ok(summary) => {
-                            eprintln!(
-                                "[recorder] Saved {} blocks ({} bytes) → {}",
-                                summary.recording.block_count,
-                                summary.recording.byte_count,
-                                summary.recording.raw_path.display()
-                            );
+                AcqMode::Demo => {
+                    // Demo mode: open recorder in GUI thread (legacy path).
+                    match StreamingRecorder::new(&self.recording.output_dir) {
+                        Ok(rec) => {
+                            self.active_recorder = Some(rec);
+                            self.recording.state = RecordingState::Recording;
+                            self.recording.recorded_blocks = 0;
+                            self.recording.recorded_bytes = 0;
                         }
-                        Err(e) => eprintln!("[recorder] Finish error: {e}"),
+                        Err(e) => eprintln!("[recorder] Failed to open output: {e}"),
                     }
                 }
-                self.recording.state = RecordingState::Idle;
-            }
+            },
+            RecordingState::Recording => match self.mode {
+                AcqMode::Device => {
+                    // Device mode: tell the recorder thread to finalize.
+                    // State will be updated to Idle via RecorderEvent::Stopped.
+                    if let Some(ref pipeline) = self.live_pipeline {
+                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
+                    }
+                }
+                AcqMode::Demo => {
+                    // Demo mode: finalize in GUI thread.
+                    if let Some(rec) = self.active_recorder.take() {
+                        match rec.finish() {
+                            Ok(summary) => {
+                                eprintln!(
+                                    "[recorder] Saved {} blocks ({} bytes) → {}",
+                                    summary.recording.block_count,
+                                    summary.recording.byte_count,
+                                    summary.recording.raw_path.display()
+                                );
+                            }
+                            Err(e) => eprintln!("[recorder] Finish error: {e}"),
+                        }
+                    }
+                    self.recording.state = RecordingState::Idle;
+                }
+            },
         }
     }
 
@@ -448,9 +477,9 @@ impl KvApp {
                     .duration_since(self.demo_start_time)
                     .as_secs_f64(),
                 AcqMode::Device => self
-                    .latest_stats
+                    .live_pipeline
                     .as_ref()
-                    .map(|s| s.elapsed_seconds)
+                    .map(|p| p.start_time.elapsed().as_secs_f64())
                     .unwrap_or(0.0),
             }
         } else {
@@ -494,13 +523,61 @@ impl KvApp {
         }
     }
 
-    /// Poll device preview and update shared state.
+    /// Poll the live pipeline for new blocks and recorder events.
     fn tick_device(&mut self) {
-        if self.device_preview.poll() {
-            if let Some(block) = self.device_preview.latest_block.clone() {
-                self.ingest_block(block);
+        if self.live_pipeline.is_none() {
+            return;
+        }
+
+        // ── Collect recorder events and preview blocks while holding the borrow ──
+        // We must release the borrow before calling self.ingest_block() or
+        // mutating other self fields, so collect into locals first.
+
+        let mut recorder_events: Vec<RecorderEvent> = Vec::new();
+        let mut preview_blocks: Vec<SampleBlock> = Vec::new();
+
+        {
+            let pipeline = self.live_pipeline.as_mut().unwrap();
+
+            while let Ok(event) = pipeline.event_rx.try_recv() {
+                recorder_events.push(event);
             }
-            self.latest_stats = self.device_preview.latest_stats.clone();
+
+            while let Ok(block) = pipeline.preview_rx.try_recv() {
+                pipeline.total_blocks += 1;
+                preview_blocks.push(block);
+            }
+        } // borrow released here
+
+        // ── Process recorder events ──────────────────────────────────────────
+        for event in recorder_events {
+            match event {
+                RecorderEvent::Started => {
+                    eprintln!("[recorder] Recording started.");
+                }
+                RecorderEvent::Stopped { blocks, bytes } => {
+                    eprintln!("[recorder] Saved {blocks} blocks ({bytes} bytes).");
+                    self.recording.recorded_blocks = blocks;
+                    self.recording.recorded_bytes = bytes;
+                    self.recording.state = RecordingState::Idle;
+                }
+                RecorderEvent::Error(e) => {
+                    eprintln!("[recorder] {e}");
+                }
+            }
+        }
+
+        // ── Ingest all preview blocks ─────────────────────────────────────────
+        let last_block = preview_blocks.last().cloned();
+        for block in preview_blocks {
+            self.ingest_block(block);
+        }
+
+        // Update stats from the most-recent block received this frame.
+        if let Some(ref block) = last_block {
+            let pipeline = self.live_pipeline.as_ref().unwrap();
+            let elapsed = pipeline.start_time.elapsed().as_secs_f64();
+            self.latest_stats = Some(compute_block_stats(block, pipeline.total_blocks, elapsed));
         }
     }
 

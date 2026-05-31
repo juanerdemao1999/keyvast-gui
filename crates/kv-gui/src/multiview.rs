@@ -25,7 +25,7 @@ use egui_tiles::UiResponse;
 
 use crate::disp_ring::DisplayRing;
 use crate::panels::{AMP_SCALES, DisplaySettings, FilterSettings, TIME_WINDOWS};
-use crate::spike_overlay::{self, SpikeSnippetStore};
+use crate::spike_overlay::{self, SpikeChannel, SpikeSnippetStore};
 use crate::theme;
 use crate::waveform;
 use kv_types::SampleBlock;
@@ -55,9 +55,12 @@ pub enum TileKind {
         visible_count: usize,
         scroll_accum_ch: f32,
     },
-    /// Spike waveform overlay (Phase 2 — placeholder for now).
+    /// Spike waveform overlay — threshold-triggered snippet view.
     SpikeOverlay {
-        channels: Vec<usize>,
+        /// Selected channels, each carrying its own vertical scale.
+        channels: Vec<SpikeChannel>,
+        /// Per-tile grid toggle.
+        show_grid: bool,
         pre_ms: f32,
         post_ms: f32,
         max_snippets: usize,
@@ -86,6 +89,7 @@ impl TileKind {
     pub fn new_spike_overlay() -> Self {
         Self::SpikeOverlay {
             channels: Vec::new(),
+            show_grid: true,
             pre_ms: 1.0,
             post_ms: 2.0,
             max_snippets: 50,
@@ -156,9 +160,9 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 UiResponse::None
             }
 
-            TileKind::SpikeOverlay { channels, pre_ms, post_ms, max_snippets } => {
+            TileKind::SpikeOverlay { channels, show_grid, pre_ms, post_ms, max_snippets } => {
                 self.draw_spike_overlay_pane(
-                    ui, _tile_id, channels, pre_ms, post_ms, max_snippets,
+                    ui, _tile_id, channels, show_grid, pre_ms, post_ms, max_snippets,
                 );
                 UiResponse::None
             }
@@ -437,11 +441,13 @@ impl<'a> KvTileBehavior<'a> {
     }
 
     /// Spike Overlay pane: channel selector, parameter controls, and snippet plot.
+    #[allow(clippy::too_many_arguments)]
     fn draw_spike_overlay_pane(
         &mut self,
         ui: &mut egui::Ui,
         tile_id: egui_tiles::TileId,
-        channels: &mut Vec<usize>,
+        channels: &mut Vec<SpikeChannel>,
+        show_grid: &mut bool,
         _pre_ms: &mut f32,
         _post_ms: &mut f32,
         _max_snippets: &mut usize,
@@ -494,6 +500,10 @@ impl<'a> KvTileBehavior<'a> {
                     .speed(1)
                     .range(5_usize..=200),
             ).changed() { params_changed = true; }
+
+            ui.separator();
+            ui.checkbox(show_grid, egui::RichText::new("Grid").size(10.0).color(theme::TEXT_DIM))
+                .on_hover_text("Toggle this tile's grid");
         });
 
         // Apply any parameter changes back to the store.
@@ -515,7 +525,7 @@ impl<'a> KvTileBehavior<'a> {
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for ch in 0..total_ch {
-                    let selected = channels.contains(&ch);
+                    let selected = channels.iter().any(|c| c.ch == ch);
                     let label = egui::RichText::new(format!("CH{ch}"))
                         .size(10.0)
                         .color(if selected { theme::channel_color(ch) } else { theme::TEXT_DIM });
@@ -525,21 +535,53 @@ impl<'a> KvTileBehavior<'a> {
                         .clicked()
                     {
                         if selected {
-                            channels.retain(|&c| c != ch);
+                            channels.retain(|c| c.ch != ch);
                         } else {
-                            channels.push(ch);
-                            channels.sort_unstable();
+                            channels.push(SpikeChannel::new(ch));
+                            channels.sort_by_key(|c| c.ch);
                         }
                     }
                 }
             });
         });
 
+        // ── Per-channel Y scale ──────────────────────────────────────
+        // One magnification control per selected channel — lets low-amplitude
+        // channels be enlarged independently (the per-channel "Y range").
+        if !channels.is_empty() {
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Y scale  (per channel)")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            )
+            .default_open(true)
+            .show(ui, |ui| {
+                for sc in channels.iter_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("CH{}", sc.ch))
+                                .size(10.0)
+                                .color(theme::channel_color(sc.ch)),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut sc.y_scale)
+                                .speed(0.05)
+                                .range(0.1_f32..=20.0)
+                                .suffix("×"),
+                        )
+                        .on_hover_text("Vertical magnification for this channel");
+                    });
+                }
+            });
+        }
+
         ui.separator();
 
         // ── Snippet plot ─────────────────────────────────────────────
         // Reborrow &mut as & for the read-only renderer.
-        spike_overlay::draw_spike_overlay(ui, &*self.snippet_store, channels, tile_salt);
+        spike_overlay::draw_spike_overlay(
+            ui, &*self.snippet_store, channels, *show_grid, tile_salt,
+        );
     }
 }
 
@@ -580,31 +622,39 @@ pub fn make_initial_tree(visible_channels: usize) -> egui_tiles::Tree<TileKind> 
     egui_tiles::Tree::new("kv_tiles", root, tiles)
 }
 
-/// Insert a new tile into the tree, adding it as a new tab in the root container.
-/// Falls back to creating a horizontal split if the root is not a tab container.
+/// Insert a new tile as a **split** so it is immediately visible — placed
+/// side-by-side with the existing views, with no manual drag required.
+///
+/// Repeated adds append to the same horizontal split so panes tile evenly
+/// (left-to-right) instead of nesting deeper on each add.
+/// `simplification_options.all_panes_must_have_tabs` still gives every pane its
+/// own tab bar (and therefore its own "＋ Add View" button), so a view can be
+/// added from any pane.  Users can still drag a tab to any edge to re-arrange
+/// (e.g. stack vertically) at will.
 pub fn add_view_to_tree(tree: &mut egui_tiles::Tree<TileKind>, kind: TileKind) {
     let new_id = tree.tiles.insert_pane(kind);
-    let root_id = match tree.root() {
+
+    let root_id = match tree.root {
         Some(id) => id,
         None => {
-            // Empty tree — set this pane as the only root
-            let _ = tree.tiles.insert_tab_tile(vec![new_id]);
+            // Empty tree — this pane becomes the only root.
+            tree.root = Some(tree.tiles.insert_tab_tile(vec![new_id]));
             return;
         }
     };
 
-    // Try to insert as a new tab in the root tabs container
-    if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Tabs(tabs))) =
+    // If the root is already a horizontal split, append to it so all added views
+    // tile evenly (avoids an ever-deepening nest on each add).
+    if let Some(egui_tiles::Tile::Container(egui_tiles::Container::Linear(lin))) =
         tree.tiles.get_mut(root_id)
+        && lin.dir == egui_tiles::LinearDir::Horizontal
     {
-        tabs.add_child(new_id);
-        tabs.set_active(new_id);
-    } else {
-        // Root is not a tab container — wrap both in a new horizontal split
-        let new_root = tree.tiles.insert_horizontal_tile(vec![root_id, new_id]);
-        // Replace the root — egui_tiles Tree doesn't expose set_root directly,
-        // so we rebuild the tree with the same tiles but a new root.
-        let tiles = std::mem::take(&mut tree.tiles);
-        *tree = egui_tiles::Tree::new("kv_tiles", new_root, tiles);
+        lin.add_child(new_id);
+        return;
     }
+
+    // Otherwise wrap the current root + new pane in a new horizontal split so
+    // they appear side-by-side immediately.
+    let new_root = tree.tiles.insert_horizontal_tile(vec![root_id, new_id]);
+    tree.root = Some(new_root);
 }

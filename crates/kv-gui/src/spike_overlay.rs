@@ -42,6 +42,28 @@ pub const DEFAULT_MAX_SNIPPETS: usize = 50;
 /// Render frames until a snippet becomes fully transparent.
 const FADE_FRAMES: u32 = 180; // ~3 s at 60 fps
 
+/// Default per-channel vertical scale (gain multiplier) for the overlay.
+pub const DEFAULT_Y_SCALE: f32 = 1.0;
+
+// ── Selected channel ─────────────────────────────────────────────────
+
+/// One channel selected for the Spike Overlay, with its own display scale.
+///
+/// `y_scale` is a per-channel vertical gain multiplier (1.0 = default).  Larger
+/// values magnify low-amplitude channels so each can be inspected independently
+/// — this is the per-channel "Y range" control the overlay exposes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpikeChannel {
+    pub ch: usize,
+    pub y_scale: f32,
+}
+
+impl SpikeChannel {
+    pub fn new(ch: usize) -> Self {
+        Self { ch, y_scale: DEFAULT_Y_SCALE }
+    }
+}
+
 // ── Snippet ──────────────────────────────────────────────────────────
 
 /// One captured threshold-crossing waveform.
@@ -278,10 +300,11 @@ impl SpikeSnippetStore {
 pub fn draw_spike_overlay(
     ui: &mut egui::Ui,
     store: &SpikeSnippetStore,
-    selected_channels: &[usize],
+    channels: &[SpikeChannel],
+    show_grid: bool,
     tile_id_salt: usize,
 ) {
-    if selected_channels.is_empty() || store.channel_count() == 0 {
+    if channels.is_empty() || store.channel_count() == 0 {
         ui.centered_and_justified(|ui| {
             ui.label(
                 egui::RichText::new("No channels selected.\nClick a channel below to monitor it.")
@@ -297,15 +320,15 @@ pub fn draw_spike_overlay(
     let x_left  = -(pre_ms as f64);
     let x_right =  post_ms as f64;
     let ch_spacing = 2.5_f64;
-    let n = selected_channels.len();
+    let n = channels.len();
     let y_min = -(n as f64) * ch_spacing + ch_spacing * 0.5;
     let y_max = ch_spacing * 0.5;
 
     // Collect all trace lines before entering the Plot closure (avoids borrow issues)
     let mut all_lines: Vec<(usize, f32, Vec<[f64; 2]>)> = Vec::new(); // (disp_pos, alpha, pts)
 
-    for (disp_pos, &phys_ch) in selected_channels.iter().enumerate() {
-        let snippets = store.snippets_for(phys_ch);
+    for (disp_pos, sc) in channels.iter().enumerate() {
+        let snippets = store.snippets_for(sc.ch);
         for snippet in snippets {
             let alpha = snippet.alpha();
             if alpha < 0.02 {
@@ -318,7 +341,8 @@ pub fn draw_spike_overlay(
                 .enumerate()
                 .map(|(i, &v)| {
                     let t_ms = x_left + (i as f64 / (total - 1) as f64) * (x_right - x_left);
-                    let y    = v as f64 * ch_spacing * 0.4 - (disp_pos as f64) * ch_spacing;
+                    let y    = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
+                        - (disp_pos as f64) * ch_spacing;
                     [t_ms, y]
                 })
                 .collect();
@@ -327,7 +351,7 @@ pub fn draw_spike_overlay(
     }
 
     // Y-axis label formatter
-    let channels_for_fmt = selected_channels.to_vec();
+    let channels_for_fmt: Vec<usize> = channels.iter().map(|c| c.ch).collect();
     let spacing_fmt = ch_spacing;
     let y_fmt = move |mark: egui_plot::GridMark, _: &std::ops::RangeInclusive<f64>| {
         let disp = (-mark.value / spacing_fmt).round() as i64;
@@ -343,7 +367,7 @@ pub fn draw_spike_overlay(
         .height(ui.available_height())
         .width(ui.available_width())
         .show_axes([true, true])
-        .show_grid(true)
+        .show_grid(show_grid)
         .allow_drag(false)
         .allow_zoom(false)
         .allow_scroll(false)
@@ -382,7 +406,7 @@ pub fn draw_spike_overlay(
 
         // Snippet lines with fade-out
         for (disp_pos, alpha, pts) in all_lines {
-            let base = theme::channel_color(selected_channels[disp_pos]);
+            let base = theme::channel_color(channels[disp_pos].ch);
             let a = (alpha * 220.0) as u8;
             let color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a);
             plot_ui.line(

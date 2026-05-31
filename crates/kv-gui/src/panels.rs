@@ -6,6 +6,7 @@
 
 use eframe::egui;
 use kv_types::SampleBlock;
+use rfd;
 
 use crate::preview::BlockStats;
 use crate::theme;
@@ -29,9 +30,24 @@ pub struct DisplaySettings {
     pub show_grid: bool,
     pub show_channel_labels: bool,
     pub overlay_mode: bool,
+    /// When true: hovering over a channel highlights it white and dims others.
+    /// When false (default): all channels always render at full brightness.
+    pub hover_highlight: bool,
+    /// Scroll step when browsing history while paused, as a percentage of
+    /// the current time window. Default 10 = 10% of window per scroll click.
+    pub browse_step_pct: f64,
     /// Per-channel enable/disable (true = visible).
     pub channel_enabled: Vec<bool>,
+    /// Vertical spacing between channel baselines (1.0 = dense, 6.0 = spread).
+    pub channel_spacing: f64,
 }
+
+/// Minimum allowed channel spacing.
+pub const SPACING_MIN: f64 = 1.0;
+/// Maximum allowed channel spacing.
+pub const SPACING_MAX: f64 = 6.0;
+/// Step for keyboard +/- adjustment.
+pub const SPACING_STEP: f64 = 0.2;
 
 impl Default for DisplaySettings {
     fn default() -> Self {
@@ -42,7 +58,10 @@ impl Default for DisplaySettings {
             show_grid: true,
             show_channel_labels: true,
             overlay_mode: false,
+            hover_highlight: false,
+            browse_step_pct: 10.0,
             channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
+            channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
         }
     }
 }
@@ -73,7 +92,7 @@ impl DisplaySettings {
 /// Notch frequency presets — line noise on most regions.
 pub const NOTCH_FREQS: &[f64] = &[50.0, 60.0];
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FilterSettings {
     pub hp_enabled: bool,
     pub hp_cutoff_hz: f64,
@@ -151,10 +170,19 @@ pub fn draw_left_panel(
     acquiring: bool,
     start_clicked: &mut bool,
     stop_clicked: &mut bool,
+    toggle_rec: &mut bool,
     display: &mut DisplaySettings,
     filters: &mut FilterSettings,
     recording: &mut RecordingSettings,
     block: Option<&SampleBlock>,
+    // Elapsed recording wall-clock seconds (None when not recording).
+    rec_elapsed_secs: Option<f64>,
+    // Recorder buffer fill level 0.0..=1.0 (from live pipeline).
+    buffer_occupancy: f64,
+    // Last recorder error message, if any.
+    recording_error: Option<&str>,
+    // Set to true by the panel when the user clicks "dismiss error".
+    dismiss_error: &mut bool,
 ) {
     ui.set_min_width(220.0);
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -168,7 +196,16 @@ pub fn draw_left_panel(
         ui.add_space(4.0);
         draw_channel_list(ui, display, block);
         ui.add_space(4.0);
-        draw_recording_section(ui, recording, acquiring);
+        draw_recording_section(
+            ui,
+            recording,
+            acquiring,
+            toggle_rec,
+            rec_elapsed_secs,
+            buffer_occupancy,
+            recording_error,
+            dismiss_error,
+        );
     });
 }
 
@@ -329,9 +366,23 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 });
         });
 
+        // Channel spacing — slider
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Spacing")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::Slider::new(&mut display.channel_spacing, SPACING_MIN..=SPACING_MAX)
+                    .step_by(SPACING_STEP)
+                    .trailing_fill(true),
+            );
+        });
+
         ui.add_space(2.0);
 
-        // Toggles on one row
+        // Toggles
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut display.show_grid,
@@ -341,6 +392,28 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 &mut display.show_channel_labels,
                 egui::RichText::new("Labels").size(10.0),
             );
+            ui.checkbox(
+                &mut display.hover_highlight,
+                egui::RichText::new("Hover hl").size(10.0),
+            )
+            .on_hover_text("Highlight hovered channel, dim others");
+        });
+
+        // Browse step — how far each scroll click moves when paused
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Browse step")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::Slider::new(&mut display.browse_step_pct, 1.0_f64..=100.0)
+                    .suffix("%")
+                    .step_by(1.0)
+                    .trailing_fill(true),
+            )
+            .on_hover_text("How far each scroll step moves when paused (% of time window)");
         });
     });
 }
@@ -485,9 +558,13 @@ fn draw_channel_list(
         });
 
         // Scrollable channel checkboxes
+        // min_scrolled_width reserves enough room so the scrollbar never
+        // overlaps the channel name / checkbox content.
         egui::ScrollArea::vertical()
             .max_height(200.0)
+            .min_scrolled_width(160.0)
             .show(ui, |ui| {
+                ui.set_min_width(160.0);
                 for ch in 0..visible {
                     // Ensure vector is big enough
                     while display.channel_enabled.len() <= ch {
@@ -517,7 +594,17 @@ fn draw_channel_list(
 
 // ── Recording section ───────────────────────────────────────────────
 
-fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, acquiring: bool) {
+#[allow(clippy::too_many_arguments)]
+fn draw_recording_section(
+    ui: &mut egui::Ui,
+    recording: &mut RecordingSettings,
+    acquiring: bool,
+    toggle_rec: &mut bool,
+    rec_elapsed_secs: Option<f64>,
+    buffer_occupancy: f64,
+    recording_error: Option<&str>,
+    dismiss_error: &mut bool,
+) {
     egui::CollapsingHeader::new(
         egui::RichText::new("RECORDING").size(11.0).strong().color(theme::TEXT_SECONDARY),
     )
@@ -538,7 +625,7 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
             ui.label(egui::RichText::new(label).size(11.0).color(label_color));
         });
 
-        // Output directory
+        // Output directory — text field + folder picker button
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Dir:")
@@ -547,34 +634,47 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
             );
             ui.add(
                 egui::TextEdit::singleline(&mut recording.output_dir)
-                    .desired_width(140.0)
+                    .desired_width(110.0)
                     .font(egui::FontId::monospace(10.0)),
             );
+            if ui
+                .button(egui::RichText::new("📁").size(13.0))
+                .on_hover_text("Browse for output folder")
+                .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Select recording output folder")
+                    .pick_folder()
+                {
+                    recording.output_dir = path.to_string_lossy().into_owned();
+                }
+            }
         });
 
-        // Arm / Record / Stop buttons
+        // Arm / Record / Stop buttons — all go through toggle_rec so that
+        // app.rs::toggle_recording() handles the actual state transitions
+        // (creating / finishing the StreamingRecorder).
         ui.horizontal(|ui| match recording.state {
             RecordingState::Idle => {
                 if theme::transport_button(ui, " Arm ", theme::ACCENT_YELLOW, acquiring) {
-                    recording.state = RecordingState::Armed;
+                    *toggle_rec = true;
                 }
             }
             RecordingState::Armed => {
                 if theme::transport_button(ui, "Record", theme::BTN_RECORD, true) {
-                    recording.state = RecordingState::Recording;
-                    recording.recorded_blocks = 0;
-                    recording.recorded_bytes = 0;
+                    *toggle_rec = true;
                 }
                 if ui
                     .button(egui::RichText::new("Disarm").size(11.0))
                     .clicked()
                 {
+                    // Disarm: go directly back to Idle without creating a file
                     recording.state = RecordingState::Idle;
                 }
             }
             RecordingState::Recording => {
                 if theme::transport_button(ui, "Stop Rec", theme::BTN_STOP, true) {
-                    recording.state = RecordingState::Idle;
+                    *toggle_rec = true;
                 }
             }
         });
@@ -582,6 +682,89 @@ fn draw_recording_section(ui: &mut egui::Ui, recording: &mut RecordingSettings, 
         if recording.state == RecordingState::Recording {
             theme::kv_label(ui, "Blocks", &recording.recorded_blocks.to_string());
             theme::kv_label(ui, "Size", &format_bytes(recording.recorded_bytes));
+
+            // ── Real-time recording clock ────────────────────────
+            if let Some(secs) = rec_elapsed_secs {
+                let h = secs as u64 / 3600;
+                let m = (secs as u64 % 3600) / 60;
+                let s = secs as u64 % 60;
+                theme::kv_label(
+                    ui,
+                    "Duration",
+                    &format!("{h:02}:{m:02}:{s:02}"),
+                );
+            }
+
+            // ── Buffer occupancy water-mark ──────────────────────
+            // Shows how full the recorder's input queue is.
+            // Green = healthy; yellow = disk may be slow; red = near overflow.
+            ui.add_space(4.0);
+            let occ_pct = (buffer_occupancy * 100.0) as u32;
+            let bar_color = if buffer_occupancy > 0.75 {
+                theme::ACCENT_RED
+            } else if buffer_occupancy > 0.40 {
+                theme::ACCENT_YELLOW
+            } else {
+                theme::ACCENT_GREEN
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Buffer")
+                        .size(10.0)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{occ_pct:3}%"))
+                        .size(10.0)
+                        .monospace()
+                        .color(bar_color),
+                );
+            });
+            ui.add(
+                egui::ProgressBar::new(buffer_occupancy as f32)
+                    .fill(bar_color)
+                    .desired_width(ui.available_width()),
+            );
+            if buffer_occupancy > 0.75 {
+                ui.label(
+                    egui::RichText::new("⚠ Disk may be too slow")
+                        .size(9.0)
+                        .color(theme::ACCENT_RED),
+                );
+            }
+        }
+
+        // ── Recorder error banner (dismissable) ──────────────────
+        if let Some(err) = recording_error {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(70, 15, 15))
+                .inner_margin(egui::Margin::same(6))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("⚠")
+                                .size(11.0)
+                                .color(theme::ACCENT_RED),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(err)
+                                .size(9.5)
+                                .color(egui::Color32::from_rgb(255, 170, 170)),
+                        );
+                    });
+                    if ui
+                        .small_button(
+                            egui::RichText::new("Dismiss").size(9.0),
+                        )
+                        .clicked()
+                    {
+                        *dismiss_error = true;
+                    }
+                });
         }
     });
 }

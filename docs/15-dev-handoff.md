@@ -20,9 +20,139 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-24 (session 6 — GUI polish + signal processing)
+Last updated: 2026-05-28 (session 15 — multi-view plan documented, Phase 1 starting)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+
+Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 15: Multi-view tile display — planning complete, implementation starting
+
+**Goal**: Replace single `CentralPanel` waveform with a draggable `egui_tiles` layout
+supporting LFP (LP 250 Hz), AP/Spike (HP 300 Hz), and Spike Overlay (threshold snippet)
+tiles alongside the existing main waveform.
+
+**Design doc**: `docs/17-multiview-plan.md`
+
+**Status**: Phase 1 starting — egui_tiles skeleton + LFP/AP rings.
+
+---
+
+### Session 14: 2-hour endurance test — MVP acceptance #11 PASSED
+
+**Goal**: Verify MVP acceptance criterion #11 — "Run a two-hour continuous acquisition test without unbounded memory growth."
+
+**Benchmark ladder results** (all presets, `--release` build):
+
+| Preset | Duration | Wall Clock | Samples Written | Missing Pkts | Memory Peak | Avg Write MB/s |
+|--------|----------|------------|-----------------|--------------|-------------|----------------|
+| smoke | 10s | 0.10s | 19.2M | 0 | 4.3 MB | 381 |
+| recorder | 10min | 4.84s | 1.15B | 0 | 9.5 MB | 476 |
+| **endurance** | **2h** | **769s** | **13.8B** | **0** | **55.8 MB** | **35.9** |
+
+**Acceptance criteria verification**:
+- ✅ No unbounded memory growth: 55.8 MB peak for 26 GB written (bounded, proportional to buffer sizing)
+- ✅ Zero missing packets (no fault injection): 0 / 3,375,000
+- ✅ Zero timestamp discontinuities
+- ✅ Zero recorder buffer drops: recorder_dropped_blocks = 0
+- ✅ Data integrity: expected_samples == written_samples == 13,824,000,000
+- ✅ Byte count: 27,648,000,000 = samples × 2 (i16)
+
+**Latency distribution (endurance)**:
+- P50: 0.015 ms, P95: 0.034 ms, P99: 0.051 ms
+- Max: 67,180 ms (single outlier — Windows file system flush on 26 GB file)
+
+**Note for real-time hardware**: The 67s max write stall won't cause data loss with the simulator (which runs faster than real-time), but real hardware at 30 kHz producing 3.84 MB/s would overflow a 5s recorder buffer during such a stall. Future mitigations: pre-allocated file, segmented writes, or deeper recorder buffer.
+
+**Baseline files saved**: `benchmarks/baselines/{smoke,recorder,endurance}-baseline.json`
+
+**Commit**: (pending)
+
+### Session 13: Sweep mode stretch fix
+
+**Problem**: After introducing sweep mode in session 12, data appeared to progressively "stretch/zoom out" as the sweep filled in.
+
+**Root cause**: `stride2 = visible_ring_entries / max_points`. At sweep start, only ~7 ring entries are visible, so stride2=1 (high resolution). By sweep end, 37,500 entries are visible, stride2=18 (coarse). Early data was re-rendered at coarser resolution each frame, making it look stretched.
+
+**Fix**: stride2 now computed from the full **window** capacity, not the currently-filled portion. For a 5s window at 30kHz: window_ring_entries = 37,500, stride2 = 18 (constant from first frame of sweep).
+
+**Commit**: `6472ddd`
+
+---
+
+### Session 12: Sweep mode display + sampling phase fix
+
+**Problems fixed**:
+1. "Twitching/flickering" when scrolling
+2. Sampling phase drift causing horizontal waveform jitter
+
+**Root causes**:
+- Continuous scroll mode changed x_left/x_right every frame → all 32k data points changed pixel positions each frame even when data was unchanged
+- `collect_channel()` ri_start varied ±1-3 ring entries per frame; stride2=18 amplified this into visible phase drift
+
+**Fix 1 — Sweep mode** (SpikeGLX / Intan RHX default):
+- `x_left = sweep_start_ms` and `x_right = x_left + window_ms` stay **fixed** within one sweep
+- A cursor line sweeps from x_left to x_right as new data arrives
+- When cursor overflows, `sweep_start_ms` advances one window and display resets (brief flash, once every 5-20s)
+- Between resets: completely stationary display — no scrolling motion at all
+
+**Fix 2 — Global alignment**: `collect_channel()` snaps `ri_start` to the global absolute-sample grid (`abs_idx % (stride2 * dwnsp) == 0`), eliminating per-frame phase jitter.
+
+**Commits**: `8c98ab3`
+
+---
+
+### Session 11: Waveform rendering overhaul (stride + O(output) collection)
+
+**Signal thickness fix**: Replaced min-max decimation with simple Nth-sample stride (SpikeGLX `draw1Analog` style). Min-max connected min and max as a line strip, causing zigzag / thick appearance. Stride emits 1 point per interval — thin consistent line at all zoom levels.
+
+**Fluidity fix**:
+- Binary search for first visible block: O(log N) vs O(N) across 10,000 history blocks per frame
+- Arithmetic sample indexing within each block: compute first stride-aligned index and step directly, never iterate samples outside the window
+- Overall: O(output_points) per channel, not O(input_samples)
+- MAX_DISPLAY_POINTS reduced from 4096 → 2000
+
+**Research basis**: Intan RHX `waveformdisplaymanager.cpp` and SpikeGLX `MGraph.cpp` source code. Both tools use 1-sample-per-display-unit rendering for normal mode; min-max / binMax is an explicit opt-in secondary mode in SpikeGLX.
+
+**Commit**: `07ee295`
+
+### Session 10: Incremental filtering + bug fixes
+
+**Problem solved**: Enabling biquad/CAR filters caused frame drops because the entire visible window (5s × 30kHz × 16ch = 2.4M filter ops) was re-processed every frame.
+
+**New architecture**:
+- `app.rs` maintains `filtered_history: VecDeque<SampleBlock>` alongside `block_history`
+- `filter_chains: Vec<FilterChain>` — persistent per-channel filter state (survives across frames)
+- Filtering happens at ingest time (`ingest_block()`) — only new blocks are processed (O(new_block) per frame)
+- When user changes filter settings, `rebuild_filter_chains()` detects the mismatch and re-filters the entire history once
+- `waveform.rs` always uses the fast path (min-max decimation only) — no per-frame filtering logic
+- Render code selects `filtered_history` or `block_history` based on whether any filter is enabled
+
+**Bug fixes in same commit**:
+- Gain/ch_spacing decoupling: gain formula now uses fixed `DEFAULT_CHANNEL_SPACING` constant (not `ch_spacing * 3.0`), so amplitude is independent of the channel spacing slider
+- Scale bar label accuracy: bar shows 1/3 lane height = amp_scale/3 µV; label now correctly reflects the actual bar voltage
+
+### Session 10 commits on `dev`
+
+- `b9b622d` — Incremental filtering architecture + scale bar accuracy fix
+
+### Session 9: GUI visual optimization (ALL COMPLETE)
+
+See `docs/16-gui-optimization-plan.md` for the full plan with acceptance criteria.
+
+All 3 rounds implemented:
+1. Min-max decimation (preserve spikes when zoomed out) -- DONE
+2. Filter warmup margin (eliminate left-edge transient) -- DONE
+3. Voltage scale bar -- DONE
+4. Dynamic channel spacing (+/- keys, slider) -- DONE
+5. Extended color palette (32 distinct colors) -- DONE
+6. Drag-to-browse when paused -- DONE
+
+### Session 9 commits on `dev`
+
+- `3a5b830` — Dynamic channel spacing: configurable via slider and +/- keys
+- `8697e23` — Expand channel palette to 32 distinct colors
+- `6c1ee6a` — Drag-to-browse history when display is paused
 
 ### Session 6 changes (waveform / UX polish)
 
@@ -47,9 +177,11 @@ The project is in the simulator-first foundation phase. The streaming pipeline, 
 | `P`       | Pause / resume display                   |
 | `F`       | Toggle performance overlay               |
 | `[` `]`   | Decrease / increase time window          |
+| `+` `-`   | Increase / decrease channel spacing      |
 | `1`–`9`   | Quick-set visible channels               |
 | Wheel     | Increase / decrease time window          |
 | Hover     | Highlight channel + tooltip              |
+| Drag      | Browse history (when paused)             |
 
 ### Files most relevant to this session
 
@@ -294,18 +426,18 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-24 (session 6)
+Last verified: 2026-05-27 (session 14)
 
 Commands run successfully:
 
 ```powershell
-cargo fmt --all -- --check
-cargo test --workspace
-cargo build --bin kv-gui
-cargo clippy --workspace
+cargo build --release --bin kv-acq
+kv-acq benchmark --preset smoke    # 0 missing, 4.3 MB mem
+kv-acq benchmark --preset recorder # 0 missing, 9.5 MB mem
+kv-acq benchmark --preset endurance # 0 missing, 55.8 MB mem, 26 GB written
 ```
 
-All 84 tests pass. Clippy clean except dead-code warnings on intentionally reserved fields/constants in kv-gui (future use: `overlay_mode`, `file_prefix`, `min`/`max` in ChannelStats, `channels`/`total_samples` in BlockStats).
+All benchmark presets pass with zero data loss. The full 2-hour endurance test completes MVP acceptance criterion #11.
 
 Current test count:
 
@@ -323,25 +455,35 @@ Current test count:
 
 ## How To Resume
 
-The full benchmark pipeline and professional GUI are feature-complete. The GUI was refactored in session 5 (layout) and session 6 (smooth scrolling, freeze, perf overlay, hover, decimation fix) to match Tier-1 features of Intan RHX / Open Ephys. Tier-3 signal processing (filters, CAR, spike detection) is the next planned GUI work. The next useful tasks, in priority order:
+The full benchmark pipeline is complete (all 12 MVP acceptance criteria met including 2h
+endurance).  The GUI dev branch includes recording health monitoring (clock, buffer
+water-mark, error banner) and a live pipeline connecting GUI display to the same data
+source as the recorder.
 
-1. **Visual smoke test**: Run `gui.bat` and verify all the new interactions: smooth scroll (no flicker), `P` to freeze, `F` for perf overlay, scroll-wheel changes time window, hover highlights a channel and shows tooltip.
+**Active work: multi-view tile display** — see `docs/17-multiview-plan.md` for the full
+design.  Implementation is in Phase 1.
 
-2. **Tier-4 GUI / analysis features** (planned, not started):
-   - Filter parameter persistence between sessions (config file)
-   - Real-time FFT / spectrogram inset on hovered channel
-   - Channel grouping (probe layout view) for high channel counts
-   - Multi-window split: zoomed window + overview window
-   - Spike sorting (online): per-channel waveform clustering, ISI histogram
-   - Event marker stream + TTL overlay
+### Phase 1 checklist (current)
 
-3. **Wire GUI to live pipeline**: Device mode uses `PreviewState` which wraps `start_preview()`. Already runs a SimulatorBackend in a background thread. Next step is connecting it to a real `FanoutBlockBuffer` preview consumer during a CLI-driven acquisition.
+- [ ] Verify `egui_tiles 0.10` + `eframe 0.31` compile compatibility
+- [ ] Add `egui_tiles` to `kv-gui/Cargo.toml`
+- [ ] Add `disp_ring_lfp`, `disp_ring_ap`, `filter_chains_lfp`, `filter_chains_ap` to `KvApp`
+- [ ] Update `ingest_block()` to push to all three rings
+- [ ] New `multiview.rs`: `TileKind` enum + `KvTileBehavior : egui_tiles::Behavior`
+- [ ] Replace `CentralPanel` render block with `tile_tree.ui(...)`
+- [ ] Startup tree: single `MainWaveform` node
+- [ ] "+ Add View" dropdown: insert LFP / AP / Spike Overlay tiles
+- [ ] Per-tile channel scroll (mouse wheel adjusts `start_ch`)
+- [ ] `cargo test --workspace` all pass
 
-4. **Run longer benchmarks**: The smoke preset (10s) works. Ladder up to `--preset recorder` (10 min), then `--preset endurance` (2 hours). Inspect `benchmark.json`.
+### Remaining backlog (after multi-view)
 
-5. **Benchmark regression tracking**: Save `benchmark.json` outputs from known-good runs and compare across commits.
-
-6. **kv-daemon**: Long-running acquisition service with IPC for GUI and CLI clients.
+1. **Experiment metadata** — animal ID, session, probe type, brain region → `recording.json`
+2. **per-channel RMS** in CHANNELS panel (code exists, never shown)
+3. **TTL digital track overlay**
+4. **Config persistence** — filter/display settings survive restart
+5. **kv-daemon** — background acquisition service
+6. **kv inspect / kv replay** CLI commands
 
 Recommended implementation boundary:
 

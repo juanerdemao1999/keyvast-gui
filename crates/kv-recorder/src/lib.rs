@@ -3,9 +3,24 @@
 use std::{
     fmt,
     fs::{self, File},
-    io::{BufWriter, Write},
+    io::{BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
+// ── KVRAW v2 embedded-header format constants ────────────────────────────────
+//
+// File layout:
+//   [0..8]    magic b"KEYVAST\n"
+//   [8..12]   json_len: u32 LE   (bytes of valid JSON in the block below)
+//   [12..524] json_block: 512 B  (UTF-8 JSON, zero-padded to 512 bytes)
+//   [524..]   raw i16 samples    (channel-interleaved, little-endian)
+//
+// `new()` writes a zeroed placeholder header; `finish()` seeks back to
+// byte 8 and overwrites with the final metadata.
+const KVRAW_MAGIC: &[u8; 8] = b"KEYVAST\n";
+const KVRAW_JSON_RESERVED: usize = 512;
+/// Byte offset where sample data begins (8 magic + 4 len + 512 json = 524).
+pub const KVRAW_DATA_OFFSET: u64 = 8 + 4 + KVRAW_JSON_RESERVED as u64;
 
 use kv_types::{AcquisitionEvent, IntegritySummary, SampleBlock, SampleBlockError};
 
@@ -579,10 +594,24 @@ impl StreamingRecorder {
             source,
         })?;
 
+        let mut writer = BufWriter::new(file);
+
+        // Write placeholder header (overwritten with real metadata on finish())
+        writer.write_all(KVRAW_MAGIC).map_err(|source| RecorderError::Io {
+            path: raw_path.clone(),
+            source,
+        })?;
+        // json_len placeholder (4 bytes) + json_block placeholder (512 bytes)
+        let placeholder = [0u8; 4 + KVRAW_JSON_RESERVED];
+        writer.write_all(&placeholder).map_err(|source| RecorderError::Io {
+            path: raw_path.clone(),
+            source,
+        })?;
+
         Ok(Self {
             output_dir,
             raw_path,
-            writer: BufWriter::new(file),
+            writer,
             block_count: 0,
             written_samples: 0,
             byte_count: 0,
@@ -640,19 +669,49 @@ impl StreamingRecorder {
         Ok(())
     }
 
-    /// Flush raw data, write metadata, return summary.
+    /// Flush raw data, write embedded JSON header, return summary.
+    ///
+    /// Seeks back to byte 8 (after the magic) to overwrite the placeholder
+    /// header with the final metadata.  No separate `.json` file is created —
+    /// all information is self-contained in `recording.kvraw`.
     pub fn finish(mut self) -> Result<StreamingRecordingSummary, RecorderError> {
+        // 1. Flush all pending sample data to disk
         self.writer.flush().map_err(|source| RecorderError::Io {
             path: self.raw_path.clone(),
             source,
         })?;
 
-        let metadata_path = self.output_dir.join("recording.json");
+        // 2. Build the final JSON BEFORE moving out of self.writer.
+        //    (into_inner() partially moves self, so we can't borrow self after.)
         let metadata = self.streaming_metadata_json();
-        fs::write(&metadata_path, metadata).map_err(|source| RecorderError::Io {
-            path: metadata_path.clone(),
+        let path = self.raw_path.clone();
+
+        // 3. Take the underlying File out of the BufWriter so we can seek.
+        let mut file = self.writer.into_inner().map_err(|e| RecorderError::Io {
+            path: path.clone(),
+            source: e.into_error(),
+        })?;
+
+        // 4. Seek back to byte 8 (right after the 8-byte magic)
+        file.seek(SeekFrom::Start(8)).map_err(|source| RecorderError::Io {
+            path: path.clone(),
             source,
         })?;
+
+        // 5. Write json_len + padded json_block
+        let json_bytes = metadata.as_bytes();
+        let json_len = json_bytes.len().min(KVRAW_JSON_RESERVED);
+
+        file.write_all(&(json_len as u32).to_le_bytes())
+            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
+
+        let mut json_block = [0u8; KVRAW_JSON_RESERVED];
+        json_block[..json_len].copy_from_slice(&json_bytes[..json_len]);
+        file.write_all(&json_block)
+            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
+
+        file.flush()
+            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
 
         let max_write_latency_us = self.write_latencies_us.iter().copied().max();
         let latency_distribution = LatencyDistribution::from_samples(&self.write_latencies_us);
@@ -660,8 +719,9 @@ impl StreamingRecorder {
         Ok(StreamingRecordingSummary {
             recording: RecordingSummary {
                 output_dir: self.output_dir,
-                raw_path: self.raw_path,
-                metadata_path,
+                // Metadata is embedded in the kvraw file; metadata_path == raw_path
+                metadata_path: path.clone(),
+                raw_path: path,
                 block_count: self.block_count,
                 written_samples: self.written_samples,
                 byte_count: self.byte_count,
@@ -730,25 +790,29 @@ impl StreamingRecorder {
             concat!(
                 "{{\n",
                 "  \"format\": \"kvraw\",\n",
-                "  \"format_version\": 1,\n",
+                "  \"format_version\": 2,\n",
+                "  \"data_offset_bytes\": {},\n",
                 "  \"device_id\": \"{}\",\n",
                 "  \"backend\": \"simulator\",\n",
                 "  \"sample_rate\": {},\n",
                 "  \"channel_count\": {},\n",
-                "  \"samples_per_packet\": {},\n",
+                "  \"samples_per_channel\": {},\n",
                 "  \"sample_type\": \"i16\",\n",
                 "  \"endianness\": \"little\",\n",
                 "  \"layout\": \"interleaved_by_sample\",\n",
+                "  \"block_count\": {},\n",
                 "  \"first_packet_id\": {},\n",
                 "  \"last_packet_id\": {},\n",
                 "  \"written_samples\": {},\n",
                 "  \"clean_stop\": true\n",
                 "}}\n"
             ),
+            KVRAW_DATA_OFFSET,
             escape_json_string(device_id),
             format_sample_rate(self.sample_rate.unwrap_or(0.0)),
             self.channel_count.unwrap_or(0),
             self.samples_per_packet.unwrap_or(0),
+            self.block_count,
             self.first_packet_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "null".to_string()),

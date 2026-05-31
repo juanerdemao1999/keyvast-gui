@@ -5,6 +5,7 @@ use kv_core::pipeline::{
     PipelineConfig, PipelineError, StreamingPipelineConfig, run_streaming_pipeline,
     run_threaded_pipeline,
 };
+use kv_recorder::KVRAW_DATA_OFFSET;
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, DeviceConfig, SampleBlock};
 
@@ -184,12 +185,14 @@ fn streaming_pipeline_writes_blocks_to_disk() {
     let expected_samples = (8 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
     assert_eq!(result.recording.written_samples, expected_samples);
 
+    // KVRAW v2: file size = header (KVRAW_DATA_OFFSET) + raw sample bytes
     let raw_size = std::fs::metadata(output_dir.join("recording.kvraw"))
         .expect("raw file")
         .len();
-    assert_eq!(raw_size, expected_samples * 2);
+    assert_eq!(raw_size, KVRAW_DATA_OFFSET + expected_samples * 2);
 
-    assert!(output_dir.join("recording.json").exists());
+    // Metadata is embedded in kvraw header; no separate JSON file in v2 format
+    assert!(!output_dir.join("recording.json").exists());
 
     cleanup_dir(&output_dir);
 }

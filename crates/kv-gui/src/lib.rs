@@ -8,8 +8,12 @@
 
 mod app;
 mod demo;
+mod disp_ring;
 mod dsp;
+mod live_pipeline;
+mod multiview;
 mod panels;
+mod spike_overlay;
 mod preview;
 mod theme;
 mod waveform;

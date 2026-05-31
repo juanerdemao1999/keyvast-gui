@@ -5,8 +5,8 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, RecorderError, StreamingRecorder, write_benchmark_summary,
-    write_integrity_summary, write_log_file, write_recording,
+    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder,
+    write_benchmark_summary, write_integrity_summary, write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -309,15 +309,24 @@ fn streaming_recorder_writes_blocks_incrementally() {
     assert_eq!(summary.recording.first_packet_id, Some(0));
     assert_eq!(summary.recording.last_packet_id, Some(2));
 
+    // KVRAW v2: file size = header (KVRAW_DATA_OFFSET) + raw sample bytes
     assert_eq!(
         fs::metadata(output_dir.join("recording.kvraw"))
             .expect("raw file should exist")
             .len(),
-        expected_bytes
+        KVRAW_DATA_OFFSET + expected_bytes
     );
 
-    let metadata = fs::read_to_string(output_dir.join("recording.json"))
-        .expect("metadata file should be readable");
+    // Metadata is embedded in the kvraw file header; no separate JSON file
+    assert!(
+        !output_dir.join("recording.json").exists(),
+        "separate JSON file should not exist in v2 format"
+    );
+    // Read the embedded JSON from the header (bytes 12..524 of the kvraw file)
+    let kvraw_bytes = fs::read(output_dir.join("recording.kvraw")).expect("kvraw readable");
+    let json_len = u32::from_le_bytes(kvraw_bytes[8..12].try_into().unwrap()) as usize;
+    let metadata = std::str::from_utf8(&kvraw_bytes[12..12 + json_len])
+        .expect("header JSON is valid UTF-8");
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
@@ -360,9 +369,13 @@ fn streaming_recorder_matches_batch_recorder_output() {
         batch_summary.last_packet_id
     );
 
+    // Batch recorder: old format (no header), just raw i16 samples.
+    // Streaming recorder: KVRAW v2 (524-byte header + raw i16 samples).
+    // The sample data portions should be byte-identical.
     let batch_raw = fs::read(batch_dir.join("recording.kvraw")).expect("batch raw");
     let stream_raw = fs::read(stream_dir.join("recording.kvraw")).expect("stream raw");
-    assert_eq!(batch_raw, stream_raw, "raw data should be byte-identical");
+    let stream_samples = &stream_raw[KVRAW_DATA_OFFSET as usize..];
+    assert_eq!(batch_raw, stream_samples, "sample data should be byte-identical");
 
     cleanup_dir(&batch_dir);
     cleanup_dir(&stream_dir);

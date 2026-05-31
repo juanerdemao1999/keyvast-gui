@@ -7,26 +7,37 @@
 //! Each channel is offset vertically so traces form a waterfall display.
 //! The X axis auto-scrolls to always show the most recent data window.
 //! Grid lines, zero-reference lines, and per-channel coloring are supported.
-
-use std::collections::VecDeque;
+//!
+//! ## Performance architecture (SpikeGLX-inspired)
+//! - Data comes from `DisplayRing`: pre-decimated at ingestion time.
+//! - Render reads O(output_points) with no block-history iteration.
+//! - `show_x` / `show_y` disabled to skip egui_plot's O(N) hover search.
+//! - Zero-reference lines drawn via painter (no extra Line object allocations).
+//! - `.points` moved (not cloned) into Line to eliminate per-frame alloc.
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
-/// Maximum rendered points per channel (decimation target for performance).
-const MAX_DISPLAY_POINTS: usize = 4096;
+/// Maximum rendered points per channel.
+/// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.
+/// We use a conservative budget to keep egui_plot tessellation cheap.
+const MAX_DISPLAY_POINTS: usize = 2000;
 
-/// Vertical spacing (in normalized units) between channel baselines.
-const CHANNEL_SPACING: f64 = 2.2;
+/// Default vertical spacing (in normalized units) between channel baselines.
+pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
 
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
+    /// Physical channel index (for colour, label, hover matching).
     channel: usize,
+    /// Slot position in the display stack (0 = top lane, 1 = next, …).
+    /// Used for Y-axis offset; independent of the physical channel number.
+    display_pos: usize,
     points: Vec<[f64; 2]>,
     /// RMS sigma in normalized-input units (only set when threshold is enabled).
     sigma: Option<f64>,
@@ -34,19 +45,41 @@ struct ChannelTrace {
     spike_count: u32,
 }
 
+/// Spike metadata retained after `points` is moved into a `Line`.
+struct SpikeMeta {
+    /// Physical channel index (used for badge label; dead_code until spike overlay is wired up).
+    #[allow(dead_code)]
+    channel: usize,
+    /// Display-stack position (same as ChannelTrace::display_pos).
+    display_pos: usize,
+    #[allow(dead_code)]
+    sigma: f64,
+    spike_count: u32,
+    thresh_y: f64,
+}
+
 // ── Public entry point ──────────────────────────────────────────────
 
 /// Draw the full waveform area — one large Plot with all channels stacked.
 ///
-/// `elapsed_secs` is the wall-clock time since acquisition started; it drives
-/// the X-axis window edge so scrolling is smooth and continuous.
+/// `sweep_left_ms` is the left edge of the current sweep window (ms since
+/// acquisition start).  The right edge is `sweep_left_ms + time_window_ms`.
+///
+/// In sweep mode these bounds are **fixed** for the duration of one sweep —
+/// the display is stationary and a cursor sweeps from left to right.  This
+/// is the display model used by SpikeGLX and Intan RHX, and eliminates the
+/// "twitching" caused by continuously shifting plot bounds.
+///
+/// Data is read from `ring` (pre-computed at ingestion time) — no per-frame
+/// block history iteration.
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
-    history: &VecDeque<SampleBlock>,
+    ring: &DisplayRing,
     latest: Option<&SampleBlock>,
+    start_ch: usize, // first physical channel to display (0 = no scroll offset)
     settings: &DisplaySettings,
     filters: &FilterSettings,
-    elapsed_secs: f64,
+    sweep_left_ms: f64,
 ) {
     let block = match latest {
         Some(b) => b,
@@ -56,8 +89,15 @@ pub fn draw_waveform_area(
         }
     };
 
+    if !ring.ready {
+        draw_empty_state(ui);
+        return;
+    }
+
     let total_channels = block.channel_count;
-    let visible = settings.visible_channels.min(total_channels);
+    // Clamp start_ch so we never go past the last channel.
+    let start_ch = start_ch.min(total_channels.saturating_sub(1));
+    let visible = settings.visible_channels.min(total_channels.saturating_sub(start_ch));
     if visible == 0 {
         draw_empty_state(ui);
         return;
@@ -65,56 +105,45 @@ pub fn draw_waveform_area(
 
     let amp_scale = settings.amp_scale_uv();
     let time_window_ms = settings.time_window_ms();
+    let ch_spacing = settings.channel_spacing;
 
-    // Gain maps normalized i16 data (±0.06 typical neural) to fill the channel lane.
-    let gain = CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
+    // Gain maps normalized i16 data to visual Y-units.  Independent of
+    // ch_spacing so that adjusting spacing does NOT change waveform amplitude.
+    // Uses the default lane height as the reference (like Intan RHX where
+    // amplitude scale and channel spacing are independent controls).
+    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
 
-    // X-axis window driven by wall clock — smooth continuous scroll
-    let x_right = elapsed_secs * 1000.0; // current time in ms
-    let x_left = (x_right - time_window_ms).max(0.0);
+    // Sweep-mode window: FIXED bounds for the duration of this sweep.
+    // The cursor (ring.latest_time_ms) sweeps from x_left to x_right.
+    // When it overflows, app.rs advances sweep_left_ms and the display resets.
+    let x_left = sweep_left_ms;
+    let x_right = x_left + time_window_ms;
 
-    // Decide pipeline: fast path (raw decimated) or full path (filter/CAR).
-    let needs_full_pipeline =
-        filters.any_filter_enabled() || filters.car_enabled || filters.spike_threshold_enabled;
+    // Latest ring data time — used to draw the sweep cursor line
+    let cursor_ms = ring.latest_time_ms();
 
-    let traces: Vec<ChannelTrace> = if needs_full_pipeline {
-        collect_lines_filtered(
-            history,
-            latest,
-            settings,
-            filters,
-            visible,
-            total_channels,
-            block.sample_rate,
-            x_left,
-            x_right,
-            gain,
-        )
-    } else {
-        collect_lines_fast(
-            history,
-            latest,
-            settings,
-            visible,
-            total_channels,
-            block.sample_rate,
-            x_left,
-            x_right,
-            gain,
-        )
-    };
+    // Collect display data from the pre-computed ring buffer.
+    // Data is already filtered (ring is fed from the filtered pipeline).
+    let traces = collect_from_ring(
+        ring, settings, filters, start_ch, visible,
+        block.sample_rate, x_left, x_right, gain, ch_spacing,
+    );
 
     // Y axis bounds
-    let y_min = -(visible as f64) * CHANNEL_SPACING + CHANNEL_SPACING * 0.5;
-    let y_max = CHANNEL_SPACING * 0.5;
+    let y_min = -(visible as f64) * ch_spacing + ch_spacing * 0.5;
+    let y_max = ch_spacing * 0.5;
 
-    // Channel label formatter for Y-axis
+    // Channel label formatter for Y-axis.
+    // Y = -(display_pos * ch_spacing), so display_pos = round(-Y / ch_spacing).
+    // Physical channel = start_ch + display_pos.
     let ch_count_for_fmt = visible;
+    let spacing_for_fmt = ch_spacing;
+    let start_ch_for_fmt = start_ch;
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
         let val = mark.value;
-        let ch_idx = (-val / CHANNEL_SPACING).round() as i64;
-        if ch_idx >= 0 && (ch_idx as usize) < ch_count_for_fmt {
-            format!("CH{}", ch_idx)
+        let disp_pos = (-val / spacing_for_fmt).round() as i64;
+        if disp_pos >= 0 && (disp_pos as usize) < ch_count_for_fmt {
+            format!("CH{}", start_ch_for_fmt + disp_pos as usize)
         } else {
             String::new()
         }
@@ -133,7 +162,11 @@ pub fn draw_waveform_area(
         }
     };
 
-    // Draw the combined plot — explicit bounds, no auto-fit (prevents Y-axis jitter)
+    // Draw the combined plot — explicit bounds, no auto-fit (prevents Y-axis jitter).
+    //
+    // show_x(false) / show_y(false): disables egui_plot's built-in coordinate
+    // readout which triggers an O(total_points) nearest-item search every hover
+    // frame.  We implement our own hover tooltip below.
     let plot = Plot::new("waveform_main")
         .height(ui.available_height())
         .width(ui.available_width())
@@ -144,12 +177,37 @@ pub fn draw_waveform_area(
         .allow_scroll(false)
         .allow_boxed_zoom(false)
         .auto_bounds(egui::Vec2b::new(false, false))
-        .show_x(true)
-        .show_y(true)
-        .x_axis_label("Time")
+        .show_x(false)
+        .show_y(false)
         .x_axis_formatter(x_formatter)
         .y_axis_formatter(y_formatter)
         .set_margin_fraction(egui::vec2(0.0, 0.01));
+
+    // Extract spike metadata BEFORE consuming traces (points will be moved into Lines).
+    // Y position is keyed on display_pos (not physical channel).
+    let spike_metas: Vec<SpikeMeta> = if filters.spike_threshold_enabled {
+        traces
+            .iter()
+            .filter_map(|t| {
+                t.sigma.map(|sigma| {
+                    let y_off = -(t.display_pos as f64) * ch_spacing;
+                    SpikeMeta {
+                        channel: t.channel,
+                        display_pos: t.display_pos,
+                        sigma,
+                        spike_count: t.spike_count,
+                        thresh_y: -filters.spike_threshold_sigma * sigma * gain + y_off,
+                    }
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Draw zero-reference lines using the painter (screen-space) to avoid
+    // creating a Line object + Vec allocation per channel.
+    // These are drawn BEFORE the plot so they appear behind traces.
 
     let response = plot.show(ui, |plot_ui| {
         // Lock to exact bounds — X from wall clock, Y from channel layout
@@ -158,29 +216,12 @@ pub fn draw_waveform_area(
             [x_right, y_max],
         ));
 
-        // Draw zero-reference lines spanning the visible window
-        if settings.show_grid {
-            for ch in 0..visible {
-                if !settings.is_channel_enabled(ch) {
-                    continue;
-                }
-                let y_off = -(ch as f64) * CHANNEL_SPACING;
-                let zero_line = Line::new(PlotPoints::from(vec![
-                    [x_left, y_off],
-                    [x_right, y_off],
-                ]))
-                .color(theme::GRID_ZERO_LINE)
-                .width(0.5)
-                .name("");
-                plot_ui.line(zero_line);
-            }
-        }
-
-        // Determine which channel the cursor is hovering over (Y → channel)
+        // Determine which channel the cursor is hovering over.
+        // Returns the PHYSICAL channel index for consistent comparison with trace.channel.
         let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
-            let ch_idx = (-pos.y / CHANNEL_SPACING).round() as i64;
-            if ch_idx >= 0 && (ch_idx as usize) < visible {
-                Some(ch_idx as usize)
+            let disp_pos = (-pos.y / ch_spacing).round() as i64;
+            if disp_pos >= 0 && (disp_pos as usize) < visible {
+                Some(start_ch + disp_pos as usize)
             } else {
                 None
             }
@@ -188,86 +229,230 @@ pub fn draw_waveform_area(
 
         // Draw spike threshold lines (negative-going) when enabled
         if filters.spike_threshold_enabled {
-            for trace in &traces {
-                if let Some(sigma) = trace.sigma {
-                    let y_off = -(trace.channel as f64) * CHANNEL_SPACING;
-                    let thresh_y =
-                        -filters.spike_threshold_sigma * sigma * gain + y_off;
-                    let line = Line::new(PlotPoints::from(vec![
-                        [x_left, thresh_y],
-                        [x_right, thresh_y],
-                    ]))
-                    .color(theme::ACCENT_RED)
-                    .width(0.8)
-                    .style(egui_plot::LineStyle::dashed_dense());
-                    plot_ui.line(line);
-                }
+            for meta in &spike_metas {
+                let line = Line::new(PlotPoints::from(vec![
+                    [x_left, meta.thresh_y],
+                    [x_right, meta.thresh_y],
+                ]))
+                .color(theme::ACCENT_RED)
+                .width(0.8)
+                .style(egui_plot::LineStyle::dashed_dense());
+                plot_ui.line(line);
             }
         }
 
-        // Draw waveform traces — highlight hovered channel
-        for trace in &traces {
+        // Draw zero-reference lines as egui_plot Lines (needed for correct
+        // plot-coordinate rendering behind traces).
+        // Use display_pos for Y-offset; check physical channel for enable/disable.
+        if settings.show_grid {
+            for disp_pos in 0..visible {
+                if !settings.is_channel_enabled(start_ch + disp_pos) {
+                    continue;
+                }
+                let y_off = -(disp_pos as f64) * ch_spacing;
+                plot_ui.line(
+                    Line::new(PlotPoints::from(vec![
+                        [x_left, y_off],
+                        [x_right, y_off],
+                    ]))
+                    .color(theme::GRID_ZERO_LINE)
+                    .width(0.5)
+                    .name(""),
+                );
+            }
+        }
+
+        // Sweep cursor — vertical line at the latest data position.
+        // This is the SpikeGLX-style "write cursor" that sweeps right.
+        if cursor_ms > x_left && cursor_ms < x_right {
+            plot_ui.line(
+                Line::new(PlotPoints::from(vec![
+                    [cursor_ms, y_min],
+                    [cursor_ms, y_max],
+                ]))
+                .color(egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80))
+                .width(1.0)
+                .name(""),
+            );
+        }
+
+        // Draw waveform traces — highlight hovered channel.
+        // Points are MOVED (not cloned) into Line to avoid per-channel alloc.
+        for trace in traces {
             let base_color = theme::channel_color(trace.channel);
             let is_hovered = hovered_ch == Some(trace.channel);
-            let (color, width) = if is_hovered {
-                (egui::Color32::WHITE, 1.8)
-            } else if hovered_ch.is_some() {
-                // Dim non-hovered channels when something is hovered
-                (dim_color(base_color, 0.45), 1.0)
+            // Default: all channels always at full brightness (1.3× base color).
+            // Hover highlight mode (settings.hover_highlight) must be ON for
+            // dimming to activate — matches professional tool conventions where
+            // the waveform display is always fully lit until user requests focus.
+            let (color, width) = if settings.hover_highlight && is_hovered {
+                (egui::Color32::WHITE, 2.0)
+            } else if settings.hover_highlight && hovered_ch.is_some() {
+                (dim_color(base_color, 0.35), 1.0)
             } else {
-                (base_color, 1.2)
+                (brighten_color(base_color, 1.3), 1.5)
             };
-            let line = Line::new(PlotPoints::from(trace.points.clone()))
-                .color(color)
-                .width(width)
-                .name(format!("CH{}", trace.channel));
-            plot_ui.line(line);
+            plot_ui.line(
+                Line::new(PlotPoints::from(trace.points))
+                    .color(color)
+                    .width(width)
+                    .name(""),
+            );
         }
 
         hovered_ch
     });
 
-    // Spike-count badges on the right edge of each lane (overlay painted in screen space)
+    // Spike-count badges on the right edge of each lane (overlay painted in screen space).
+    // Y position uses display_pos, not physical channel.
     if filters.spike_threshold_enabled {
         let painter = ui.painter();
-        for trace in &traces {
-            if trace.spike_count == 0 {
+        for meta in &spike_metas {
+            if meta.spike_count == 0 {
                 continue;
             }
-            let y_lane = -(trace.channel as f64) * CHANNEL_SPACING;
+            let y_lane = -(meta.display_pos as f64) * ch_spacing;
             let plot_pos = egui_plot::PlotPoint::new(x_right, y_lane);
             let screen_pos = response.transform.position_from_point(&plot_pos);
             let badge_pos = screen_pos + egui::vec2(-6.0, -1.0);
             painter.text(
                 badge_pos,
                 egui::Align2::RIGHT_CENTER,
-                format!("{}", trace.spike_count),
+                format!("{}", meta.spike_count),
                 egui::FontId::monospace(10.0),
                 theme::ACCENT_RED,
             );
         }
     }
 
-    // Tooltip with the hovered channel + time
+    // Hover info overlay — drawn in the top-left corner of the plot so it
+    // never covers the waveform under the cursor.
     if response.response.hovered()
         && let Some(hovered_ch) = response.inner
-            && let Some(ptr_pos) = response.response.hover_pos() {
-                let time_at_cursor = response.transform.value_from_position(ptr_pos).x;
-                let tip = format_time_tooltip(hovered_ch, time_at_cursor);
-                egui::containers::popup::show_tooltip_at_pointer(
-                    ui.ctx(),
-                    ui.layer_id(),
-                    egui::Id::new("waveform_hover_tooltip"),
-                    |ui| {
-                        ui.label(
-                            egui::RichText::new(tip)
-                                .monospace()
-                                .size(11.0)
-                                .color(theme::TEXT_PRIMARY),
-                        );
-                    },
-                );
-            }
+            && let Some(ptr_pos) = response.response.hover_pos()
+    {
+        let plot_val = response.transform.value_from_position(ptr_pos);
+        let time_at_cursor = plot_val.x;
+
+        // Reverse the gain/offset transform to recover amplitude in µV.
+        // finalize_channel applies: y_plot = value_norm * gain + y_offset
+        // where y_offset = -(ch * ch_spacing).
+        // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
+        // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
+        // hovered_ch is the physical channel; display_pos = physical_ch - start_ch.
+        let disp_pos = hovered_ch.saturating_sub(start_ch);
+        let y_baseline = -(disp_pos as f64) * ch_spacing;
+        let delta_y = plot_val.y - y_baseline;
+        let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
+        let amp_str = if amp_uv.abs() >= 1000.0 {
+            format!("{:+.2} mV", amp_uv / 1000.0)
+        } else {
+            format!("{:+.1} µV", amp_uv)
+        };
+
+        let tip = format!("{}  {}",
+            format_time_tooltip(hovered_ch, time_at_cursor),
+            amp_str);
+        let plot_rect = response.response.rect;
+        let painter = ui.painter();
+        let text_pos = plot_rect.left_top() + egui::vec2(10.0, 8.0);
+        // Background pill
+        let font = egui::FontId::monospace(11.0);
+        let galley = painter.layout_no_wrap(tip.clone(), font.clone(), theme::TEXT_PRIMARY);
+        let bg_rect = egui::Rect::from_min_size(
+            text_pos - egui::vec2(4.0, 2.0),
+            galley.size() + egui::vec2(8.0, 4.0),
+        );
+        painter.rect_filled(
+            bg_rect,
+            egui::CornerRadius::same(3),
+            egui::Color32::from_rgba_premultiplied(18, 18, 24, 210),
+        );
+        painter.text(
+            text_pos,
+            egui::Align2::LEFT_TOP,
+            tip,
+            font,
+            theme::TEXT_PRIMARY,
+        );
+    }
+
+    // Voltage scale bar — small vertical reference on the bottom-right
+    draw_scale_bar(ui, &response, amp_scale, ch_spacing);
+}
+
+/// Draw a voltage scale bar in the bottom-right corner of the plot.
+/// The bar height corresponds to the amplitude scale setting (µV).
+fn draw_scale_bar(
+    ui: &egui::Ui,
+    response: &egui_plot::PlotResponse<Option<usize>>,
+    amp_scale_uv: f64,
+    _ch_spacing: f64,
+) {
+    let painter = ui.painter();
+    let plot_rect = response.response.rect;
+
+    // The scale bar shows the amp_scale setting as a visual reference.
+    // gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000 / amp_scale).
+    // A normalized amplitude of amp_scale/1000 (the "unit" signal) maps to:
+    //   (amp_scale/1000) * gain = DEFAULT_CHANNEL_SPACING * 3.0 Y-units.
+    // So the bar representing amp_scale µV has height DEFAULT_CHANNEL_SPACING * 3.0.
+    // That's the entire lane (too tall). Instead show amp_scale/3 µV (1/3 lane):
+    let bar_y_units = DEFAULT_CHANNEL_SPACING;
+    let bar_voltage_uv = amp_scale_uv / 3.0;
+
+    // Convert bar height from plot Y-units to screen pixels using the transform
+    let top_point = egui_plot::PlotPoint::new(0.0, 0.0);
+    let bot_point = egui_plot::PlotPoint::new(0.0, -bar_y_units);
+    let top_screen = response.transform.position_from_point(&top_point);
+    let bot_screen = response.transform.position_from_point(&bot_point);
+    let bar_height_px = (bot_screen.y - top_screen.y).abs();
+
+    // Only draw if bar is tall enough to be visible (at least 8 px)
+    if bar_height_px < 8.0 {
+        return;
+    }
+
+    // Position: bottom-right corner with some margin
+    let margin = 16.0;
+    let bar_x = plot_rect.right() - margin;
+    let bar_bottom = plot_rect.bottom() - margin - 12.0; // leave room for label
+    let bar_top = bar_bottom - bar_height_px;
+
+    // Draw the vertical bar with small horizontal ticks at top and bottom
+    let bar_color = theme::TEXT_SECONDARY;
+    let stroke = egui::Stroke::new(1.5, bar_color);
+    let tick_w = 4.0;
+
+    // Vertical line
+    painter.line_segment(
+        [egui::pos2(bar_x, bar_top), egui::pos2(bar_x, bar_bottom)],
+        stroke,
+    );
+    // Top tick
+    painter.line_segment(
+        [egui::pos2(bar_x - tick_w, bar_top), egui::pos2(bar_x + tick_w, bar_top)],
+        stroke,
+    );
+    // Bottom tick
+    painter.line_segment(
+        [egui::pos2(bar_x - tick_w, bar_bottom), egui::pos2(bar_x + tick_w, bar_bottom)],
+        stroke,
+    );
+
+    // Label — format µV nicely (bar represents 1/3 of amp_scale)
+    let label = if bar_voltage_uv >= 1000.0 {
+        format!("{:.0} mV", bar_voltage_uv / 1000.0)
+    } else {
+        format!("{:.0} µV", bar_voltage_uv)
+    };
+    painter.text(
+        egui::pos2(bar_x, bar_bottom + 4.0),
+        egui::Align2::CENTER_TOP,
+        label,
+        egui::FontId::monospace(10.0),
+        bar_color,
+    );
 }
 
 fn format_time_tooltip(ch: usize, time_ms: f64) -> String {
@@ -286,273 +471,113 @@ fn dim_color(c: egui::Color32, factor: f32) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
-// ── Data collection ─────────────────────────────────────────────────
-
-/// **Fast path** — used when no filter / CAR / spike-detection is enabled.
-///
-/// Per-channel anchored decimation: the same physical samples are picked
-/// each frame, so the visible trace is rock-solid even as the viewport
-/// slides.  Per-channel DC mean is removed at the end.
-#[allow(clippy::too_many_arguments)]
-fn collect_lines_fast(
-    history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
-    settings: &DisplaySettings,
-    visible: usize,
-    channel_count: usize,
-    sample_rate: f64,
-    t_left_ms: f64,
-    t_right_ms: f64,
-    gain: f64,
-) -> Vec<ChannelTrace> {
-    let ms_per_sample = if sample_rate > 0.0 {
-        1000.0 / sample_rate
-    } else {
-        1.0
-    };
-    let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
-
-    let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
-    for ch in 0..visible {
-        if !settings.is_channel_enabled(ch) {
-            continue;
-        }
-        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for block in history.iter().chain(latest) {
-            if block.channel_count != channel_count {
-                continue;
-            }
-            let spc = block.samples_per_channel;
-            let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-            let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-            if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
-                continue;
-            }
-            for s in 0..spc {
-                let abs_idx = block.timestamp_start + s as u64;
-                if stride > 1 && !abs_idx.is_multiple_of(stride) {
-                    continue;
-                }
-                let time_ms = abs_idx as f64 * ms_per_sample;
-                if time_ms < t_left_ms || time_ms > t_right_ms {
-                    continue;
-                }
-                let data_idx = s * channel_count + ch;
-                let value = if data_idx < block.data.len() {
-                    block.data[data_idx] as f64 / i16::MAX as f64
-                } else {
-                    0.0
-                };
-                pts.push([time_ms, value]);
-            }
-        }
-        finalize_channel(&mut pts, ch, gain);
-        traces.push(ChannelTrace {
-            channel: ch,
-            points: pts,
-            sigma: None,
-            spike_count: 0,
-        });
-    }
-    traces
+/// Brighten a color by `factor` (1.0 = unchanged, >1.0 = brighter), clamped to 255.
+fn brighten_color(c: egui::Color32, factor: f32) -> egui::Color32 {
+    let r = (c.r() as f32 * factor).min(255.0) as u8;
+    let g = (c.g() as f32 * factor).min(255.0) as u8;
+    let b = (c.b() as f32 * factor).min(255.0) as u8;
+    egui::Color32::from_rgb(r, g, b)
 }
 
-/// **Full pipeline** — used when any HP/LP/Notch/CAR is enabled.
+// ── Data collection ─────────────────────────────────────────────────
+
+/// Collect display traces from the pre-computed `DisplayRing`.
 ///
-/// Collects every raw sample within the visible window for every channel
-/// (no decimation yet), optionally subtracts the common-average reference
-/// at each time index, runs each channel through its own biquad chain in
-/// sample order to maintain phase coherence, then anchored-decimates the
-/// filtered result for rendering.
-#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-fn collect_lines_filtered(
-    history: &VecDeque<SampleBlock>,
-    latest: Option<&SampleBlock>,
+/// **O(output_points) per channel** — no block-history iteration, no binary
+/// search, no per-sample timestamp comparison.  The ring stores pre-decimated
+/// f32 values already filtered by the incremental pipeline.
+///
+/// Secondary stride is fixed for the full sweep window so the decimation
+/// level stays constant as data fills in during a sweep.
+///
+/// Spike detection (sigma + threshold crossings) runs inline when enabled.
+#[allow(clippy::too_many_arguments)]
+fn collect_from_ring(
+    ring: &DisplayRing,
     settings: &DisplaySettings,
     filters: &FilterSettings,
+    start_ch: usize,
     visible: usize,
-    channel_count: usize,
     sample_rate: f64,
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
+    ch_spacing: f64,
 ) -> Vec<ChannelTrace> {
-    let ms_per_sample = if sample_rate > 0.0 {
-        1000.0 / sample_rate
-    } else {
-        1.0
-    };
-    let window_samples = ((t_right_ms - t_left_ms) / ms_per_sample).ceil() as u64;
-    let stride = (window_samples / MAX_DISPLAY_POINTS as u64).max(1);
+    // Pre-compute the full-window ring-entry count for stable stride2.
+    // stride2 must be based on the *intended* window width, not the currently
+    // filled portion, otherwise stride2 grows during a sweep and early data
+    // appears progressively coarser (the "stretch/zoom" visual artifact).
+    let ms_per_ring = ring.dwnsp as f64 * 1000.0 / ring.sample_rate.max(1.0);
+    let window_ring_entries =
+        ((t_right_ms - t_left_ms) / ms_per_ring).ceil() as usize + 1;
 
-    // Build a flat per-channel buffer of (abs_idx, raw_value).  We allocate
-    // once for the maximum window length to avoid reallocation churn.
-    let cap = window_samples as usize + 1024;
-    let mut times: Vec<u64> = Vec::with_capacity(cap);
-    let mut buffers: Vec<Vec<f64>> = (0..visible).map(|_| Vec::with_capacity(cap)).collect();
-
-    let mut times_initialized = false;
-    for block in history.iter().chain(latest) {
-        if block.channel_count != channel_count {
-            continue;
-        }
-        let spc = block.samples_per_channel;
-        let block_start_ms = block.timestamp_start as f64 * ms_per_sample;
-        let block_end_ms = block_start_ms + spc as f64 * ms_per_sample;
-        if block_end_ms < t_left_ms || block_start_ms > t_right_ms {
-            continue;
-        }
-        for s in 0..spc {
-            let abs_idx = block.timestamp_start + s as u64;
-            let time_ms = abs_idx as f64 * ms_per_sample;
-            if time_ms < t_left_ms || time_ms > t_right_ms {
-                continue;
-            }
-            times.push(abs_idx);
-            for (slot, ch) in (0..visible).enumerate() {
-                let data_idx = s * channel_count + ch;
-                let v = if data_idx < block.data.len() {
-                    block.data[data_idx] as f64 / i16::MAX as f64
-                } else {
-                    0.0
-                };
-                buffers[slot].push(v);
-            }
-        }
-        times_initialized = true;
-    }
-    if !times_initialized || times.is_empty() {
-        return Vec::new();
-    }
-
-    // CAR: subtract the mean of all visible-and-enabled channels at each
-    // time index from every channel.  Common neuroscience practice for
-    // removing common-mode noise.
-    if filters.car_enabled {
-        let n = times.len();
-        for i in 0..n {
-            let mut sum = 0.0;
-            let mut count = 0;
-            for ch in 0..visible {
-                if !settings.is_channel_enabled(ch) {
-                    continue;
-                }
-                sum += buffers[ch][i];
-                count += 1;
-            }
-            if count > 0 {
-                let mean = sum / count as f64;
-                for ch in 0..visible {
-                    buffers[ch][i] -= mean;
-                }
-            }
-        }
-    }
-
-    // Apply per-channel filter chain in sample order.  Note: filter state
-    // is fresh each frame, so the leftmost ~10 ms have a small transient.
-    if filters.any_filter_enabled() {
-        for ch in 0..visible {
-            if !settings.is_channel_enabled(ch) {
-                continue;
-            }
-            let mut chain = make_chain(filters, sample_rate);
-            for v in &mut buffers[ch] {
-                *v = chain.process(*v);
-            }
-        }
-    }
-
-    // Per-channel sigma + spike detection on full-resolution filtered data.
-    // Using DC-removed RMS, then negative-going threshold crossings with a
-    // ~1 ms refractory period (32 samples at 32 kHz / 30 at 30 kHz).
-    let refractory_samples = (sample_rate * 0.001).max(1.0) as usize;
-    let mut sigmas: Vec<Option<f64>> = vec![None; visible];
-    let mut spike_counts: Vec<u32> = vec![0; visible];
-    if filters.spike_threshold_enabled {
-        for ch in 0..visible {
-            if !settings.is_channel_enabled(ch) {
-                continue;
-            }
-            let buf = &buffers[ch];
-            if buf.is_empty() {
-                continue;
-            }
-            // DC mean (we DC-remove for sigma estimation only — buf is left untouched here)
-            let mean: f64 = buf.iter().sum::<f64>() / buf.len() as f64;
-            let var: f64 =
-                buf.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / buf.len() as f64;
-            let sigma = var.sqrt();
-            sigmas[ch] = Some(sigma);
-
-            let thresh = -filters.spike_threshold_sigma * sigma;
-            let mut last_crossing: Option<usize> = None;
-            let mut prev_centered = 0.0;
-            for (i, v) in buf.iter().enumerate() {
-                let centered = v - mean;
-                if i > 0 && prev_centered >= thresh && centered < thresh
-                    && last_crossing.is_none_or(|l| i - l >= refractory_samples) {
-                        spike_counts[ch] = spike_counts[ch].saturating_add(1);
-                        last_crossing = Some(i);
-                    }
-                prev_centered = centered;
-            }
-        }
-    }
-
-    // Anchored decimation + DC removal + gain/offset, per channel.
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
-    for ch in 0..visible {
-        if !settings.is_channel_enabled(ch) {
+
+    for disp_pos in 0..visible {
+        let phys_ch = start_ch + disp_pos;
+
+        // Per-channel enable/disable is indexed by physical channel.
+        if !settings.is_channel_enabled(phys_ch) {
             continue;
         }
-        let mut pts: Vec<[f64; 2]> = Vec::with_capacity(MAX_DISPLAY_POINTS + 16);
-        for (i, &abs_idx) in times.iter().enumerate() {
-            if stride > 1 && abs_idx % stride != 0 {
-                continue;
+
+        // Read display-ready points from the ring using the PHYSICAL channel index.
+        let mut pts = ring.collect_channel(
+            phys_ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries,
+        );
+
+        // Spike detection on the pre-finalize (un-offset, un-gained) values.
+        let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
+            let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
+            let var =
+                pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
+            let sig = var.sqrt();
+            let thresh = -filters.spike_threshold_sigma * sig;
+            let refractory = (sample_rate * 0.001).max(1.0) as usize;
+            let mut count = 0u32;
+            let mut last_cross: Option<usize> = None;
+            let mut prev = 0.0_f64;
+            for (i, p) in pts.iter().enumerate() {
+                let centered = p[1] - mean;
+                if i > 0
+                    && prev >= thresh
+                    && centered < thresh
+                    && last_cross.is_none_or(|l| i - l >= refractory)
+                {
+                    count = count.saturating_add(1);
+                    last_cross = Some(i);
+                }
+                prev = centered;
             }
-            pts.push([abs_idx as f64 * ms_per_sample, buffers[ch][i]]);
-        }
-        finalize_channel(&mut pts, ch, gain);
+            (Some(sig), count)
+        } else {
+            (None, 0)
+        };
+
+        // finalize_channel applies Y-offset using DISPLAY position (not physical channel).
+        finalize_channel(&mut pts, disp_pos, gain, ch_spacing);
         traces.push(ChannelTrace {
-            channel: ch,
+            channel: phys_ch,
+            display_pos: disp_pos,
             points: pts,
-            sigma: sigmas[ch],
-            spike_count: spike_counts[ch],
+            sigma,
+            spike_count,
         });
     }
     traces
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
-fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64) {
+fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64) {
     if pts.is_empty() {
         return;
     }
     let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-    let y_offset = -(ch as f64) * CHANNEL_SPACING;
+    let y_offset = -(ch as f64) * ch_spacing;
     for p in pts.iter_mut() {
         p[1] = (p[1] - mean) * gain + y_offset;
     }
-}
-
-/// Build a fresh `FilterChain` from the user's settings.
-fn make_chain(filters: &FilterSettings, sample_rate: f64) -> FilterChain {
-    let mut c = FilterChain::passthrough();
-    if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
-        c.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-        c.hp_enabled = true;
-    }
-    if filters.lp_enabled && filters.lp_cutoff_hz < sample_rate / 2.0 {
-        c.lp = Biquad::lowpass(filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-        c.lp_enabled = true;
-    }
-    if filters.notch_enabled {
-        c.notch = Biquad::notch(filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-        c.notch_enabled = true;
-    }
-    c
 }
 
 // ── Empty state ─────────────────────────────────────────────────────

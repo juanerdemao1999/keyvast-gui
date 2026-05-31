@@ -10,7 +10,10 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.31"
 egui_plot = "0.31"
+rfd = "0.15"
 kv-buffer = { path = "../kv-buffer" }
 kv-core = { path = "../kv-core" }
+kv-recorder = { path = "../kv-recorder" }
 kv-simulator = { path = "../kv-simulator" }
 kv-types = { path = "../kv-types" }
+egui_tiles = "0.12"

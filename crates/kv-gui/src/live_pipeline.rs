@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use std::{sync::mpsc, thread};
 
@@ -84,6 +84,10 @@ pub struct LivePipelineHandle {
     pub recorder_cmd_tx: mpsc::Sender<RecorderCmd>,
     /// Cumulative preview blocks received (for BlockStats computation).
     pub total_blocks: u64,
+    /// Packet-ID based drop detection: expected next packet_id.
+    pub expected_next_packet_id: Option<u64>,
+    /// Cumulative count of detected dropped blocks (packet-ID gaps).
+    pub dropped_blocks: u64,
     /// Wall-clock start time (for elapsed-seconds in BlockStats).
     pub start_time: Instant,
     stop_flag: Arc<AtomicBool>,
@@ -114,17 +118,23 @@ impl Drop for LivePipelineHandle {
 
 // ── Constructor ──────────────────────────────────────────────────────
 
+/// Shared state: fanout buffer + condvar so the recorder wakes on new data.
+type SharedBuffer = Arc<(Mutex<FanoutBlockBuffer>, Condvar)>;
+
 /// Start the live pipeline and return a handle for the GUI to use.
 pub fn start_live_pipeline(source: PipelineSource) -> LivePipelineHandle {
     // Shared fanout buffer — recorder consumer pops from here
-    let shared = Arc::new(Mutex::new(FanoutBlockBuffer::new()));
+    let shared: SharedBuffer = Arc::new((Mutex::new(FanoutBlockBuffer::new()), Condvar::new()));
     let recorder_id = {
-        let mut buf = shared.lock().expect("buffer lock poisoned");
+        let mut buf = shared.0.lock().expect("buffer lock poisoned");
         buf.add_consumer("recorder", RECORDER_CAPACITY)
             .expect("failed to add recorder consumer")
     };
 
-    let (preview_tx, preview_rx) = mpsc::channel::<SampleBlock>();
+    // Bounded preview channel: at 30 kHz / 64 spp ≈ 469 blocks/s, 1024 slots
+    // gives ~2 s of headroom before dropping.  If the GUI can't keep up, the
+    // producer will block briefly rather than accumulating unbounded memory.
+    let (preview_tx, preview_rx) = mpsc::sync_channel::<SampleBlock>(1024);
     let (cmd_tx, cmd_rx) = mpsc::channel::<RecorderCmd>();
     let (event_tx, event_rx) = mpsc::channel::<RecorderEvent>();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -148,6 +158,8 @@ pub fn start_live_pipeline(source: PipelineSource) -> LivePipelineHandle {
         event_rx,
         recorder_cmd_tx: cmd_tx,
         total_blocks: 0,
+        expected_next_packet_id: None,
+        dropped_blocks: 0,
         start_time: Instant::now(),
         stop_flag,
         producer_thread: Some(producer_thread),
@@ -177,8 +189,8 @@ impl ActiveSource {
 
 fn producer_loop(
     source: PipelineSource,
-    shared: Arc<Mutex<FanoutBlockBuffer>>,
-    preview_tx: mpsc::Sender<SampleBlock>,
+    shared: SharedBuffer,
+    preview_tx: mpsc::SyncSender<SampleBlock>,
     event_tx: mpsc::Sender<RecorderEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -220,12 +232,23 @@ fn producer_loop(
 
         match active.read_block() {
             Ok(block) => {
-                // Send preview copy to GUI — if receiver is gone, stop.
-                if preview_tx.send(block.clone()).is_err() {
-                    break;
+                // Send preview copy to GUI.  try_send avoids blocking the
+                // producer when the GUI falls behind — dropped preview frames
+                // are acceptable, but stalling the acquisition is not.
+                // If the receiver is disconnected, stop the producer.
+                match preview_tx.try_send(block.clone()) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // GUI too slow — skip this preview frame
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
-                // Push original into shared fanout (recorder gets its slot).
-                shared.lock().expect("buffer lock poisoned").push(block);
+                // Push original into shared fanout (recorder gets its slot)
+                // and notify the recorder thread via condvar.
+                {
+                    shared.0.lock().expect("buffer lock poisoned").push(block);
+                    shared.1.notify_one();
+                }
             }
             Err(message) => {
                 // Surface the failure to the GUI, unless the user already asked
@@ -246,7 +269,7 @@ fn producer_loop(
 // ── Recorder thread ──────────────────────────────────────────────────
 
 fn recorder_loop(
-    shared: Arc<Mutex<FanoutBlockBuffer>>,
+    shared: SharedBuffer,
     recorder_id: BufferConsumerId,
     cmd_rx: mpsc::Receiver<RecorderCmd>,
     event_tx: mpsc::Sender<RecorderEvent>,
@@ -255,6 +278,8 @@ fn recorder_loop(
     // Rate-limit BufferStatus events to ~5 per second.
     let mut last_status_report = Instant::now();
     const STATUS_INTERVAL: Duration = Duration::from_millis(200);
+    // Condvar timeout — wakes periodically to check commands even if idle.
+    const CONDVAR_TIMEOUT: Duration = Duration::from_millis(50);
 
     loop {
         // Handle any pending commands.
@@ -284,12 +309,14 @@ fn recorder_loop(
         }
 
         // Drain recorder consumer — write if recording, discard otherwise.
+        let mut drained_any = false;
         loop {
             let block = {
-                let mut buf = shared.lock().expect("buffer lock poisoned");
+                let mut buf = shared.0.lock().expect("buffer lock poisoned");
                 buf.pop(recorder_id).ok().flatten()
             }; // lock released before write
             let Some(block) = block else { break };
+            drained_any = true;
 
             if let Some(ref mut rec) = recorder {
                 if let Err(e) = rec.write_block(&block) {
@@ -302,7 +329,7 @@ fn recorder_loop(
         // Send buffer occupancy to GUI at ~5 Hz.
         if last_status_report.elapsed() >= STATUS_INTERVAL {
             let occupancy = {
-                let buf = shared.lock().expect("buffer lock poisoned");
+                let buf = shared.0.lock().expect("buffer lock poisoned");
                 buf.consumer_status(recorder_id)
                     .map(|s| {
                         if s.capacity_blocks > 0 {
@@ -317,7 +344,11 @@ fn recorder_loop(
             last_status_report = Instant::now();
         }
 
-        thread::sleep(Duration::from_millis(1));
+        // Wait for new data via condvar instead of busy-polling.
+        if !drained_any {
+            let buf = shared.0.lock().expect("buffer lock poisoned");
+            let _ = shared.1.wait_timeout(buf, CONDVAR_TIMEOUT);
+        }
     }
 }
 

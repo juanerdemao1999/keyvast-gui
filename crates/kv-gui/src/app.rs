@@ -190,7 +190,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
-        self.snippet_store.reconfigure(16, 30_000.0);
+        self.snippet_store.reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -214,7 +214,8 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
-        self.snippet_store.reconfigure(16, 30_000.0);
+        // snippet_store will be reconfigured lazily on the first ingest_block()
+        // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -302,25 +303,35 @@ impl KvApp {
             .collect()
     }
 
+    /// Build a fresh Vec of filter chains from the current FilterSettings.
+    fn build_filter_chains(
+        filters: &FilterSettings,
+        sample_rate: f64,
+        channel_count: usize,
+    ) -> Vec<FilterChain> {
+        (0..channel_count)
+            .map(|_| {
+                let mut chain = FilterChain::passthrough();
+                if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
+                    chain.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                    chain.hp_enabled = true;
+                }
+                if filters.lp_enabled && filters.lp_cutoff_hz < sample_rate / 2.0 {
+                    chain.lp = Biquad::lowpass(filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                    chain.lp_enabled = true;
+                }
+                if filters.notch_enabled {
+                    chain.notch = Biquad::notch(filters.notch_freq_hz(), sample_rate, Q_NOTCH);
+                    chain.notch_enabled = true;
+                }
+                chain
+            })
+            .collect()
+    }
+
     /// Rebuild filter chains from the current FilterSettings.
     fn rebuild_filter_chains(&mut self, sample_rate: f64, channel_count: usize) {
-        self.filter_chains.clear();
-        for _ in 0..channel_count {
-            let mut chain = FilterChain::passthrough();
-            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
-                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.hp_enabled = true;
-            }
-            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
-                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.lp_enabled = true;
-            }
-            if self.filters.notch_enabled {
-                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-                chain.notch_enabled = true;
-            }
-            self.filter_chains.push(chain);
-        }
+        self.filter_chains = Self::build_filter_chains(&self.filters, sample_rate, channel_count);
         self.filter_settings_snapshot = self.filters;
         // Re-filter existing history with new chains
         self.refilter_history();
@@ -332,23 +343,7 @@ impl KvApp {
         // Rebuild chains fresh for the re-filter pass
         let sample_rate = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
         let channel_count = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-        let mut chains: Vec<FilterChain> = Vec::with_capacity(channel_count);
-        for _ in 0..channel_count {
-            let mut chain = FilterChain::passthrough();
-            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
-                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.hp_enabled = true;
-            }
-            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
-                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.lp_enabled = true;
-            }
-            if self.filters.notch_enabled {
-                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-                chain.notch_enabled = true;
-            }
-            chains.push(chain);
-        }
+        let mut chains = Self::build_filter_chains(&self.filters, sample_rate, channel_count);
         let car_enabled = self.filters.car_enabled;
         for block in self.block_history.iter() {
             let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
@@ -448,13 +443,13 @@ impl KvApp {
         // Produce filtered version using persistent chains
         let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
         let filtered = if needs_filter {
-            Self::filter_block_with_chains(&block, &mut self.filter_chains, self.filters.car_enabled)
+            Some(Self::filter_block_with_chains(&block, &mut self.filter_chains, self.filters.car_enabled))
         } else {
-            block.clone()
+            None
         };
 
         // Feed main display ring from the display-ready (filtered or raw) block.
-        self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
+        self.disp_ring.push_block(filtered.as_ref().unwrap_or(&block));
 
         // Feed fixed-filter rings (always incremental, never CAR).
         let lfp_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
@@ -489,15 +484,16 @@ impl KvApp {
             }
         }
 
-        // Store raw + filtered history for pause/browse and re-filter
-        self.block_history.push_back(block.clone());
-        self.filtered_history.push_back(filtered);
+        // Store raw + filtered history for pause/browse and re-filter.
+        // When no user filter is active, the filtered copy equals the raw block.
+        let filtered_block = filtered.unwrap_or_else(|| block.clone());
+        self.latest_block = Some(block.clone());
+        self.block_history.push_back(block);
+        self.filtered_history.push_back(filtered_block);
         while self.block_history.len() > self.history_capacity {
             self.block_history.pop_front();
             self.filtered_history.pop_front();
         }
-
-        self.latest_block = Some(block);
     }
 
     fn is_running(&self) -> bool {
@@ -653,6 +649,7 @@ impl KvApp {
                 block,
                 self.demo_blocks_generated,
                 elapsed_total,
+                0, // demo mode has no drops
             );
             self.latest_stats = Some(stats);
         }
@@ -680,6 +677,13 @@ impl KvApp {
 
             while let Ok(block) = pipeline.preview_rx.try_recv() {
                 pipeline.total_blocks += 1;
+                // Detect dropped blocks via packet-ID discontinuity
+                if let Some(expected) = pipeline.expected_next_packet_id {
+                    if block.packet_id > expected {
+                        pipeline.dropped_blocks += block.packet_id - expected;
+                    }
+                }
+                pipeline.expected_next_packet_id = Some(block.packet_id + 1);
                 preview_blocks.push(block);
             }
         } // borrow released here
@@ -726,7 +730,12 @@ impl KvApp {
         // (live_pipeline may have just been torn down by a SourceError above.)
         if let (Some(block), Some(pipeline)) = (last_block.as_ref(), self.live_pipeline.as_ref()) {
             let elapsed = pipeline.start_time.elapsed().as_secs_f64();
-            self.latest_stats = Some(compute_block_stats(block, pipeline.total_blocks, elapsed));
+            self.latest_stats = Some(compute_block_stats(
+                block,
+                pipeline.total_blocks,
+                elapsed,
+                pipeline.dropped_blocks,
+            ));
         }
     }
 

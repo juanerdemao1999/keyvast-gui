@@ -799,6 +799,18 @@ impl StreamingRecorder {
             return empty_recording_metadata_json();
         };
 
+        // Infer backend from device_id: "demo-*" → demo, "rhd-*" → rhd-hardware,
+        // "simulator-*" → simulator.  Falls back to the raw device_id prefix.
+        let backend = if device_id.starts_with("demo") {
+            "demo"
+        } else if device_id.starts_with("rhd") {
+            "rhd-hardware"
+        } else if device_id.starts_with("simulator") {
+            "simulator"
+        } else {
+            device_id.split('-').next().unwrap_or("unknown")
+        };
+
         format!(
             concat!(
                 "{{\n",
@@ -806,7 +818,7 @@ impl StreamingRecorder {
                 "  \"format_version\": 2,\n",
                 "  \"data_offset_bytes\": {},\n",
                 "  \"device_id\": \"{}\",\n",
-                "  \"backend\": \"simulator\",\n",
+                "  \"backend\": \"{}\",\n",
                 "  \"sample_rate\": {},\n",
                 "  \"channel_count\": {},\n",
                 "  \"samples_per_channel\": {},\n",
@@ -822,6 +834,7 @@ impl StreamingRecorder {
             ),
             KVRAW_DATA_OFFSET,
             escape_json_string(device_id),
+            escape_json_string(backend),
             format_sample_rate(self.sample_rate.unwrap_or(0.0)),
             self.channel_count.unwrap_or(0),
             self.samples_per_packet.unwrap_or(0),

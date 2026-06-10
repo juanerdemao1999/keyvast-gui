@@ -21,8 +21,9 @@ pub const TIME_WINDOWS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0];
 /// Amplitude presets in microvolts per division (display only — raw i16 scaled).
 pub const AMP_SCALES: &[f64] = &[50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0];
 
-/// Max channels we support toggling for.
-const MAX_CHANNEL_TOGGLES: usize = 64;
+/// Initial channel toggle capacity.  The vec grows dynamically if the device
+/// has more channels, so this is just the default pre-allocation size.
+const INITIAL_CHANNEL_TOGGLES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct DisplaySettings {
@@ -62,7 +63,7 @@ impl Default for DisplaySettings {
             overlay_mode: false,
             hover_highlight: false,
             browse_step_pct: 10.0,
-            channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
+            channel_enabled: vec![true; INITIAL_CHANNEL_TOGGLES],
             channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
         }
     }
@@ -211,14 +212,46 @@ impl Default for DeviceSettings {
 /// always pick another file, and `None` is returned when none can be located so
 /// nothing about acquisition is hard-coded.
 fn default_bitfile_path() -> Option<PathBuf> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    [
+    let bitfile_names = [
         "keyvast_combined_download.bit",
         "keyvast_260607_with_UART.bit",
         "intan_rec_controller_7310.bit",
-    ]
-    .into_iter()
-    .find_map(|name| manifest.join("../../../..").join(name).canonicalize().ok())
+    ];
+
+    // 1. Search relative to the executable (works in deployed builds).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for name in &bitfile_names {
+                let candidate = exe_dir.join(name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+
+    // 2. Search current working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        for name in &bitfile_names {
+            let candidate = cwd.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    // 3. Fallback: compile-time source tree (development only).
+    #[cfg(debug_assertions)]
+    {
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for name in &bitfile_names {
+            if let Ok(path) = manifest.join("../../../..").join(name).canonicalize() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
 }
 
 // ── Left control panel ──────────────────────────────────────────────

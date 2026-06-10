@@ -210,34 +210,47 @@ fn generate_sample(
         value += (phase * 2.3).sin() * cg.lfp_amplitude * 0.15;
     }
 
-    // 3) Spike waveform
-    if cg.spike_rate_hz > 0.0 && global_s >= cg.next_spike_sample {
-        // Biphasic spike: sharp negative then positive rebound
-        value -= cg.spike_amplitude;
+    // 3) Spike waveform — realistic 5-sample template (~0.17 ms at 30 kHz):
+    //    s+0: small onset deflection
+    //    s+1: large negative trough (action potential peak)
+    //    s+2: positive overshoot (repolarization)
+    //    s+3: after-hyperpolarization (AHP)
+    //    s+4: recovery to baseline
+    if cg.spike_rate_hz > 0.0
+        && global_s >= cg.next_spike_sample
+        && global_s < cg.next_spike_sample.saturating_add(5)
+    {
+        let spike_start = cg.next_spike_sample;
+        let offset = global_s.saturating_sub(spike_start);
+        let spike_val = match offset {
+            0 => -0.3 * cg.spike_amplitude,  // onset
+            1 => -1.0 * cg.spike_amplitude,  // negative trough
+            2 =>  0.5 * cg.spike_amplitude,  // positive overshoot
+            3 => -0.15 * cg.spike_amplitude, // AHP
+            4 =>  0.0,                        // recovery
+            _ => 0.0,
+        };
+        value += spike_val;
 
-        // Schedule next spike
-        match cg.kind {
-            ChannelType::Bursting => {
-                if cg.burst_remaining > 0 {
-                    cg.burst_remaining -= 1;
-                    cg.next_spike_sample = global_s + cg.burst_isi_samples as u64;
-                } else {
-                    let burst_size = 3 + (rng.next_u64() % 4) as u32;
-                    cg.burst_remaining = burst_size;
-                    cg.next_spike_sample = global_s + cg.burst_isi_samples as u64;
+        // Schedule next spike after the template completes
+        if offset >= 4 {
+            match cg.kind {
+                ChannelType::Bursting => {
+                    if cg.burst_remaining > 0 {
+                        cg.burst_remaining -= 1;
+                        cg.next_spike_sample = global_s + cg.burst_isi_samples as u64;
+                    } else {
+                        let burst_size = 3 + (rng.next_u64() % 4) as u32;
+                        cg.burst_remaining = burst_size;
+                        cg.next_spike_sample = global_s + cg.burst_isi_samples as u64;
+                    }
+                }
+                _ => {
+                    cg.next_spike_sample =
+                        global_s + rng.poisson_interval(cg.spike_rate_hz, sample_rate);
                 }
             }
-            _ => {
-                cg.next_spike_sample =
-                    global_s + rng.poisson_interval(cg.spike_rate_hz, sample_rate);
-            }
         }
-    } else if cg.spike_rate_hz > 0.0 && global_s == cg.next_spike_sample.wrapping_add(1) {
-        // Positive rebound (1 sample later)
-        value += cg.spike_amplitude * 0.4;
-    } else if cg.spike_rate_hz > 0.0 && global_s == cg.next_spike_sample.wrapping_add(2) {
-        // After-hyperpolarization
-        value -= cg.spike_amplitude * 0.1;
     }
 
     // 4) Slow baseline drift

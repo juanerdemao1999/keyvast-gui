@@ -40,10 +40,12 @@ pub struct BlockStats {
 /// Compute `BlockStats` from a single block.
 ///
 /// Used by Demo mode (`tick_demo`) and the live pipeline (`tick_device`).
+/// `dropped_blocks` is the number of gaps detected via packet-ID discontinuity.
 pub fn compute_block_stats(
     block: &SampleBlock,
     total_blocks: u64,
     elapsed_seconds: f64,
+    dropped_blocks: u64,
 ) -> BlockStats {
     let channel_stats = compute_channel_stats(block);
     let total_samples = total_blocks * (block.samples_per_channel * block.channel_count) as u64;
@@ -65,7 +67,7 @@ pub fn compute_block_stats(
         total_blocks,
         total_samples,
         elapsed_seconds,
-        dropped_blocks: 0,
+        dropped_blocks,
     }
 }
 

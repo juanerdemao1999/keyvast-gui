@@ -315,13 +315,51 @@ mod imp {
     }
 
     pub fn default_frontpanel_dll_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("third_party")
+        let dll_name = "okFrontPanel.dll";
+        let relative_vendor = std::path::Path::new("third_party")
             .join("opalkelly")
             .join("windows-x64")
-            .join("okFrontPanel.dll")
+            .join(dll_name);
+
+        // 1. Next to the executable (deployed builds).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let candidate = exe_dir.join(dll_name);
+                if candidate.exists() {
+                    return candidate;
+                }
+                // Also check vendor sub-path relative to exe
+                let candidate = exe_dir.join(&relative_vendor);
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+        }
+
+        // 2. Current working directory.
+        if let Ok(cwd) = std::env::current_dir() {
+            let candidate = cwd.join(dll_name);
+            if candidate.exists() {
+                return candidate;
+            }
+            let candidate = cwd.join(&relative_vendor);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
+        // 3. Fallback: compile-time source tree (development only).
+        #[cfg(debug_assertions)]
+        {
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let candidate = manifest.join("..").join("..").join(&relative_vendor);
+            if let Ok(path) = candidate.canonicalize() {
+                return path;
+            }
+        }
+
+        // Last resort: bare name, let the OS DLL search find it.
+        PathBuf::from(dll_name)
     }
 }
 

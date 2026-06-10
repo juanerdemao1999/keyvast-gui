@@ -1,0 +1,16 @@
+[package]
+name = "kv-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kv-buffer = { path = "../kv-buffer" }
+kv-integrity = { path = "../kv-integrity" }
+kv-recorder = { path = "../kv-recorder" }
+kv-types = { path = "../kv-types" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Foundation"] }
+
+[dev-dependencies]
+kv-simulator = { path = "../kv-simulator" }

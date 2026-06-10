@@ -1,0 +1,26 @@
+# Rust build output
+/target/
+
+# Local IDE and editor state
+/.idea/
+/.vscode/
+*.swp
+*.swo
+
+# Local environment files
+.env
+.env.*
+
+# Keyvast acquisition outputs
+/run-*/
+*.kvraw
+recording.json
+events.csv
+integrity.json
+benchmark.json
+log.txt
+
+# OS noise
+Thumbs.db
+Desktop.ini
+

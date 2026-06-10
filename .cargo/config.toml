@@ -1,0 +1,22 @@
+[alias]
+gui = "run --bin kv-gui --release"
+
+# Route crates.io through a China-accessible mirror to avoid download timeouts.
+# Active: TUNA (Tsinghua) — verified reachable from this machine.
+# rsproxy.cn and mirrors.ustc.edu.cn both timed out here; swap the registry
+# line below if TUNA ever becomes slow:
+#   sparse+https://rsproxy.cn/index/
+#   sparse+https://mirrors.ustc.edu.cn/crates.io-index/
+[source.crates-io]
+replace-with = "tuna-sparse"
+
+[source.tuna-sparse]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
+
+[net]
+retry = 10
+git-fetch-with-cli = true
+
+[http]
+timeout = 120
+low-speed-limit = 1

@@ -1,0 +1,700 @@
+# Development Handoff
+
+This file is the persistent handoff note for AI sessions. It should let a new model resume work without relying on previous chat context.
+
+## Handoff Rules
+
+At the start of a session:
+
+1. Read `AGENTS.md`, `README.md`, and this file.
+2. Check `git status --short`.
+3. Inspect the relevant crates or docs for the next task.
+4. Run focused verification before making risky changes.
+
+Before ending a session after meaningful work:
+
+1. Update this file.
+2. Record the latest status, verification commands, next steps, and blockers.
+3. Put confirmed product or hardware decisions in `docs/12-confirmed-decisions.md`.
+4. Put unresolved product or hardware questions in `docs/14-open-questions.md`.
+
+## Current State
+
+Last updated: 2026-06-08 (session 18 - RHD chip register config + ADC calibration)
+
+The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+
+Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 18: RHD chip register configuration + ADC calibration (flat-signal fix)
+
+**Symptom**: With the GUI on the RHD source, the board connected, data streamed
+at the true 30 kHz (115 blk/s, 1.89 MB/s, 0 drops, no errors) — but every
+channel was flat at ~0 µV. User confirmed the same bitfile + headstage produce
+real signal in the Open Ephys RHD plugin, so the gap was purely software.
+
+**Root cause**: the backend only configured the Rhythm *data plane* (sample
+rate, streams, cable delay). It never uploaded the RHD2000 *chip* register
+configuration or ran ADC self-calibration, so the amplifiers sat
+unconfigured and the ADC emitted mid-scale (offset-binary 32768 → signed 0).
+
+**Fix** (in `kv-rhd`):
+
+- New `commands.rs` — faithful port of Intan `Rhd2000RegistersUsb3`:
+  `Rhd2000Registers` (register state + defaults + sample-rate bias), DSP-cutoff
+  selection, RH1/RH2/RL bandwidth DAC solving, `register_value` bit packing,
+  16-bit MOSI command encoding (`create_rhd2000_command`), and the three
+  128-command lists (register config w/ optional calibrate, temp sensor,
+  dig-out). Verified line-by-line against the Open Ephys source.
+- `backend.rs` — new FrontPanel endpoints (CmdRam 0x05-0x07, AuxCmdBank1/2/3
+  0x08-0x0a, AuxCmdLength/Loop 0x0b/0x0c) and `upload_command_list` /
+  `select_aux_command_bank(_all_ports)` / `select_aux_command_length`.
+  `configure()` now runs `initialize_rhd_chips()`: upload AuxCmd1 (dig-out),
+  AuxCmd2 (temp), AuxCmd3 bank0 (config+calibrate) / bank1 (config) / bank2
+  (fast-settle); select calibrate bank; non-continuous 256-step run; read &
+  discard; then switch to bank1 for normal acquisition.
+- Also fixed the per-block re-trigger: `RhdHardwareBackend` now has an
+  `acquisition_started` flag and calls `start_continuous_acquisition()` once
+  on the first `read_block`, instead of re-running SPI every block.
+
+**Build**: `cargo build -p kv-rhd` and `-p kv-gui` both clean (only the 4
+pre-existing kv-gui dead-code warnings). Mirror note: builds go through the
+Tsinghua (TUNA) crates.io mirror configured in `.cargo/config.toml`.
+
+**Status**: awaiting on-hardware retest. Expectation: a few extra seconds at
+Start (register upload + ADC calibration), then real waveforms. If still flat,
+suspect MISO/cable-delay timing or a keyvast-bitfile endpoint difference, not
+the chip config.
+
+---
+
+### Session 17: RHD backend wired into GUI Device mode
+
+**Goal**: Let the GUI acquire from the real RHD / Opal Kelly board, not only the simulator.
+
+**What changed** (all in `crates/kv-gui`):
+
+- `Cargo.toml` — added `kv-rhd` path dependency.
+- `live_pipeline.rs` — new `PipelineSource` enum (`Simulator(SimulatorConfig)` | `Rhd(Box<RhdHardwareOptions>)`). `start_live_pipeline` now takes a `PipelineSource`. `producer_loop` opens the chosen backend behind an internal `ActiveSource` adapter: the simulator keeps its sleep pacing, hardware blocks inside `read_block()` (no artificial pacing). New `RecorderEvent::SourceError(String)` reports device open/read failures back to the GUI.
+- `panels.rs` — new `DeviceKind` enum + `DeviceSettings { kind, rhd_bitfile, rhd_streams }`. DEVICE panel gains a Simulator/RHD source selector, a bitfile picker (`rfd`, `.bit` filter), and a 1/2-headstage selector; all disabled while acquiring. `default_bitfile_path()` best-effort pre-fills `keyvast_260607_with_UART.bit` if found next to the workspace (returns None otherwise — nothing hard-coded into acquisition).
+- `app.rs` — `KvApp` gains `device: DeviceSettings` + `device_error`. `start_device()` builds the source via `build_pipeline_source()` (RHD requires a bitfile, otherwise a banner error and no start). `tick_device` handles `SourceError` → banner + pipeline teardown. New red dismissible device-error banner. The old `live_pipeline.as_ref().unwrap()` in `tick_device` is now a safe `if let` (a `SourceError` can drop the pipeline mid-frame).
+
+Everything downstream (fanout buffer, recorder thread, preview channel, display rings) is unchanged — the hardware-independent boundary holds, and `ingest_block` already adapts to each block's `channel_count` / `sample_rate`.
+
+**Default behaviour preserved**: Device mode still defaults to `DeviceKind::Simulator`, so the GUI runs with no hardware and there is no regression. RHD is opt-in from the DEVICE panel.
+
+**Build status**: `cargo build -p kv-gui` compiles cleanly (debug). The only new warning introduced was a stray `RHD_MIN_STREAMS` const, since removed; the remaining 4 warnings are pre-existing dead-code fields (`demo.rs`, `panels.rs`, `preview.rs`). `cargo test --workspace` not yet run.
+
+**Network note for future sessions**: crates.io is unreachable directly from this machine (curl timeouts on download). `.cargo/config.toml` now replaces `crates-io` with the Tsinghua (TUNA) sparse mirror — `rsproxy.cn` and `mirrors.ustc.edu.cn` both timed out from here, TUNA responded in ~3.5 s. If builds start failing with download timeouts again, check/rotate that mirror.
+
+**Hardware test steps**: build, run `kv-gui`, open the DEVICE panel → Source = RHD, pick `keyvast_260607_with_UART.bit`, Headstages = 2, then press Start (or Space). Watch for either live waveforms or the red device-error banner (which surfaces FrontPanel open / board-id / FIFO errors verbatim).
+
+**Backend caveats still open (in `kv-rhd`, unchanged this session — surfaced to the user, not yet fixed)**:
+
+- No RHD chip register / SPI command upload. The backend assumes the keyvast MicroBlaze firmware configures the RHD chips. UNVERIFIED — if amplifiers output nothing or garbage, this is the first suspect.
+- `read_raw_block` re-triggers `SPI_START` every block in continuous run mode (the CLI `rhd-smoke` does the same), which is suspect vs standard Rhythm semantics.
+- Synchronous poll read (`wait_for_fifo_words`, 1 s timeout); a non-blocking / continuous read may be needed if 30 kHz can't keep up.
+
+**Next**: compile + smoke-test on the hardware machine; if data is wrong, investigate the two backend caveats above.
+
+---
+
+### Session 16: RHD / Opal Kelly hardware discovery
+
+**Goal**: Understand how to connect the Keyvast GUI to the new bitfile and Open Ephys-compatible RHD acquisition path.
+
+**External reference downloaded**:
+
+```text
+D:\11111\1case\104_keyvast_gui\external\rhd-recording-controller
+```
+
+This repository contains the Open Ephys RHD Recording Controller plugin and the useful Intan Rhythm USB3 API files:
+
+```text
+Source/rhythm-api/rhd2000evalboardusb3.*
+Source/rhythm-api/rhd2000datablockusb3.*
+Source/rhythm-api/rhd2000registersusb3.*
+Source/rhythm-api/okFrontPanelDLL.h
+Resources/okFrontPanel.dll
+Resources/intan_rec_controller_7310.bit
+```
+
+**User-confirmed hardware decisions**:
+
+```text
+Opal Kelly board: XEM7310-A75
+Keyvast bitfile to use: D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit
+Windows package should bundle the FrontPanel runtime DLL where possible
+First live acquisition target: up to two 32-channel RHD headstages
+Display scaling should follow Open Ephys / Intan RHD conventions
+```
+
+**Important findings**:
+
+- `keyvast_top.sv` combines the Intan Rhythm data plane with the MicroBlaze control plane.
+- The Rhythm data plane uses FrontPanel endpoints matching the Intan/Open Ephys USB3 path.
+- Expected endpoint highlights: WireIn `0x00` reset/run, WireIn `0x03` sample clock M/D, WireIn `0x14` data stream enable, WireOut `0x20` FIFO words, WireOut `0x22` SPI running, WireOut `0x23` TTL in, WireOut `0x3e` board id, WireOut `0x3f` board version, BTPipeOut `0xA0` data.
+- Expected data frame magic: `0xd7a22aaa38132a53`.
+- Open Ephys converts amplifier words for display as `(uint16 - 32768) * 0.195`, i.e. unsigned offset-binary ADC words to microvolts. Preserve raw samples in recording unless changed later.
+
+**Recommended next implementation boundary**:
+
+Add a real hardware backend crate such as `kv-driver` or `kv-rhd` that implements the existing `kv-core::AcquisitionSource` contract and returns `SampleBlock`. Start with a CLI smoke command before wiring the GUI:
+
+```text
+kv-acq rhd-smoke --bitfile D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit --blocks 10
+```
+
+The smoke command should open the first XEM7310-A75, upload the bitfile, verify FrontPanel + board id, initialize Rhythm, enable streams for the first two 32-channel headstages, read from BTPipeOut `0xA0`, validate magic/timestamps, and write existing `kvraw` output.
+
+---
+
+### Session 15: Multi-view tile display — planning complete, implementation starting
+
+**Goal**: Replace single `CentralPanel` waveform with a draggable `egui_tiles` layout
+supporting LFP (LP 250 Hz), AP/Spike (HP 300 Hz), and Spike Overlay (threshold snippet)
+tiles alongside the existing main waveform.
+
+**Design doc**: `docs/17-multiview-plan.md`
+
+**Status**: Phase 1 starting — egui_tiles skeleton + LFP/AP rings.
+
+---
+
+### Session 14: 2-hour endurance test — MVP acceptance #11 PASSED
+
+**Goal**: Verify MVP acceptance criterion #11 — "Run a two-hour continuous acquisition test without unbounded memory growth."
+
+**Benchmark ladder results** (all presets, `--release` build):
+
+| Preset | Duration | Wall Clock | Samples Written | Missing Pkts | Memory Peak | Avg Write MB/s |
+|--------|----------|------------|-----------------|--------------|-------------|----------------|
+| smoke | 10s | 0.10s | 19.2M | 0 | 4.3 MB | 381 |
+| recorder | 10min | 4.84s | 1.15B | 0 | 9.5 MB | 476 |
+| **endurance** | **2h** | **769s** | **13.8B** | **0** | **55.8 MB** | **35.9** |
+
+**Acceptance criteria verification**:
+- ✅ No unbounded memory growth: 55.8 MB peak for 26 GB written (bounded, proportional to buffer sizing)
+- ✅ Zero missing packets (no fault injection): 0 / 3,375,000
+- ✅ Zero timestamp discontinuities
+- ✅ Zero recorder buffer drops: recorder_dropped_blocks = 0
+- ✅ Data integrity: expected_samples == written_samples == 13,824,000,000
+- ✅ Byte count: 27,648,000,000 = samples × 2 (i16)
+
+**Latency distribution (endurance)**:
+- P50: 0.015 ms, P95: 0.034 ms, P99: 0.051 ms
+- Max: 67,180 ms (single outlier — Windows file system flush on 26 GB file)
+
+**Note for real-time hardware**: The 67s max write stall won't cause data loss with the simulator (which runs faster than real-time), but real hardware at 30 kHz producing 3.84 MB/s would overflow a 5s recorder buffer during such a stall. Future mitigations: pre-allocated file, segmented writes, or deeper recorder buffer.
+
+**Baseline files saved**: `benchmarks/baselines/{smoke,recorder,endurance}-baseline.json`
+
+**Commit**: (pending)
+
+### Session 13: Sweep mode stretch fix
+
+**Problem**: After introducing sweep mode in session 12, data appeared to progressively "stretch/zoom out" as the sweep filled in.
+
+**Root cause**: `stride2 = visible_ring_entries / max_points`. At sweep start, only ~7 ring entries are visible, so stride2=1 (high resolution). By sweep end, 37,500 entries are visible, stride2=18 (coarse). Early data was re-rendered at coarser resolution each frame, making it look stretched.
+
+**Fix**: stride2 now computed from the full **window** capacity, not the currently-filled portion. For a 5s window at 30kHz: window_ring_entries = 37,500, stride2 = 18 (constant from first frame of sweep).
+
+**Commit**: `6472ddd`
+
+---
+
+### Session 12: Sweep mode display + sampling phase fix
+
+**Problems fixed**:
+1. "Twitching/flickering" when scrolling
+2. Sampling phase drift causing horizontal waveform jitter
+
+**Root causes**:
+- Continuous scroll mode changed x_left/x_right every frame → all 32k data points changed pixel positions each frame even when data was unchanged
+- `collect_channel()` ri_start varied ±1-3 ring entries per frame; stride2=18 amplified this into visible phase drift
+
+**Fix 1 — Sweep mode** (SpikeGLX / Intan RHX default):
+- `x_left = sweep_start_ms` and `x_right = x_left + window_ms` stay **fixed** within one sweep
+- A cursor line sweeps from x_left to x_right as new data arrives
+- When cursor overflows, `sweep_start_ms` advances one window and display resets (brief flash, once every 5-20s)
+- Between resets: completely stationary display — no scrolling motion at all
+
+**Fix 2 — Global alignment**: `collect_channel()` snaps `ri_start` to the global absolute-sample grid (`abs_idx % (stride2 * dwnsp) == 0`), eliminating per-frame phase jitter.
+
+**Commits**: `8c98ab3`
+
+---
+
+### Session 11: Waveform rendering overhaul (stride + O(output) collection)
+
+**Signal thickness fix**: Replaced min-max decimation with simple Nth-sample stride (SpikeGLX `draw1Analog` style). Min-max connected min and max as a line strip, causing zigzag / thick appearance. Stride emits 1 point per interval — thin consistent line at all zoom levels.
+
+**Fluidity fix**:
+- Binary search for first visible block: O(log N) vs O(N) across 10,000 history blocks per frame
+- Arithmetic sample indexing within each block: compute first stride-aligned index and step directly, never iterate samples outside the window
+- Overall: O(output_points) per channel, not O(input_samples)
+- MAX_DISPLAY_POINTS reduced from 4096 → 2000
+
+**Research basis**: Intan RHX `waveformdisplaymanager.cpp` and SpikeGLX `MGraph.cpp` source code. Both tools use 1-sample-per-display-unit rendering for normal mode; min-max / binMax is an explicit opt-in secondary mode in SpikeGLX.
+
+**Commit**: `07ee295`
+
+### Session 10: Incremental filtering + bug fixes
+
+**Problem solved**: Enabling biquad/CAR filters caused frame drops because the entire visible window (5s × 30kHz × 16ch = 2.4M filter ops) was re-processed every frame.
+
+**New architecture**:
+- `app.rs` maintains `filtered_history: VecDeque<SampleBlock>` alongside `block_history`
+- `filter_chains: Vec<FilterChain>` — persistent per-channel filter state (survives across frames)
+- Filtering happens at ingest time (`ingest_block()`) — only new blocks are processed (O(new_block) per frame)
+- When user changes filter settings, `rebuild_filter_chains()` detects the mismatch and re-filters the entire history once
+- `waveform.rs` always uses the fast path (min-max decimation only) — no per-frame filtering logic
+- Render code selects `filtered_history` or `block_history` based on whether any filter is enabled
+
+**Bug fixes in same commit**:
+- Gain/ch_spacing decoupling: gain formula now uses fixed `DEFAULT_CHANNEL_SPACING` constant (not `ch_spacing * 3.0`), so amplitude is independent of the channel spacing slider
+- Scale bar label accuracy: bar shows 1/3 lane height = amp_scale/3 µV; label now correctly reflects the actual bar voltage
+
+### Session 10 commits on `dev`
+
+- `b9b622d` — Incremental filtering architecture + scale bar accuracy fix
+
+### Session 9: GUI visual optimization (ALL COMPLETE)
+
+See `docs/16-gui-optimization-plan.md` for the full plan with acceptance criteria.
+
+All 3 rounds implemented:
+1. Min-max decimation (preserve spikes when zoomed out) -- DONE
+2. Filter warmup margin (eliminate left-edge transient) -- DONE
+3. Voltage scale bar -- DONE
+4. Dynamic channel spacing (+/- keys, slider) -- DONE
+5. Extended color palette (32 distinct colors) -- DONE
+6. Drag-to-browse when paused -- DONE
+
+### Session 9 commits on `dev`
+
+- `3a5b830` — Dynamic channel spacing: configurable via slider and +/- keys
+- `8697e23` — Expand channel palette to 32 distinct colors
+- `6c1ee6a` — Drag-to-browse history when display is paused
+
+### Session 6 changes (waveform / UX polish)
+
+- **Smooth wall-clock-driven scrolling** — viewport edges are computed from `elapsed_secs * 1000` instead of from data-derived bounds; data points keep absolute time positions from `block.timestamp_start`, so they never move once placed. Eliminated the discrete jumps caused by per-frame re-zeroing.
+- **Anchored decimation** — points are filtered by `(timestamp_start + s) % stride == 0` so the same physical samples are picked every frame regardless of where they fall in the per-frame collected vector. Eliminated the visual "flicker" that array-position decimation produced.
+- **Per-channel DC removal** — each visible channel's mean is subtracted before display so traces stay centered in their lane (industry standard).
+- **Display freeze** — `P` toggles a paused viewport while acquisition and recording continue.  Captured `paused_elapsed` keeps the X bounds locked.
+- **Mouse-wheel zoom** on the plot cycles through `TIME_WINDOWS` (1s/2s/5s/10s/20s); `[` and `]` do the same from the keyboard.
+- **Performance overlay** — `F` toggles a small panel showing FPS, frame interval (EMA), render time (EMA), and history block count.  Uses 0.9/0.1 EMA so the readout is stable.
+- **Hover highlight** — hovering over a channel draws it in white with extra width; non-hovered channels are dimmed; a tooltip shows `CHn  •  t = 12.34 ms`.
+- **Smarter time axis** — ticks render as seconds when window ≥ 2s, ms otherwise.
+- **Y-axis jitter fix** — replaced `include_y` + `.reset()` (which auto-fit each frame) with explicit `set_plot_bounds()` inside the draw closure.  Channel labels now stay still.
+- **ComboBox visibility fix** — set `weak_bg_fill` on widget styles so the Time/Amp dropdowns no longer render as white-on-white.
+
+### Quick keyboard / mouse reference
+
+| Key       | Action                                  |
+|-----------|-----------------------------------------|
+| `Space`   | Toggle acquisition                       |
+| `R`       | Toggle recording (Arm → Record → Stop)   |
+| `G`       | Toggle grid                              |
+| `P`       | Pause / resume display                   |
+| `F`       | Toggle performance overlay               |
+| `[` `]`   | Decrease / increase time window          |
+| `+` `-`   | Increase / decrease channel spacing      |
+| `1`–`9`   | Quick-set visible channels               |
+| Wheel     | Increase / decrease time window          |
+| Hover     | Highlight channel + tooltip              |
+| Drag      | Browse history (when paused)             |
+
+### Files most relevant to this session
+
+- `crates/kv-gui/src/waveform.rs` — viewport, decimation, hover highlight, filter pipeline routing, spike threshold rendering
+- `crates/kv-gui/src/app.rs` — pause state, perf metrics, scroll-wheel handling, overlays, FilterSettings wiring
+- `crates/kv-gui/src/panels.rs` — `TIME_WINDOWS`, ComboBox styling, `FilterSettings` struct + Filters UI section
+- `crates/kv-gui/src/dsp.rs` — Biquad IIR filters (HP/LP/Notch via RBJ cookbook, Direct Form II Transposed), FilterChain, 9 unit tests
+- `crates/kv-gui/src/theme.rs` — `weak_bg_fill`, `transport_button` (no `add_enabled`)
+
+### Tier-3 signal processing (added at end of session 6)
+
+- **HP / LP / Notch biquad filters** — RBJ cookbook designs at user-selected cutoffs.  Defaults: HP 300 Hz (spike band), LP 250 Hz (LFP band), Notch 50 / 60 Hz selectable.  Q = 1/√2 (Butterworth) for HP/LP, Q = 30 for Notch.
+- **Common Average Reference (CAR)** — at each time index, subtract the mean of all enabled visible channels from every channel.  Standard mu-mode noise removal in multi-channel arrays.
+- **Spike threshold + crossing count** — per-channel σ (RMS) over the visible window, threshold at `−k·σ` (default k = 4), negative-going threshold crossings counted with a 1 ms refractory period.  Threshold line drawn dashed-red across each lane; crossing count painted at the right edge of each lane.
+- **Display vs. recording**: filters are display-only; the recording stream remains raw, matching standard practice in Open Ephys / Intan RHX / Plexon.  A small caption in the FILTERS panel reminds users.
+- **Performance routing**: when no filter / CAR / spike-detection is enabled, the renderer takes the original fast path (per-channel anchored decimation, no extra allocation).  The full pipeline (collect every raw sample → CAR → biquad chain → decimate) only runs when needed.
+
+
+Implemented:
+
+- Git repository initialized in `D:\1cases\51_keyvast_gui`.
+- Rust toolchain installed and usable from normal PowerShell.
+- Microsoft Visual Studio Build Tools C++ workload installed for the Rust MSVC linker.
+- Root Rust workspace created.
+- `kv-types` crate created.
+- `kv-simulator` crate created.
+- `kv-integrity` crate created.
+- `kv-recorder` crate created.
+- `kv-core` crate created.
+- `kv-buffer` crate created.
+- `kv-cli` crate created with `kv-acq` binary.
+- Initial shared data model implemented:
+  - `DeviceBackendKind`
+  - `DeviceConfig`
+  - `SampleBlock`
+  - `SampleBlockError`
+  - `AcquisitionState`
+  - `AcquisitionEvent`
+  - `DeviceStatus`
+  - `IntegritySummary`
+- Initial contract tests added for simulator defaults and `SampleBlock` validation.
+- Initial simulator backend implemented:
+  - `SimulatorConfig`
+  - `SimulatorBackend`
+  - deterministic seed support
+  - default `SampleBlock` emission
+  - monotonic packet IDs
+  - simulator timestamp as first sample index in block
+  - deterministic packet drop by packet ID
+  - generated `i16` sample data with simple noise, low-frequency, and spike-like components
+- Initial integrity checks implemented:
+  - `check_blocks(&[SampleBlock])`
+  - `IntegrityReport`
+  - `PacketGap`
+  - `TimestampDiscontinuity`
+  - invalid block rejection before reporting
+  - packet gap detection
+  - simulator timestamp discontinuity detection
+  - expected vs written sample counts
+- Initial recorder implemented:
+  - `write_recording(output_dir, &[SampleBlock])`
+  - `write_integrity_summary(output_dir, &IntegritySummary)`
+  - `write_log_file(output_dir, &[line])`
+  - `write_events_csv(output_dir, &[AcquisitionEvent])`
+  - `write_benchmark_summary(output_dir, &BenchmarkSummary)`
+  - `BenchmarkSummary`
+  - `RecordingSummary`
+  - `RecorderError`
+  - pre-write `SampleBlock` validation
+  - consistency checks for one recording's device ID, sample rate, channel count, and samples per packet
+  - `recording.kvraw` little-endian interleaved `i16` writing
+  - minimal `recording.json` metadata writing
+  - machine-readable `integrity.json` summary writing
+  - human-readable `log.txt` writing
+  - machine-readable `events.csv` writing
+  - simulator/dev estimate `benchmark.json` writing
+  - filesystem error surfacing
+- Initial acquisition core implemented:
+  - `AcquisitionSource` trait for backend-like block readers
+  - `run_fixed_blocks(config, requested_blocks, source)`
+  - `AcquisitionRun`
+  - `AcquisitionRunSummary`
+  - `AcquisitionRunError`
+  - explicit state history for fixed runs
+  - simulator-backed fixed block acquisition test coverage
+  - backend read error path with `AcquisitionState::Error`
+  - config validation before reading blocks
+  - post-run integrity report generation
+- Initial bounded block buffer implemented:
+  - `BlockBuffer`
+  - `BufferStatus`
+  - `BufferError`
+  - FIFO pop semantics
+  - fixed-capacity overflow policy that drops the oldest block
+  - pushed and dropped block counters
+  - occupancy reporting
+- Initial fan-out block buffer implemented:
+  - `FanoutBlockBuffer`
+  - `BufferConsumerId`
+  - `FanoutBufferStatus`
+  - `ConsumerBufferStatus`
+  - named consumers such as `recorder` and `preview`
+  - independent bounded queues per consumer
+  - per-consumer pop cursors, occupancy, pushed, popped, and dropped counters
+  - late consumers start from future pushed blocks only
+  - slow preview consumers drop only their own oldest blocks without affecting recorder consumption
+  - internally shared sample blocks to avoid copying raw sample vectors for every consumer
+- Initial simulator recording command implemented:
+  - `kv-acq simulator-record --blocks N --output DIR`
+  - `kv-acq simulator-record --blocks N` defaulting to `run-YYYYMMDD-HHMMSS`
+  - optional `--drop-packet PACKET_ID` fault injection
+  - `run_simulator_recording(SimulatorRecordingOptions)`
+  - `run_directory_name_utc(SystemTime)` helper for deterministic run folder names
+  - simulator acquisition through `kv-core`
+  - recording output through `kv-recorder`
+  - `integrity.json` writing from the acquisition integrity summary
+  - `log.txt` writing with start, warning, flush, and stop lines
+  - `events.csv` writing with started, stopped, and packet_missing rows
+  - `benchmark.json` writing with simulator_estimate metrics
+  - returned acquisition, recording, and integrity summaries
+  - binary smoke test that writes `recording.kvraw`, `recording.json`, `integrity.json`, `log.txt`, `events.csv`, and `benchmark.json`
+
+- Threaded fan-out pipeline implemented:
+  - `kv-core::pipeline` module with `run_threaded_pipeline`
+  - `PipelineConfig`, `PipelineResult`, `PipelineTiming`, `PipelineError`
+  - dedicated producer thread reading from `AcquisitionSource`, pushing into `FanoutBlockBuffer`
+  - main thread draining recorder consumer into `Vec<SampleBlock>`
+  - independent preview consumer drained in the same loop (drops old blocks without blocking recorder)
+  - `Arc<Mutex<SharedState>>` + `Condvar` for thread synchronization
+  - producer error propagation via `PipelineError::ProducerFailed`
+  - wall-clock timing via `std::time::Instant`
+  - first-block latency measurement
+  - post-run integrity check on recorded blocks
+  - per-consumer final status reporting (pushed, popped, dropped)
+- Streaming recorder implemented:
+  - `StreamingRecorder::new(output_dir)` opens `.kvraw` file
+  - `write_block(&SampleBlock)` appends incrementally with per-block write latency tracking
+  - `finish()` writes `recording.json` metadata, returns `StreamingRecordingSummary` with max write latency
+  - validates device consistency across blocks (same as batch recorder)
+  - `block_count()` accessor for progress monitoring
+- Incremental integrity implemented:
+  - `IncrementalIntegrity::new()` creates empty state
+  - `push(&SampleBlock)` processes one block at a time, tracking packet gaps and timestamp discontinuities
+  - `finish()` returns `IntegrityReport` identical to batch `check_blocks` output
+  - no buffering — suitable for unbounded streaming runs
+- Streaming pipeline implemented:
+  - `run_streaming_pipeline(config, source)` in `kv-core::pipeline`
+  - `StreamingPipelineConfig` with `output_dir` field
+  - recorder consumer thread writes directly to disk via `StreamingRecorder` + `IncrementalIntegrity`
+  - returns `StreamingPipelineResult` with recording summary, integrity report, timing, per-consumer status, and `max_write_latency_us`
+- Real benchmark timing added:
+  - `kv-acq simulator-pipeline` command writes `benchmark.json` with `measurement_kind: "measured"`
+  - `kv-acq simulator-stream` command writes `benchmark.json` with `measurement_kind: "measured_streaming"`
+  - wall-clock `duration_seconds` and `average_write_mb_s` from actual elapsed time
+  - `max_buffer_occupancy` from recorder and preview consumer final status
+  - `max_write_latency_ms` from per-block streaming write latency
+  - clearly distinct from `simulator_estimate` used by old `simulator-record` command
+- Benchmark runner implemented:
+  - `kv-acq benchmark --preset smoke|recorder|stress-128|stress-256|endurance`
+  - `kv-acq benchmark --duration SECONDS [--channels N] [--sample-rate F] [--samples-per-packet N]`
+  - `blocks_for_duration(seconds, sample_rate, samples_per_packet)` computes block count from target duration
+  - preset durations: smoke=10s, recorder=600s, stress-128=600s, stress-256=600s, endurance=7200s
+  - stress-128 and stress-256 presets override channel count to 128 and 256 respectively
+  - uses streaming pipeline under the hood for memory-efficient long runs
+  - returns `BenchmarkResult` with computed block count and requested duration
+- CLI extended:
+  - `kv-acq simulator-pipeline --blocks N [--output DIR] [--drop-packet ID] [--recorder-capacity N] [--preview-capacity N]`
+  - `kv-acq simulator-stream --blocks N [--output DIR] [--drop-packet ID] [--recorder-capacity N] [--preview-capacity N]`
+  - `kv-acq benchmark --preset NAME | --duration SECONDS [--channels N] [--sample-rate F] [--output DIR]`
+  - `CommandResult` enum for unified command dispatch with Record, Pipeline, Stream, and Benchmark variants
+  - default recorder capacity: 2048 blocks, preview: 32 blocks
+  - binary smoke tests for all four commands
+
+- kv-gui professional interface implemented (v0.2.0, refactored session 5):
+  - `kv-gui` crate with egui/eframe + egui_plot 0.31
+  - Professional dark theme (Intan RHX / Open Ephys style) in `theme.rs`
+    - 16-color channel palette, transport button colors, toolbar background
+    - `transport_button()` reusable widget, `format_clock()` helper
+  - Demo mode with realistic neural signal generator (`demo.rs`):
+    - 8 channel archetypes: Quiet, LFP, Spiking, Bursting, Noisy
+    - Poisson-timed spike waveforms, LFP theta/gamma oscillations, pink noise, burst mode
+    - Per-channel phase variation and amplitude randomization
+    - Auto-starts on launch, generates blocks at real-time cadence
+  - Single-plot multi-channel waveform display (`waveform.rs`, rewritten session 5):
+    - **Single `egui_plot::Plot` with all channels as stacked waterfall traces**
+      (replaces N separate Plot widgets — much faster, professional look)
+    - Per-channel vertical offset with Y-axis channel labels
+    - Per-channel coloring from 16-color palette
+    - Zero-reference lines for each channel baseline
+    - Horizontal pan/zoom on time axis
+    - Automatic downsampling (MAX_DISPLAY_SAMPLES=4096)
+  - Professional toolbar layout (`app.rs`, rewritten session 5):
+    - Prominent Start/Stop and Record transport buttons with color states
+    - Real-time acquisition clock (yellow=acquiring, red=recording)
+    - Mode selector (Demo/Device)
+  - Collapsible sidebar (`panels.rs`, rewritten session 5):
+    - DEVICE: connection status, device info (CollapsingHeader)
+    - ACQUISITION: transport controls with status indicator
+    - DISPLAY: channel count slider, time/amplitude ComboBox, grid/label toggles
+    - CHANNELS: per-channel enable/disable checkboxes with colored bars, All/None toggle
+    - RECORDING: arm/record/stop workflow with directory selector
+  - Status bar: ACQ/IDLE, recording state, clock, device info, data rate, block rate, drops
+  - Keyboard shortcuts: Space=start/stop, R=record cycle, G=grid, 1-9=quick channel count
+  - Device mode connects to SimulatorBackend via background thread (`preview.rs`)
+  - History ring buffer (128 blocks) for scrolling waveform display
+  - Real-time BlockStats computation (per-channel RMS/peak-to-peak, data rate, block rate)
+
+- Latency distribution implemented:
+  - `LatencyDistribution` struct in kv-recorder with count, min, max, mean, p50, p95, p99 (all in microseconds)
+  - `LatencyDistribution::from_samples(&[u64])` computes distribution from raw samples
+  - `StreamingRecordingSummary` carries `latency_distribution: Option<LatencyDistribution>`
+  - `StreamingPipelineResult` carries `latency_distribution: Option<LatencyDistribution>`
+  - `BenchmarkSummary` extended with `p50_write_latency_ms`, `p95_write_latency_ms`, `p99_write_latency_ms`
+  - `benchmark.json` output includes all three percentile fields
+
+- CPU/memory monitoring implemented:
+  - `kv-core::process_metrics` module
+  - `ProcessMetricsCollector::start()` / `finish(wall_clock_seconds)` pattern
+  - On Windows: uses `GetProcessTimes` for CPU%, `GetProcessMemoryInfo` for peak working set
+  - On non-Windows: returns `None` (graceful degradation)
+  - `BenchmarkSummary.cpu_percent_avg` and `memory_mb_max` populated during benchmark runs
+  - `windows-sys` v0.59 added as a `cfg(windows)` dependency in kv-core
+
+### Session 17: RHD / Opal Kelly Bring-Up Start
+
+Implemented first RHD hardware integration layer:
+
+- New crate: `crates/kv-rhd`
+  - Rhythm USB3 constants and block-size helpers
+  - Rhythm raw USB frame parser into existing `SampleBlock`
+  - RHD offset-binary ADC conversion: `u16 - 32768` into signed `i16`
+  - Display scale helper: `0.195 uV/count`, matching Open Ephys / Intan RHD convention
+  - Windows FrontPanel runtime loader using bundled `okFrontPanel.dll`
+  - RHD command RAM generation for AuxCmd1/AuxCmd2/AuxCmd3
+  - FrontPanel board path: configure bitfile, verify board id 700, set 30 kHz data clock, set MISO delay, enable 1-2 streams, upload command RAM, run ADC calibration, then read BTPipeOut `0xA0`
+
+- New bundled runtime asset:
+  - `third_party/opalkelly/windows-x64/okFrontPanel.dll`
+  - Copied from downloaded Open Ephys RHD plugin resources for local packaging convenience.
+
+- New CLI command:
+  - `kv-acq rhd-smoke`
+  - Hardware mode: downloads `D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit` by default and reads Rhythm USB blocks.
+  - Offline mode: `kv-acq rhd-smoke --raw-input capture.bin` parses raw Rhythm USB bytes and writes normal `recording.kvraw`, `integrity.json`, `events.csv`, `log.txt`, and `benchmark.json`.
+
+- Build/network follow-up:
+  - `kv-gui` now disables `eframe` default features and uses the `glow` renderer only, avoiding the unnecessary `egui-wgpu` dependency for the current Windows GUI.
+  - `.cargo/config.toml` and `gui.bat` now set sparse registry protocol plus longer Cargo HTTP retry/timeout settings for slow crates.io downloads.
+
+Current limitations:
+
+- Not yet verified on a live XEM7310-A75 in this environment.
+- Physical channel ordering still needs confirmation against the actual two-headstage wiring.
+- The first implementation assumes Rhythm default stream mapping: stream 0 then stream 1, each with 32 channels.
+
+Why Open Ephys does more setup:
+
+- The bitfile exposes the USB data transport, FIFO, timing, and SPI scheduler.
+- The RHD headstage chips still need register writes over SPI for bandwidth, DSP offset removal, amplifier power-up, aux inputs, fast settle, and ADC calibration.
+- Open Ephys therefore uploads command lists into FPGA command RAM, selects command banks per SPI port, runs a short non-continuous calibration pass, then switches to the no-calibration bank for normal acquisition.
+
+Not yet implemented:
+
+- Live-board validation and final physical channel-map confirmation
+- `kv-daemon`
+
+## Current Defaults In Use
+
+These are recommended defaults from `docs/14-open-questions.md`; they are not final hardware decisions.
+
+- Simulator device ID: `simulator-0`
+- Channels: `64`
+- Sample rate: `30000.0`
+- Sample type: `i16`
+- Samples per packet: `64`
+- TTL lines: `16`
+- Layout: `interleaved_by_sample`
+- Simulator timestamp meaning: first sample index in the block
+- Recording folder format: `run-YYYYMMDD-HHMMSS`
+- Recommended CLI binary name: `kv-acq`
+
+## Last Verification
+
+Last verified: 2026-06-08 (session 17 partial, Rust toolchain unavailable)
+
+Verification attempted:
+
+```powershell
+cargo test -p kv-rhd
+cargo test -p kv-cli rhd_smoke_raw_input_writes_rhd_backend_metadata
+cmd /c where cargo
+cmd /c where rustc
+```
+
+Result:
+
+```text
+cargo and rustc were not found in the current PowerShell PATH.
+Common install locations such as %USERPROFILE%\.cargo\bin and C:\Program Files were also checked without finding cargo.exe.
+```
+
+The RHD code, command RAM initialization, CLI path, and offline raw-input smoke test were added, but Rust tests could not be executed in this environment until the Rust toolchain is installed or available on PATH.
+
+Previous full benchmark verification: 2026-05-27 (session 14)
+
+Commands run successfully:
+
+```powershell
+cargo build --release --bin kv-acq
+kv-acq benchmark --preset smoke    # 0 missing, 4.3 MB mem
+kv-acq benchmark --preset recorder # 0 missing, 9.5 MB mem
+kv-acq benchmark --preset endurance # 0 missing, 55.8 MB mem, 26 GB written
+```
+
+All benchmark presets pass with zero data loss. The full 2-hour endurance test completes MVP acceptance criterion #11.
+
+Current test count:
+
+```text
+8 passing tests in kv-buffer
+19 passing tests in kv-cli (6 record + 3 pipeline + 3 stream + 7 benchmark)
+15 passing tests in kv-core (4 acquisition + 10 pipeline + 1 process_metrics)
+4 passing tests in kv-types
+5 passing tests in kv-simulator
+10 passing tests in kv-integrity (6 batch + 4 incremental)
+14 passing tests in kv-recorder (9 batch + 4 streaming + 1 latency distribution)
+9 passing tests in kv-gui::dsp (Biquad / FilterChain frequency response)
+84 total passing tests
+```
+
+## How To Resume
+
+The full benchmark pipeline is complete (all 12 MVP acceptance criteria met including 2h
+endurance).  The GUI dev branch includes recording health monitoring (clock, buffer
+water-mark, error banner) and a live pipeline connecting GUI display to the same data
+source as the recorder.
+
+**Active work: multi-view tile display** — see `docs/17-multiview-plan.md` for the full
+design.  Implementation is in Phase 1.
+
+### Phase 1 checklist (current)
+
+- [ ] Verify `egui_tiles 0.10` + `eframe 0.31` compile compatibility
+- [ ] Add `egui_tiles` to `kv-gui/Cargo.toml`
+- [ ] Add `disp_ring_lfp`, `disp_ring_ap`, `filter_chains_lfp`, `filter_chains_ap` to `KvApp`
+- [ ] Update `ingest_block()` to push to all three rings
+- [ ] New `multiview.rs`: `TileKind` enum + `KvTileBehavior : egui_tiles::Behavior`
+- [ ] Replace `CentralPanel` render block with `tile_tree.ui(...)`
+- [ ] Startup tree: single `MainWaveform` node
+- [ ] "+ Add View" dropdown: insert LFP / AP / Spike Overlay tiles
+- [ ] Per-tile channel scroll (mouse wheel adjusts `start_ch`)
+- [ ] `cargo test --workspace` all pass
+
+### Remaining backlog (after multi-view)
+
+1. **Experiment metadata** — animal ID, session, probe type, brain region → `recording.json`
+2. **per-channel RMS** in CHANNELS panel (code exists, never shown)
+3. **TTL digital track overlay**
+4. **Config persistence** — filter/display settings survive restart
+5. **kv-daemon** — background acquisition service
+6. **kv inspect / kv replay** CLI commands
+
+Recommended implementation boundary:
+
+```text
+kv-simulator -> produces SampleBlock
+kv-integrity -> checks SampleBlock continuity and sample counts (batch or incremental)
+kv-recorder -> writes validated SampleBlock data to kvraw plus metadata (batch or streaming)
+kv-core -> orchestrates acquisition: run_fixed_blocks, run_threaded_pipeline, or run_streaming_pipeline
+kv-buffer -> bounded FIFO + fan-out buffering with per-consumer overflow counters
+kv-rhd -> Rhythm USB3 parser + Opal Kelly FrontPanel hardware smoke backend
+kv-cli -> thin developer commands: simulator-record, simulator-pipeline, simulator-stream, benchmark, rhd-smoke
+```
+
+Keep real hardware details behind `kv-rhd` / backend boundaries. Do not let GUI panels parse FrontPanel packets directly.
+
+## Open Decisions To Ask Eventually
+
+These do not block the next core step:
+
+1. Final CLI binary name: `kv-acq`, `kv`, or `keyvast-acq`.
+2. Whether `64 samples per channel per packet` is acceptable long term.
+3. Whether TTL should remain `SampleBlock.ttl_bits` plus timestamped events.
+4. Recorder buffer defaults: 5 seconds for recorder, 1 second for GUI preview.
+5. Recording folder format: `run-YYYYMMDD-HHMMSS`.
+
+## Notes For Future Agents
+
+- Keep hardware independence strict.
+- Prefer small TDD steps.
+- Update this handoff before stopping.
+- If chat context gets large, summarize the current phase here before compacting or switching models.

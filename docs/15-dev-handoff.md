@@ -20,11 +20,88 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-08 (session 18 - RHD chip register config + ADC calibration)
+Last updated: 2026-06-10 (session 20 — Open Ephys RHD plugin alignment)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 20: Comprehensive Open Ephys RHD plugin alignment (11 fixes)
+
+**Goal**: Deep code-level comparison of keyvast-gui against Open Ephys rhythm-plugins
+to find and fix all remaining issues and gaps.
+
+**PR #3** (`devin/1781107079-openephys-alignment` → `v2.0`):
+https://github.com/juanerdemao1999/keyvast-gui/pull/3
+
+Includes PR#2 cherry-pick plus 11 new fixes/improvements.
+
+**Critical fixes:**
+
+1. **Reverted Reg 3/6 writes in AuxCmd3** — PR#2 incorrectly added `reg_write(3)`
+   and `reg_write(6)` to `create_command_list_register_config`. Open Ephys
+   intentionally skips these (Reg 3 = temp sensor / dig out via AuxCmd1/2;
+   Reg 6 = impedance DAC). AuxCmd3 would overwrite AuxCmd2's temp sensor bits.
+
+2. **Added `set_data_source()` stream→port MUX** — `WireInDataStreamSel1234`
+   (0x12) / `WireInDataStreamSel5678` (0x13) now explicitly configured.
+   Previously relied on FPGA power-on defaults.
+
+3. **Split `setMaxTimeStep` into LSB (0x01) + MSB (0x02)** — was writing full
+   32-bit to single WireIn.
+
+**FIFO / USB3:**
+
+4. `flush_fifo()` now sets USB3 throttle override bit (WireInResetRun bit 16),
+   uses 256 KB bulk reads, then smaller aligned reads, and clears override.
+
+**Parser improvements:**
+
+5. Auxiliary data (temp, VDD, aux ADC) parsed into `SampleBlock::aux_data`
+6. Board ADC (8 ch) parsed into `SampleBlock::board_adc_data`
+7. Per-sample TTL in/out tracked (`ttl_in_per_sample`, `ttl_out_per_sample`)
+8. `SampleBlock` extended with optional fields; all constructors backward-compat
+
+**New capabilities:**
+
+9. `set_cable_delay_port()` for per-port MISO delay
+10. `set_sample_rate(f64)` with all 18 Open Ephys PLL M/D pairs (1kHz–30kHz)
+11. `RhdChipType` enum for RHD2132/2216/2164 identification
+
+**Stubs added:** impedance testing, DAC threshold, LED control, external fast settle.
+
+**Build**: `cargo check -p kv-rhd` + `-p kv-gui --target x86_64-pc-windows-msvc`
+clean. All 89 tests pass (workspace minus kv-gui).
+
+**What was NOT changed (verified correct):** frame header magic validation, timestamp
+continuity, ADC conversion (offset-binary → signed), PLL M/D for 30kHz, DSP cutoff
+frequency selection, bandwidth register DAC solving, ADC calibration sequence, frame
+length formula, AuxCmd1/2 command lists.
+
+**Next steps:**
+- Hardware retest after merging PR#3
+- If `setDataSource` MUX mapping is wrong (custom bitfile may use hardcoded mapping),
+  the user can disable `set_default_data_sources()` or adjust the mapping
+- Wire `RhdChipType` detection into the scan to auto-adjust channel count
+- Implement full impedance testing (requires dedicated AuxCmd bank with DAC waveform)
+- Wire multi-sample-rate into the GUI (currently hardcoded 30kHz)
+- Fill in DAC/LED/external-fast-settle stubs when hardware is available
+
+---
+
+### Session 19: Signal quality analysis + PR#2 (5 fixes)
+
+**Goal**: Diagnose "signal too large, all noise" when using keyvast-gui with the
+XEM7310 FPGA + RHD amplifier (works fine in Open Ephys RHD plugin).
+
+**PR #2** (`devin/1781105421-fix-signal-quality` → `v2.0`):
+https://github.com/juanerdemao1999/keyvast-gui/pull/2
+
+5 fixes: chip ID validation in port scan, FIFO MSB read (0x26), register config
+Reg 3/6 (later found to be wrong — reverted in session 20), display scaling with
+0.195 µV/count, flush_fifo loop improvement.
+
+---
 
 ### Session 18: RHD chip register configuration + ADC calibration (flat-signal fix)
 

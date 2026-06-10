@@ -270,8 +270,11 @@ pub fn draw_waveform_area(
         }
 
         // Sweep cursor — vertical line at the latest data position.
-        // This is the SpikeGLX-style "write cursor" that sweeps right.
-        if cursor_ms > x_left && cursor_ms < x_right {
+        // Only drawn in Sweep mode (SpikeGLX-style "write cursor").
+        // In Roll mode the right edge IS the latest data, no cursor needed.
+        if matches!(settings.display_mode, crate::panels::DisplayMode::Sweep)
+            && cursor_ms > x_left && cursor_ms < x_right
+        {
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![
                     [cursor_ms, y_min],
@@ -286,7 +289,11 @@ pub fn draw_waveform_area(
         // Draw waveform traces — highlight hovered channel.
         // Points are MOVED (not cloned) into Line to avoid per-channel alloc.
         for trace in traces {
-            let base_color = theme::channel_color(trace.channel);
+            let base_color = if settings.color_by_group {
+                settings.channel_color(trace.channel)
+            } else {
+                theme::channel_color(trace.channel)
+            };
             let is_hovered = hovered_ch == Some(trace.channel);
             // Default: all channels always at full brightness (1.3× base color).
             // Hover highlight mode (settings.hover_highlight) must be ON for

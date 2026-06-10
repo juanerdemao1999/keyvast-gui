@@ -7,9 +7,11 @@
 //! signals (spikes, LFP, bursts) for demonstration without hardware.
 
 mod app;
+mod channel_map;
 mod demo;
 mod disp_ring;
 mod dsp;
+mod fft_panel;
 mod live_pipeline;
 mod multiview;
 mod panels;

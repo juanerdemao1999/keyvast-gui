@@ -65,6 +65,8 @@ pub enum TileKind {
         post_ms: f32,
         max_snippets: usize,
     },
+    /// FFT spectrum view for a selected channel.
+    FftSpectrum,
 }
 
 impl TileKind {
@@ -95,6 +97,10 @@ impl TileKind {
             max_snippets: 50,
         }
     }
+
+    pub fn new_fft() -> Self {
+        Self::FftSpectrum
+    }
 }
 
 // ── Add-view request (set during top_bar_right_ui, processed after tree.ui) ─
@@ -103,6 +109,7 @@ pub enum AddViewRequest {
     Lfp,
     Ap,
     SpikeOverlay,
+    Fft,
 }
 
 // ── Behavior ─────────────────────────────────────────────────────────
@@ -130,6 +137,8 @@ pub struct KvTileBehavior<'a> {
     pub block_history_len: usize,
     // Spike snippet store — mutable so the tile UI can update detection params.
     pub snippet_store: &'a mut SpikeSnippetStore,
+    // FFT state
+    pub fft: &'a crate::fft_panel::FftState,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
 }
@@ -166,6 +175,12 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 );
                 UiResponse::None
             }
+
+            TileKind::FftSpectrum => {
+                let sr = self.latest_block.map(|b| b.sample_rate).unwrap_or(30000.0);
+                crate::fft_panel::draw_fft_plot(ui, self.fft, sr);
+                UiResponse::None
+            }
         }
     }
 
@@ -179,6 +194,8 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 format!("Spike AP  CH{}–{}", start_ch, start_ch + visible_count).into(),
             TileKind::SpikeOverlay { channels, .. } =>
                 format!("Spike Overlay  ({} ch)", channels.len()).into(),
+            TileKind::FftSpectrum =>
+                "FFT Spectrum".into(),
         }
     }
 
@@ -226,6 +243,10 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
             }
             if ui.button(egui::RichText::new("Spike Overlay").size(11.0)).clicked() {
                 *self.pending_add = Some(AddViewRequest::SpikeOverlay);
+                ui.close_menu();
+            }
+            if ui.button(egui::RichText::new("FFT Spectrum").size(11.0)).clicked() {
+                *self.pending_add = Some(AddViewRequest::Fft);
                 ui.close_menu();
             }
         });

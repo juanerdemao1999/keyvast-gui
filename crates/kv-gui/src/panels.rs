@@ -15,6 +15,27 @@ use crate::theme;
 
 // ── Display settings state ──────────────────────────────────────────
 
+/// Display mode: how the time axis updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    /// Fixed window, cursor sweeps right (SpikeGLX/Intan RHX default).
+    Sweep,
+    /// Continuous scrolling, latest data on the right.
+    Roll,
+}
+
+/// 8-color palette for channel group coloring.
+pub const CHANNEL_GROUP_COLORS: &[egui::Color32] = &[
+    egui::Color32::from_rgb(100, 180, 255),  // blue
+    egui::Color32::from_rgb(120, 220, 120),  // green
+    egui::Color32::from_rgb(255, 160, 80),   // orange
+    egui::Color32::from_rgb(200, 120, 255),  // purple
+    egui::Color32::from_rgb(255, 100, 100),  // red
+    egui::Color32::from_rgb(80, 220, 200),   // teal
+    egui::Color32::from_rgb(255, 220, 80),   // yellow
+    egui::Color32::from_rgb(200, 200, 200),  // gray
+];
+
 /// Time-window presets in seconds (total visible window width).
 pub const TIME_WINDOWS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0];
 
@@ -42,6 +63,15 @@ pub struct DisplaySettings {
     pub channel_enabled: Vec<bool>,
     /// Vertical spacing between channel baselines (1.0 = dense, 6.0 = spread).
     pub channel_spacing: f64,
+    // ── Phase 2 fields ──────────────────────────────────────────────
+    /// Display mode: Sweep (default) or Roll.
+    pub display_mode: DisplayMode,
+    /// Whether to color channels by group (cycling palette).
+    pub color_by_group: bool,
+    /// Number of channels per color group.
+    pub channels_per_group: usize,
+    /// Custom channel display order. Empty = natural (identity) order.
+    pub channel_order: Vec<usize>,
 }
 
 /// Minimum allowed channel spacing.
@@ -64,6 +94,10 @@ impl Default for DisplaySettings {
             browse_step_pct: 10.0,
             channel_enabled: vec![true; MAX_CHANNEL_TOGGLES],
             channel_spacing: crate::waveform::DEFAULT_CHANNEL_SPACING,
+            display_mode: DisplayMode::Sweep,
+            color_by_group: false,
+            channels_per_group: 8,
+            channel_order: Vec::new(),
         }
     }
 }
@@ -86,6 +120,27 @@ impl DisplaySettings {
     /// Check if a channel is enabled for display.
     pub fn is_channel_enabled(&self, ch: usize) -> bool {
         self.channel_enabled.get(ch).copied().unwrap_or(true)
+    }
+
+    /// Get the display color for a channel. If group coloring is enabled,
+    /// color cycles through the palette based on group assignment.
+    pub fn channel_color(&self, ch: usize) -> egui::Color32 {
+        if self.color_by_group && self.channels_per_group > 0 {
+            let group = ch / self.channels_per_group;
+            CHANNEL_GROUP_COLORS[group % CHANNEL_GROUP_COLORS.len()]
+        } else {
+            egui::Color32::from_rgb(100, 180, 255) // default blue
+        }
+    }
+
+    /// Map a display position to a physical channel index.
+    /// If `channel_order` is empty, returns the identity mapping.
+    pub fn display_to_physical(&self, display_pos: usize) -> usize {
+        if self.channel_order.is_empty() {
+            display_pos
+        } else {
+            self.channel_order.get(display_pos).copied().unwrap_or(display_pos)
+        }
     }
 }
 
@@ -521,6 +576,47 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 egui::RichText::new("Hover hl").size(10.0),
             )
             .on_hover_text("Highlight hovered channel, dim others");
+        });
+
+        // Display mode — Sweep vs Roll
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Mode")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.selectable_value(
+                &mut display.display_mode,
+                DisplayMode::Sweep,
+                egui::RichText::new("Sweep").size(10.0),
+            ).on_hover_text("Fixed window, cursor sweeps right (SpikeGLX/Intan RHX style)");
+            ui.selectable_value(
+                &mut display.display_mode,
+                DisplayMode::Roll,
+                egui::RichText::new("Roll").size(10.0),
+            ).on_hover_text("Continuous scrolling, latest data on the right");
+        });
+
+        // Channel colors
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.checkbox(
+                &mut display.color_by_group,
+                egui::RichText::new("Group colors").size(10.0),
+            ).on_hover_text("Color channels by group (cycling 8-color palette)");
+            if display.color_by_group {
+                let mut g = display.channels_per_group as i32;
+                if ui.add(
+                    egui::DragValue::new(&mut g)
+                        .range(1..=64)
+                        .speed(0.5)
+                        .prefix("per ")
+                        .suffix(" ch"),
+                ).changed() {
+                    display.channels_per_group = g.max(1) as usize;
+                }
+            }
         });
 
         // Browse step — how far each scroll click moves when paused

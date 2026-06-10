@@ -30,6 +30,8 @@ use kv_recorder::StreamingRecorder;
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::channel_map::{self, ChannelMapState};
+use crate::fft_panel::{self, FftState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
 use crate::spike_overlay::SpikeSnippetStore;
@@ -125,6 +127,9 @@ pub struct KvApp {
     last_frame: Instant,
     frame_ms_ema: f64,
     render_ms_ema: f64,
+    // Phase 2 features
+    fft: FftState,
+    channel_map: ChannelMapState,
 }
 
 impl KvApp {
@@ -171,6 +176,8 @@ impl KvApp {
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
+            fft: FftState::default(),
+            channel_map: ChannelMapState::default(),
         }
     }
 
@@ -842,19 +849,23 @@ impl eframe::App for KvApp {
             elapsed_live
         };
 
-        // ── Sweep-mode window management ─────────────────────────
-        // Advance sweep_start_ms when new data has filled the current window.
-        // This keeps x_left / x_right FIXED within a sweep — the entire display
-        // is stationary and only the cursor moves right, matching the SpikeGLX /
-        // Intan RHX default display mode.  When the window fills, the display
-        // resets to a new window (brief flash, once per window duration).
+        // ── Display-mode window management ─────────────────────────
         if !self.display_paused && self.disp_ring.ready {
             let latest_ms = self.disp_ring.latest_time_ms();
             let window_ms = self.display.time_window_ms();
-            if latest_ms >= self.sweep_start_ms + window_ms {
-                // Snap to the most recent complete window boundary
-                self.sweep_start_ms =
-                    (latest_ms / window_ms).floor() * window_ms;
+            match self.display.display_mode {
+                panels::DisplayMode::Sweep => {
+                    // Fixed window, cursor sweeps right.  When the window fills,
+                    // snap to the next window boundary (brief flash, once per window).
+                    if latest_ms >= self.sweep_start_ms + window_ms {
+                        self.sweep_start_ms =
+                            (latest_ms / window_ms).floor() * window_ms;
+                    }
+                }
+                panels::DisplayMode::Roll => {
+                    // Continuous scrolling: x_right = latest, x_left = latest - window.
+                    self.sweep_start_ms = (latest_ms - window_ms).max(0.0);
+                }
             }
         }
 
@@ -1131,6 +1142,27 @@ impl eframe::App for KvApp {
                 if toggle_rec {
                     self.toggle_recording();
                 }
+
+                // FFT spectrum panel
+                ui.add_space(4.0);
+                let total_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+                fft_panel::draw_fft_section(
+                    ui,
+                    &mut self.fft,
+                    &self.disp_ring,
+                    sr,
+                    total_ch,
+                );
+
+                // Channel mapping panel
+                ui.add_space(4.0);
+                channel_map::draw_channel_map_section(
+                    ui,
+                    &mut self.channel_map,
+                    &mut self.display,
+                    total_ch,
+                );
             });
 
         // ── Multi-view tile canvas ──────────────────────────────
@@ -1167,6 +1199,7 @@ impl eframe::App for KvApp {
                         render_ms_ema:     &mut self.render_ms_ema,
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
+                        fft:           &self.fft,
                         pending_add:   &mut pending_add,
                     };
                     tree.ui(&mut behavior, ui);
@@ -1179,6 +1212,7 @@ impl eframe::App for KvApp {
                         AddViewRequest::Lfp => TileKind::new_lfp(visible),
                         AddViewRequest::Ap  => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
+                        AddViewRequest::Fft => TileKind::new_fft(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }

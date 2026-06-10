@@ -692,6 +692,34 @@ These do not block the next core step:
 4. Recorder buffer defaults: 5 seconds for recorder, 1 second for GUI preview.
 5. Recording folder format: `run-YYYYMMDD-HHMMSS`.
 
+### Session: Phase 2 — display features (Roll mode, channel colors, FFT, channel mapping)
+
+**Date**: 2026-06-10
+**Branch**: `devin/1781113191-phase2-display-features` (base: `v2.0`)
+
+**What changed**:
+
+1. **Roll mode display** (`panels.rs`, `app.rs`) — `DisplayMode::Sweep | Roll` enum. In Roll mode, `sweep_start_ms = (latest_ms - window_ms).max(0.0)` every frame. Sweep cursor only drawn in Sweep mode. UI toggle in DISPLAY panel.
+
+2. **Channel colors/grouping** (`panels.rs`, `waveform.rs`) — `CHANNEL_GROUP_COLORS` 8-color palette. `channel_color()` cycles colors based on `channels_per_group`. Waveform renderer uses group color when `color_by_group` enabled.
+
+3. **FFT spectrum analysis** (`fft_panel.rs` — new) — `FftState` with configurable FFT size (256–4096), frequency range, log scale. Hand-written radix-2 Cooley-Tukey FFT. PSD computed from `DisplayRing::last_n_samples()`. Plot with 50/60 Hz markers. Available as sidebar section + tile view.
+
+4. **Channel mapping/sorting** (`channel_map.rs` — new) — `ChannelMapPreset::Natural|Reverse|EvenOdd|Custom`. `display_to_physical()` mapping. Custom comma-separated input with validation. Sidebar UI.
+
+5. **Tile system extended** (`multiview.rs`) — `TileKind::FftSpectrum` variant. FFT tile in "+ Add View" menu. `KvTileBehavior` carries `fft: &FftState`.
+
+6. **DisplayRing extension** (`disp_ring.rs`) — `last_n_samples(ch, n)` extracts recent samples as i16 for FFT.
+
+**Verification**:
+- `cargo check -p kv-rhd` — pass
+- `cargo check -p kv-gui --target x86_64-pc-windows-msvc` — pass (24 warnings, all pre-existing dead-code)
+- `cargo test --workspace --exclude kv-gui` — 85 tests pass (includes 2 FFT tests + 6 channel map tests)
+
+**Next steps**:
+- Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
+- Hardware testing of all Phase 2 features on Windows with XEM7310
+
 ## Notes For Future Agents
 
 - Keep hardware independence strict.

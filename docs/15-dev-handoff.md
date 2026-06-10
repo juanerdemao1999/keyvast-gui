@@ -20,11 +20,64 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-10 (session 20 — Open Ephys RHD plugin alignment)
+Last updated: 2026-06-10 (session 21 — cross-GUI comparison + code audit fixes)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 21: Cross-GUI comparison + code audit bug fixes
+
+**Goal**: (1) Horizontal comparison with Intan RHX, SpikeGLX, Open Ephys GUI, and
+NeuroScope2 to identify feature gaps. (2) Full codebase audit to find bugs and
+architecture issues.
+
+**PR #4** (`devin/1781109497-bugfix-and-improvements` → PR#3 branch):
+https://github.com/juanerdemao1999/keyvast-gui/pull/4
+
+**Bug fixes (5):**
+
+1. **B1**: `start_demo()` / `start_device()` snippet_store channel count was hardcoded
+   to 16 — now uses actual channel count from demo config or lazy-init from first block.
+2. **B2**: `dropped_blocks` was always 0 — now tracks packet-ID discontinuity in
+   `LivePipelineHandle` and passes to `compute_block_stats`.
+3. **B3**: `streaming_metadata_json()` hardcoded `"backend": "simulator"` — now infers
+   from device_id prefix (demo/rhd-hardware/simulator).
+4. **B4/B12**: `default_bitfile_path()` and `default_frontpanel_dll_path()` used
+   `env!("CARGO_MANIFEST_DIR")` (compile-time only) — now searches exe dir → cwd →
+   debug-only compile path → bare name fallback.
+5. **B5**: `MAX_CHANNEL_TOGGLES=64` renamed to `INITIAL_CHANNEL_TOGGLES` to clarify
+   the vec grows dynamically.
+
+**Architecture improvements (6):**
+
+6. **D1**: Preview channel bounded (1024 slots) with `try_send` — prevents OOM when
+   GUI falls behind; skips preview frames rather than stalling acquisition.
+7. **D2**: Recorder thread replaced 1ms sleep polling with condvar notification from
+   producer, matching kv-core/pipeline.rs pattern.
+8. **D3/D6**: Reduced block clones in `ingest_block()` — filtered is now `Option<SampleBlock>`,
+   avoiding a full clone when no user filter is active.
+9. **D4**: Extracted duplicate filter chain construction into `build_filter_chains()`.
+10. **D10**: Demo spike waveform improved from 1-sample biphasic to realistic 5-sample
+    template (onset → trough → overshoot → AHP → recovery).
+11. **D11**: Simulator `spike_component()` now generates spikes on all channels with
+    channel-dependent rarity (was limited to first 8 channels).
+
+**Cross-GUI comparison report**: Sent to user as attachment. Key findings:
+- 🔴 Missing: impedance measurement, offline file viewer/playback
+- 🟡 Missing: roll mode, channel colors, audio monitor, remote API, multi-format
+  recording, gate/trigger, channel mapping, probe map, spectrogram, channel subset save
+
+**Build**: All 89 tests pass. `cargo check` clean on all crates.
+
+**Next steps (from comparison report, pending user approval):**
+- Implement impedance measurement (RHD DAC waveform + amplitude/phase readout)
+- Implement KVRAW offline reader + playback mode
+- Add roll mode display option
+- Add recording format export (Intan .rhd / Binary)
+- Remote control API (TCP + JSON-RPC)
+
+---
 
 ### Session 20: Comprehensive Open Ephys RHD plugin alignment (11 fixes)
 

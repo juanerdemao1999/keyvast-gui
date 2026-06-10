@@ -20,11 +20,67 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-10 (session 21 — cross-GUI comparison + code audit fixes)
+Last updated: 2026-06-10 (session 22 — Phase 1: impedance measurement + offline playback)
 
 The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
 
 Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+
+### Session 22: Phase 1 — Impedance measurement + offline .kvraw playback
+
+**Goal**: Implement the two highest-priority features from the cross-GUI comparison:
+(1) impedance measurement, (2) offline .kvraw file reader + playback mode.
+
+**PR #5** (`devin/1781111069-phase1-impedance-playback` → `v2.0`):
+
+**Phase 1.1 — Impedance Measurement:**
+
+1. **`commands.rs`**: Added `ZcheckScale` enum (100fF/1pF/10pF with capacitance values),
+   `MAX_COMMAND_LENGTH = 1024`, `sample_rate()` getter, zcheck configuration methods
+   (`enable_zcheck`, `set_zcheck_scale`, `set_zcheck_polarity`, `set_zcheck_channel`),
+   and `create_command_list_zcheck_dac(frequency, amplitude)` that generates WRITE(6, x)
+   sine wave commands for the on-chip impedance DAC.
+
+2. **`impedance.rs` (new)**: `ChannelImpedance`, `ImpedanceTestConfig`, `ImpedanceResult`
+   types. `compute_impedance()` performs single-bin DFT at the test frequency to extract
+   magnitude/phase. `auto_select_scale()` picks the best capacitor scale based on
+   impedance range. Quality labels/colors for GUI display. 5 unit tests.
+
+3. **`backend.rs`**: Full `run_impedance_test()` implementation:
+   - Uploads DC waveform to AuxCmd1 Bank 0, sine wave to AuxCmd1 Bank 1
+   - Uploads register configs with zcheck enabled + 3 cap scales to AuxCmd3 Banks 2/3/4
+   - For each channel: sets zcheck_select, switches banks, runs acquisition, reads data
+   - Computes impedance via DFT, auto-selects best cap scale, re-measures if needed
+   - Restores normal operation (DC DAC, non-zcheck config) after test
+   - `extract_channel_from_raw()` helper extracts single-channel i16 from raw frame data
+
+4. **`impedance_panel.rs` (new GUI)**: Impedance panel in left sidebar with:
+   - Test frequency and periods configuration
+   - Progress bar during measurement
+   - Results table with per-channel magnitude (Ω/kΩ/MΩ), phase, and quality color coding
+
+**Phase 1.2 — Offline .kvraw Playback:**
+
+5. **`kv-recorder/src/lib.rs`**: Added `KvrawReader` and `KvrawMetadata` types.
+   Reader opens .kvraw files, parses embedded JSON header (v2) or companion .json (v1),
+   supports random-access `read_frames(start, count)` and `read_channels()`.
+   Minimal JSON parser avoids serde dependency.
+
+6. **`playback.rs` (new GUI)**: `PlaybackManager` state machine (Idle/Paused/Playing).
+   GUI panel with: file open dialog, transport controls (play/pause/rewind/close),
+   speed control (0.1x–10x), timeline scrubber slider, time position display.
+   Playback feeds SampleBlocks into the existing `ingest_block()` pipeline for display.
+
+**Build**: `cargo check -p kv-rhd` + `-p kv-gui --target x86_64-pc-windows-msvc` clean.
+All tests pass (impedance: 5, recorder reader round-trip: 1, plus all 89 existing).
+
+**Next steps (Phase 2, pending user approval):**
+- Roll mode display
+- Channel colors/grouping
+- FFT / spectrum analysis
+- Channel mapping/sorting
+
+---
 
 ### Session 21: Cross-GUI comparison + code audit bug fixes
 

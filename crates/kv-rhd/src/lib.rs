@@ -3,15 +3,21 @@
 mod backend;
 mod commands;
 mod frontpanel;
+pub mod impedance;
 mod parser;
 mod protocol;
 
 pub use backend::{RhdHardwareBackend, RhdHardwareOptions, RhdReadError};
 pub use commands::{
-    AuxCommandSlot, BoardPort, RHD_ADC_CALIBRATION_SAMPLES, RHD_COMMAND_LIST_LEN,
-    Rhd2000CommandType, Rhd2000Registers, RhdCommandError, create_rhd2000_command,
+    AuxCommandSlot, BoardPort, MAX_COMMAND_LENGTH, RHD_ADC_CALIBRATION_SAMPLES,
+    RHD_COMMAND_LIST_LEN, Rhd2000CommandType, Rhd2000Registers, RhdCommandError, ZcheckScale,
+    create_rhd2000_command,
 };
 pub use frontpanel::{FrontPanelError, default_frontpanel_dll_path};
+pub use impedance::{
+    ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceTestConfig,
+    auto_select_scale, compute_impedance,
+};
 pub use parser::{RhythmParseError, parse_rhythm_data_block};
 pub use protocol::{
     CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT,

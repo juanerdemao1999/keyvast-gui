@@ -30,6 +30,7 @@ use kv_recorder::StreamingRecorder;
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::impedance_panel::{self, ImpedanceState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
 use crate::spike_overlay::SpikeSnippetStore;
@@ -37,6 +38,7 @@ use crate::panels::{
     self, DeviceKind, DeviceSettings, DisplaySettings, FilterSettings, RecordingSettings,
     RecordingState,
 };
+use crate::playback::{self, PlaybackManager};
 use crate::preview::{BlockStats, compute_block_stats};
 use crate::theme;
 
@@ -125,6 +127,9 @@ pub struct KvApp {
     last_frame: Instant,
     frame_ms_ema: f64,
     render_ms_ema: f64,
+    // Phase 1 features
+    impedance: ImpedanceState,
+    playback_mgr: PlaybackManager,
 }
 
 impl KvApp {
@@ -171,6 +176,8 @@ impl KvApp {
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
+            impedance: ImpedanceState::default(),
+            playback_mgr: PlaybackManager::default(),
         }
     }
 
@@ -833,6 +840,13 @@ impl eframe::App for KvApp {
             AcqMode::Device => self.tick_device(),
         }
 
+        // Tick playback if active.
+        if self.playback_mgr.is_loaded() {
+            if let Some(block) = self.playback_mgr.tick() {
+                self.ingest_block(block);
+            }
+        }
+
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
 
@@ -1128,6 +1142,26 @@ impl eframe::App for KvApp {
                     self.recording_error = None;
                 }
 
+                // Impedance panel
+                ui.add_space(4.0);
+                let mut start_impedance = false;
+                let acq_running = self.is_running();
+                impedance_panel::draw_impedance_section(
+                    ui,
+                    &mut self.impedance,
+                    acq_running,
+                    &mut start_impedance,
+                );
+
+                // Playback panel
+                ui.add_space(4.0);
+                let mut open_playback_file = false;
+                playback::draw_playback_section(
+                    ui,
+                    &mut self.playback_mgr,
+                    &mut open_playback_file,
+                );
+
                 if start {
                     match self.mode {
                         AcqMode::Demo => self.start_demo(),
@@ -1139,6 +1173,13 @@ impl eframe::App for KvApp {
                 }
                 if toggle_rec {
                     self.toggle_recording();
+                }
+
+                // Handle playback file open (outside borrow scope)
+                if open_playback_file {
+                    if let Some(path) = playback::pick_kvraw_file() {
+                        self.playback_mgr.load_file(path);
+                    }
                 }
             });
 

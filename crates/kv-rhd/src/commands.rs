@@ -4,6 +4,8 @@ use crate::protocol::{DEFAULT_RHD_SAMPLE_RATE, SAMPLES_PER_USB_BLOCK};
 
 pub const RHD_COMMAND_LIST_LEN: usize = 128;
 pub const RHD_ADC_CALIBRATION_SAMPLES: usize = SAMPLES_PER_USB_BLOCK;
+/// Maximum command sequence length for on-FPGA RAM banks.
+pub const MAX_COMMAND_LENGTH: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Rhd2000CommandType {
@@ -223,6 +225,10 @@ impl Rhd2000Registers {
         Self::new(DEFAULT_RHD_SAMPLE_RATE)
     }
 
+    pub fn sample_rate(&self) -> f64 {
+        self.sample_rate
+    }
+
     pub fn set_fast_settle(&mut self, enabled: bool) {
         self.amp_fast_settle = u8::from(enabled);
     }
@@ -241,6 +247,26 @@ impl Rhd2000Registers {
 
     pub fn enable_dsp(&mut self, enabled: bool) {
         self.dsp_en = u8::from(enabled);
+    }
+
+    pub fn enable_zcheck(&mut self, enabled: bool) {
+        self.zcheck_en = u8::from(enabled);
+    }
+
+    pub fn set_zcheck_scale(&mut self, scale: ZcheckScale) {
+        self.zcheck_scale = match scale {
+            ZcheckScale::Cs100fF => 0x00,
+            ZcheckScale::Cs1pF => 0x01,
+            ZcheckScale::Cs10pF => 0x03,
+        };
+    }
+
+    pub fn set_zcheck_polarity(&mut self, negative: bool) {
+        self.zcheck_sel_pol = u8::from(negative);
+    }
+
+    pub fn set_zcheck_channel(&mut self, channel: u8) {
+        self.zcheck_select = channel.min(63);
     }
 
     pub fn register_value(&self, register: u8) -> Result<u8, RhdCommandError> {
@@ -644,6 +670,69 @@ fn reg_write(register: u8, value: u8) -> Result<u16, RhdCommandError> {
         Some(register),
         Some(value),
     )
+}
+
+/// Series capacitor scale for impedance testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZcheckScale {
+    /// 0.1 pF — for high impedance electrodes (> ~1 MΩ).
+    Cs100fF,
+    /// 1.0 pF — for medium impedance electrodes (~100 kΩ–1 MΩ).
+    Cs1pF,
+    /// 10.0 pF — for low impedance electrodes (< ~100 kΩ).
+    Cs10pF,
+}
+
+impl ZcheckScale {
+    /// Capacitance in farads.
+    pub fn capacitance_farads(self) -> f64 {
+        match self {
+            Self::Cs100fF => 0.1e-12,
+            Self::Cs1pF => 1.0e-12,
+            Self::Cs10pF => 10.0e-12,
+        }
+    }
+}
+
+impl Rhd2000Registers {
+    /// Generate a command list that writes a sine wave (or DC) to the
+    /// impedance-test DAC (Register 6). Returns the number of commands
+    /// in the resulting sequence.
+    ///
+    /// `frequency` = 0.0 produces a DC (flat mid-scale) output.
+    /// `amplitude` is in DAC units (0..128, where 128 = full scale).
+    ///
+    /// Port of Intan `createCommandListZcheckDac`.
+    pub fn create_command_list_zcheck_dac(
+        &self,
+        frequency: f64,
+        amplitude: f64,
+    ) -> Result<Vec<u16>, RhdCommandError> {
+        let mut commands = Vec::with_capacity(MAX_COMMAND_LENGTH);
+
+        if frequency <= 0.0 || self.sample_rate <= 0.0 {
+            // DC: fill entire bank with WRITE(6, 128)
+            for _ in 0..MAX_COMMAND_LENGTH {
+                commands.push(reg_write(6, 128)?);
+            }
+            return Ok(commands);
+        }
+
+        // Compute how many samples make up one complete period of the
+        // test waveform.  Clamp to at most MAX_COMMAND_LENGTH.
+        let period_samples = (self.sample_rate / frequency).round() as usize;
+        let period_samples = period_samples.max(1).min(MAX_COMMAND_LENGTH);
+
+        let two_pi = 2.0 * std::f64::consts::PI;
+        for i in 0..period_samples {
+            let phase = two_pi * (i as f64) / (period_samples as f64);
+            let dac_value = (amplitude * phase.sin() + 128.0).round() as i32;
+            let dac_byte = dac_value.clamp(0, 255) as u8;
+            commands.push(reg_write(6, dac_byte)?);
+        }
+
+        Ok(commands)
+    }
 }
 
 fn rh1_from_upper_bandwidth(upper_bandwidth: f64) -> f64 {

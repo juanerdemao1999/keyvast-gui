@@ -26,6 +26,10 @@ fn sample_block_accepts_documented_interleaved_layout() {
         samples_per_channel: 3,
         ttl_bits: 0b101,
         data: vec![1, 10, 2, 20, 3, 30],
+        aux_data: None,
+        board_adc_data: None,
+        ttl_in_per_sample: None,
+        ttl_out_per_sample: None,
     };
 
     block.validate().expect("documented layout should validate");
@@ -46,6 +50,10 @@ fn sample_block_rejects_data_length_mismatch() {
         samples_per_channel: 3,
         ttl_bits: 0,
         data: vec![1, 10, 2, 20, 3],
+        aux_data: None,
+        board_adc_data: None,
+        ttl_in_per_sample: None,
+        ttl_out_per_sample: None,
     };
 
     assert_eq!(
@@ -69,6 +77,10 @@ fn sample_block_rejects_ttl_bits_outside_enabled_lines() {
         samples_per_channel: 1,
         ttl_bits: 1 << 16,
         data: vec![0],
+        aux_data: None,
+        board_adc_data: None,
+        ttl_in_per_sample: None,
+        ttl_out_per_sample: None,
     };
 
     assert_eq!(

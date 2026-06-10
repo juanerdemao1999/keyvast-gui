@@ -54,6 +54,23 @@ pub struct SampleBlock {
     pub samples_per_channel: usize,
     pub ttl_bits: u32,
     pub data: Vec<i16>,
+
+    /// Raw auxiliary command results: `[stream][aux_ch][sample]`.
+    /// 3 aux channels per stream, one u16 per sample.
+    /// `None` when the parser does not extract auxiliary data.
+    pub aux_data: Option<Vec<Vec<Vec<u16>>>>,
+
+    /// Board ADC channels: `[adc_ch][sample]`, 8 channels of u16.
+    /// `None` when not extracted.
+    pub board_adc_data: Option<Vec<Vec<u16>>>,
+
+    /// Per-sample TTL input words.  When present the length equals
+    /// `samples_per_channel`.  The legacy `ttl_bits` field still holds the
+    /// last sample's TTL word for backward compatibility.
+    pub ttl_in_per_sample: Option<Vec<u32>>,
+
+    /// Per-sample TTL output words.
+    pub ttl_out_per_sample: Option<Vec<u32>>,
 }
 
 impl SampleBlock {

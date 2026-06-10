@@ -11,6 +11,70 @@ pub const DEFAULT_RHD_SAMPLE_RATE: f64 = 30_000.0;
 pub const USB3_BLOCK_SIZE_BYTES: usize = 1024;
 pub const RHD_AMPLIFIER_MICROVOLTS_PER_COUNT: f32 = 0.195;
 
+/// Number of auxiliary result words per stream per sample.
+pub const AUX_CHANNELS_PER_STREAM: usize = 3;
+
+/// Board ADC channels in each frame.
+pub const BOARD_ADC_CHANNELS: usize = 8;
+
+/// Open Ephys scale factor for VDD supply voltage: 0.0000748 V/count.
+pub const RHD_VDD_VOLTS_PER_COUNT: f64 = 0.0000748;
+
+/// Open Ephys scale factor for auxiliary ADC inputs: 0.0000374 V/count.
+pub const RHD_AUX_ADC_VOLTS_PER_COUNT: f64 = 0.0000374;
+
+/// RHD2132 16-channel headstage: amplifier channels are offset by this
+/// many channels from channel 0. The chip only populates the upper 16
+/// of its 32 logical amplifier channels.
+pub const RHD2132_16CH_OFFSET: usize = 16;
+
+/// Supported RHD amplifier chip types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RhdChipType {
+    /// RHD2132 — 32 channels, single MISO.
+    Rhd2132,
+    /// RHD2132 in 16-channel mode — only channels 16..31 are active.
+    Rhd2132_16ch,
+    /// RHD2216 — 16 channels, single MISO.
+    Rhd2216,
+    /// RHD2164 — 64 channels, dual MISO (two streams per headstage).
+    Rhd2164,
+}
+
+impl RhdChipType {
+    /// Identify the chip type from the register-63 (Company ID) readback.
+    /// Register 63 bits `[5:0]` encode the die revision, `[7:6]` encode
+    /// the number of amplifiers: 00=RHD2216(16), 01=RHD2132(32),
+    /// 10=RHD2164(64).
+    pub fn from_register63(reg63: u16) -> Option<Self> {
+        let num_amps = (reg63 >> 6) & 0x03;
+        match num_amps {
+            0 => Some(Self::Rhd2216),
+            1 => Some(Self::Rhd2132),
+            2 => Some(Self::Rhd2164),
+            _ => None,
+        }
+    }
+
+    /// Number of amplifier channels the chip exposes.
+    pub fn channel_count(self) -> usize {
+        match self {
+            Self::Rhd2132 => 32,
+            Self::Rhd2132_16ch => 16,
+            Self::Rhd2216 => 16,
+            Self::Rhd2164 => 64,
+        }
+    }
+
+    /// Number of data streams per headstage.
+    pub fn streams_per_headstage(self) -> usize {
+        match self {
+            Self::Rhd2164 => 2,
+            _ => 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RhythmDataConfig {
     pub device_id: String,

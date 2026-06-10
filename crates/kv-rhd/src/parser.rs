@@ -3,8 +3,8 @@ use std::fmt;
 use kv_types::{SampleBlock, SampleBlockError};
 
 use crate::protocol::{
-    CHANNELS_PER_STREAM, RHYTHM_HEADER_MAGIC, RhythmConfigError, RhythmDataConfig,
-    bytes_per_block, raw_word_to_signed_count,
+    AUX_CHANNELS_PER_STREAM, BOARD_ADC_CHANNELS, CHANNELS_PER_STREAM, RHYTHM_HEADER_MAGIC,
+    RhythmConfigError, RhythmDataConfig, bytes_per_block, raw_word_to_signed_count,
 };
 
 pub fn parse_rhythm_data_block(
@@ -24,12 +24,26 @@ pub fn parse_rhythm_data_block(
     }
 
     let channel_count = config.channel_count();
-    let mut data = Vec::with_capacity(channel_count.saturating_mul(config.samples_per_block));
+    let samples = config.samples_per_block;
+    let streams = config.enabled_streams;
+    let mut data = Vec::with_capacity(channel_count.saturating_mul(samples));
     let mut offset = 0_usize;
     let mut timestamp_start = None;
-    let mut ttl_bits = None;
 
-    for sample_index in 0..config.samples_per_block {
+    // Auxiliary data: [stream][aux_ch][sample]
+    let mut aux_data: Vec<Vec<Vec<u16>>> = (0..streams)
+        .map(|_| (0..AUX_CHANNELS_PER_STREAM).map(|_| Vec::with_capacity(samples)).collect())
+        .collect();
+
+    // Board ADC: [adc_ch][sample]
+    let mut board_adc: Vec<Vec<u16>> = (0..BOARD_ADC_CHANNELS)
+        .map(|_| Vec::with_capacity(samples))
+        .collect();
+
+    let mut ttl_in_vec: Vec<u32> = Vec::with_capacity(samples);
+    let mut ttl_out_vec: Vec<u32> = Vec::with_capacity(samples);
+
+    for sample_index in 0..samples {
         let frame_offset = offset;
         let header = read_u64_le(raw, &mut offset);
         if header != RHYTHM_HEADER_MAGIC {
@@ -51,11 +65,18 @@ pub fn parse_rhythm_data_block(
             });
         }
 
-        offset = offset.saturating_add(3 * config.enabled_streams * 2);
+        // Parse auxiliary command results (3 words per stream).
+        for aux_ch in 0..AUX_CHANNELS_PER_STREAM {
+            for stream in 0..streams {
+                let word = read_u16_le(raw, &mut offset);
+                aux_data[stream][aux_ch].push(word);
+            }
+        }
 
+        // Parse amplifier data (32 channels × N streams).
         let mut frame_samples = vec![0_i16; channel_count];
         for channel in 0..CHANNELS_PER_STREAM {
-            for stream in 0..config.enabled_streams {
+            for stream in 0..streams {
                 let word = read_u16_le(raw, &mut offset);
                 frame_samples[stream * CHANNELS_PER_STREAM + channel] =
                     raw_word_to_signed_count(word);
@@ -63,12 +84,23 @@ pub fn parse_rhythm_data_block(
         }
         data.extend_from_slice(&frame_samples);
 
-        offset = offset.saturating_add((config.enabled_streams % 4) * 2);
-        offset = offset.saturating_add(8 * 2);
-        let frame_ttl_bits = read_u16_le(raw, &mut offset) as u32;
-        ttl_bits.get_or_insert(frame_ttl_bits);
-        offset = offset.saturating_add(2);
+        // Skip filler word(s) that align each frame to a 4-stream boundary.
+        offset = offset.saturating_add((streams % 4) * 2);
+
+        // Parse 8 board ADC channels.
+        for adc_ch in 0..BOARD_ADC_CHANNELS {
+            let word = read_u16_le(raw, &mut offset);
+            board_adc[adc_ch].push(word);
+        }
+
+        // Parse TTL input and TTL output words.
+        let ttl_in = read_u16_le(raw, &mut offset) as u32;
+        let ttl_out = read_u16_le(raw, &mut offset) as u32;
+        ttl_in_vec.push(ttl_in);
+        ttl_out_vec.push(ttl_out);
     }
+
+    let last_ttl = ttl_in_vec.last().copied().unwrap_or_default();
 
     let block = SampleBlock {
         device_id: config.device_id.clone(),
@@ -77,9 +109,13 @@ pub fn parse_rhythm_data_block(
         timestamp_start: timestamp_start.unwrap_or_default() as u64,
         sample_rate: config.sample_rate,
         channel_count,
-        samples_per_channel: config.samples_per_block,
-        ttl_bits: ttl_bits.unwrap_or_default(),
+        samples_per_channel: samples,
+        ttl_bits: last_ttl,
         data,
+        aux_data: Some(aux_data),
+        board_adc_data: Some(board_adc),
+        ttl_in_per_sample: Some(ttl_in_vec),
+        ttl_out_per_sample: Some(ttl_out_vec),
     };
 
     block

@@ -260,6 +260,10 @@ fn sample_block(
         samples_per_channel,
         ttl_bits: 0,
         data,
+        aux_data: None,
+        board_adc_data: None,
+        ttl_in_per_sample: None,
+        ttl_out_per_sample: None,
     }
 }
 

@@ -72,6 +72,10 @@ impl SimulatorBackend {
             samples_per_channel: self.config.device.samples_per_packet,
             ttl_bits: self.ttl_bits(packet_id),
             data: self.samples_for_packet(packet_id, timestamp_start),
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
         };
 
         block

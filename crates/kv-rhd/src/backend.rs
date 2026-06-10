@@ -15,7 +15,8 @@ use crate::{
 };
 
 const WIRE_IN_RESET_RUN: i32 = 0x00;
-const WIRE_IN_MAX_TIME_STEP: i32 = 0x01;
+const WIRE_IN_MAX_TIME_STEP_LSB: i32 = 0x01;
+const WIRE_IN_MAX_TIME_STEP_MSB: i32 = 0x02;
 const WIRE_IN_DATA_FREQ_PLL: i32 = 0x03;
 const WIRE_IN_MISO_DELAY: i32 = 0x04;
 const WIRE_IN_CMD_RAM_ADDR: i32 = 0x05;
@@ -26,6 +27,8 @@ const WIRE_IN_AUX_CMD_BANK2: i32 = 0x09;
 const WIRE_IN_AUX_CMD_BANK3: i32 = 0x0a;
 const WIRE_IN_AUX_CMD_LENGTH: i32 = 0x0b;
 const WIRE_IN_AUX_CMD_LOOP: i32 = 0x0c;
+const WIRE_IN_DATA_STREAM_SEL_1234: i32 = 0x12;
+const WIRE_IN_DATA_STREAM_SEL_5678: i32 = 0x13;
 const WIRE_IN_DATA_STREAM_EN: i32 = 0x14;
 const WIRE_IN_TTL_OUT: i32 = 0x15;
 const WIRE_IN_MULTI_USE: i32 = 0x1f;
@@ -195,6 +198,7 @@ impl RhythmFrontPanelBoard {
             board.set_cable_length_meters(1, cable_length_meters)?;
         }
         board.enable_streams(enabled_streams)?;
+        board.set_default_data_sources()?;
         board.clear_ttl_out()?;
         eprintln!("[kv-rhd] data plane configured; initializing RHD chips (ADC calibration)...");
         board.initialize_rhd_chips(enabled_streams)?;
@@ -235,9 +239,47 @@ impl RhythmFrontPanelBoard {
         Ok(())
     }
 
-    fn set_sample_rate_30khz(&self) -> Result<(), RhdReadError> {
-        let m = 42_u32;
-        let d = 25_u32;
+    /// Program the FPGA PLL for the given sample rate. Returns `true`
+    /// if the rate is supported, `false` otherwise.
+    /// PLL M/D pairs from Open Ephys `Rhd2000EvalBoard::setSampleRate()`.
+    fn set_sample_rate(&self, sample_rate: f64) -> Result<bool, RhdReadError> {
+        let (m, d): (u32, u32) = if (sample_rate - 1000.0).abs() < 1.0 {
+            (7, 125)
+        } else if (sample_rate - 1250.0).abs() < 1.0 {
+            (7, 100)
+        } else if (sample_rate - 1500.0).abs() < 1.0 {
+            (21, 250)
+        } else if (sample_rate - 2000.0).abs() < 1.0 {
+            (14, 125)
+        } else if (sample_rate - 2500.0).abs() < 1.0 {
+            (35, 250)
+        } else if (sample_rate - 3000.0).abs() < 1.0 {
+            (21, 125)
+        } else if (sample_rate - 3333.0).abs() < 1.0 {
+            (14, 75)
+        } else if (sample_rate - 4000.0).abs() < 1.0 {
+            (28, 125)
+        } else if (sample_rate - 5000.0).abs() < 1.0 {
+            (7, 25)
+        } else if (sample_rate - 6250.0).abs() < 1.0 {
+            (7, 20)
+        } else if (sample_rate - 8000.0).abs() < 1.0 {
+            (112, 250)
+        } else if (sample_rate - 10000.0).abs() < 1.0 {
+            (14, 25)
+        } else if (sample_rate - 12500.0).abs() < 1.0 {
+            (7, 10)
+        } else if (sample_rate - 15000.0).abs() < 1.0 {
+            (21, 25)
+        } else if (sample_rate - 20000.0).abs() < 1.0 {
+            (28, 25)
+        } else if (sample_rate - 25000.0).abs() < 1.0 {
+            (35, 25)
+        } else if (sample_rate - 30000.0).abs() < 1.0 {
+            (42, 25)
+        } else {
+            return Ok(false);
+        };
 
         self.wait_for_dcm_done();
         self.device
@@ -249,12 +291,22 @@ impl RhythmFrontPanelBoard {
             .map_err(RhdReadError::FrontPanel)?;
         self.wait_for_data_clock_locked();
 
+        Ok(true)
+    }
+
+    fn set_sample_rate_30khz(&self) -> Result<(), RhdReadError> {
+        self.set_sample_rate(30000.0)?;
         Ok(())
     }
 
     fn set_max_time_step(&self, max_time_step: u32) -> Result<(), RhdReadError> {
+        let lsb = max_time_step & 0x0000_ffff;
+        let msb = (max_time_step & 0xffff_0000) >> 16;
         self.device
-            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP, max_time_step, u32::MAX)
+            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP_LSB, lsb, u32::MAX)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device
+            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP_MSB, msb, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
         Ok(())
@@ -290,6 +342,56 @@ impl RhythmFrontPanelBoard {
             .set_wire_in_value(WIRE_IN_TTL_OUT, 0, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
+        Ok(())
+    }
+
+    /// Map each logical data stream to a physical SPI port data source.
+    /// Open Ephys `BoardDataSource` enum: PortA1=0, PortA2=1, PortB1=2,
+    /// PortB2=3, PortC1=4, PortC2=5, PortD1=6, PortD2=7.
+    /// Stream MUX uses `WireInDataStreamSel1234` (0x12) for streams 0-3 (and
+    /// 8-11 in upper 16 bits) and `WireInDataStreamSel5678` (0x13) for
+    /// streams 4-7 (and 12-15).
+    fn set_data_source(&self, stream: u32, source: u32) -> Result<(), RhdReadError> {
+        let (endpoint, bit_shift) = match stream {
+            0 => (WIRE_IN_DATA_STREAM_SEL_1234, 0),
+            1 => (WIRE_IN_DATA_STREAM_SEL_1234, 4),
+            2 => (WIRE_IN_DATA_STREAM_SEL_1234, 8),
+            3 => (WIRE_IN_DATA_STREAM_SEL_1234, 12),
+            4 => (WIRE_IN_DATA_STREAM_SEL_5678, 0),
+            5 => (WIRE_IN_DATA_STREAM_SEL_5678, 4),
+            6 => (WIRE_IN_DATA_STREAM_SEL_5678, 8),
+            7 => (WIRE_IN_DATA_STREAM_SEL_5678, 12),
+            8 => (WIRE_IN_DATA_STREAM_SEL_1234, 16),
+            9 => (WIRE_IN_DATA_STREAM_SEL_1234, 20),
+            10 => (WIRE_IN_DATA_STREAM_SEL_1234, 24),
+            11 => (WIRE_IN_DATA_STREAM_SEL_1234, 28),
+            12 => (WIRE_IN_DATA_STREAM_SEL_5678, 16),
+            13 => (WIRE_IN_DATA_STREAM_SEL_5678, 20),
+            14 => (WIRE_IN_DATA_STREAM_SEL_5678, 24),
+            15 => (WIRE_IN_DATA_STREAM_SEL_5678, 28),
+            _ => return Err(RhdReadError::InvalidPort { port_index: stream as usize }),
+        };
+        self.device
+            .set_wire_in_value(endpoint, source << bit_shift, 0x000f << bit_shift)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        Ok(())
+    }
+
+    /// Mirrors Open Ephys `initialize()`: map streams 0-7 to
+    /// PortA1, PortB1, PortC1, PortD1, PortA2, PortB2, PortC2, PortD2.
+    /// USB3 boards also map streams 8-15 to the same source cycle.
+    fn set_default_data_sources(&self) -> Result<(), RhdReadError> {
+        // BoardDataSource: PortA1=0, PortA2=1, PortB1=2, PortB2=3,
+        //                  PortC1=4, PortC2=5, PortD1=6, PortD2=7
+        let sources: [u32; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+        for (stream, &source) in sources.iter().enumerate() {
+            self.set_data_source(stream as u32, source)?;
+        }
+        // USB3: repeat for streams 8-15
+        for (stream, &source) in sources.iter().enumerate() {
+            self.set_data_source((stream + 8) as u32, source)?;
+        }
         Ok(())
     }
 
@@ -574,6 +676,17 @@ impl RhythmFrontPanelBoard {
         Ok(())
     }
 
+    /// Set MISO delay for a single port (0=A … 7=H) without affecting others.
+    fn set_cable_delay_port(&self, port: usize, delay: u32) -> Result<(), RhdReadError> {
+        let delay = delay.min(15);
+        let shift = (port as u32) * 4;
+        self.device
+            .set_wire_in_value(WIRE_IN_MISO_DELAY, delay << shift, 0x0f << shift)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        Ok(())
+    }
+
     /// Write an arbitrary data-stream enable mask to the FPGA. Bit `i` enables
     /// physical data stream `i` (stream `i` belongs to SPI port `i / 4`).
     fn enable_stream_mask(&self, mask: u32) -> Result<(), RhdReadError> {
@@ -677,6 +790,8 @@ impl RhythmFrontPanelBoard {
                     stream_range_label(first_stream, enabled_streams),
                     delay,
                 );
+                // Apply per-port delay only for the discovered port.
+                self.set_cable_delay_port(port, delay)?;
                 Ok((stream_bits << first_stream, delay))
             }
             None => {
@@ -707,20 +822,52 @@ impl RhythmFrontPanelBoard {
     }
 
     fn flush_fifo(&self) {
+        // Set USB3 pipeout block-throttle override (bit 16 of WireInResetRun)
+        // so the FPGA allows reads of any size during flush.
+        let _ = self
+            .device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16);
+        self.device.update_wire_ins();
+
+        // Phase A: bulk drain with large reads (up to 256 KB per iteration).
+        const FLUSH_CHUNK: usize = 256 * 1024;
         for _ in 0..10_000 {
             let available_words = self.num_words_in_fifo();
-            if available_words == 0 {
-                return;
+            if (available_words as usize) < FLUSH_CHUNK / 2 {
+                break;
             }
-            let byte_count = (available_words as usize)
-                .saturating_mul(2)
-                .min(USB3_BLOCK_SIZE_BYTES);
-            let mut buffer = vec![0_u8; byte_count];
+            let mut buffer = vec![0_u8; FLUSH_CHUNK];
             let _ = self
                 .device
                 .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
         }
-        eprintln!("[kv-rhd] WARNING: flush_fifo did not fully drain after 10 000 iterations");
+
+        // Phase B: drain remaining with appropriately-sized reads.
+        for _ in 0..10_000 {
+            let available_words = self.num_words_in_fifo();
+            if available_words == 0 {
+                break;
+            }
+            let byte_count = (available_words as usize).saturating_mul(2);
+            // Round up to USB3_BLOCK_SIZE_BYTES boundary.
+            let aligned = ((byte_count + USB3_BLOCK_SIZE_BYTES - 1) / USB3_BLOCK_SIZE_BYTES)
+                .max(1)
+                * USB3_BLOCK_SIZE_BYTES;
+            let mut buffer = vec![0_u8; aligned];
+            let _ = self
+                .device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
+        }
+
+        // Release throttle override.
+        let _ = self
+            .device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16);
+        self.device.update_wire_ins();
+
+        if self.num_words_in_fifo() > 0 {
+            eprintln!("[kv-rhd] WARNING: flush_fifo did not fully drain");
+        }
     }
 
     fn num_words_in_fifo(&self) -> u32 {
@@ -775,6 +922,41 @@ impl RhythmFrontPanelBoard {
     #[allow(dead_code)]
     fn board_version(&self) -> u32 {
         self.board_version
+    }
+
+    // ------------------------------------------------------------------
+    // Stub methods for features that Open Ephys supports but keyvast has
+    // not yet wired up.  They are marked `#[allow(dead_code)]` until the
+    // GUI or a command interface calls them.
+    // ------------------------------------------------------------------
+
+    /// Set the on-chip DAC for impedance testing waveform generation.
+    #[allow(dead_code)]
+    fn set_dac_threshold(&self, _dac_channel: u8, _threshold: u16) -> Result<(), RhdReadError> {
+        // TODO: WireInDacSource1..8 + WireInDacManual + TrigIn bits.
+        Ok(())
+    }
+
+    /// Enable/disable an on-board LED.
+    #[allow(dead_code)]
+    fn set_led(&self, _led_index: u8, _on: bool) -> Result<(), RhdReadError> {
+        // TODO: WireInLedDisplay register.
+        Ok(())
+    }
+
+    /// Trigger external fast-settle (blanking) via the FPGA logic line.
+    #[allow(dead_code)]
+    fn set_external_fast_settle_channel(&self, _channel: u8) -> Result<(), RhdReadError> {
+        // TODO: WireInExternalFastSettle.
+        Ok(())
+    }
+
+    /// Run a frequency-sweep impedance test across selected channels.
+    #[allow(dead_code)]
+    fn run_impedance_test(&self) -> Result<(), RhdReadError> {
+        // TODO: requires dedicated AuxCmd bank with impedance DAC waveform.
+        eprintln!("[kv-rhd] impedance testing is not yet implemented");
+        Ok(())
     }
 }
 

@@ -23,6 +23,12 @@ use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
+/// RHD amplifier full-scale range in µV. The 16-bit offset-binary ADC maps
+/// ±32767 counts at 0.195 µV/count → ±6389.6 µV. Display normalization
+/// divides by i16::MAX, so a normalized value of 1.0 corresponds to this
+/// many microvolts.
+const RHD_FULL_SCALE_UV: f64 = 32_767.0 * 0.195;
+
 /// Maximum rendered points per channel.
 /// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.
 /// We use a conservative budget to keep egui_plot tessellation cheap.
@@ -111,7 +117,11 @@ pub fn draw_waveform_area(
     // ch_spacing so that adjusting spacing does NOT change waveform amplitude.
     // Uses the default lane height as the reference (like Intan RHX where
     // amplitude scale and channel spacing are independent controls).
-    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
+    //
+    // The ring stores values normalized to [-1, 1] (i16 / 32767).  A norm
+    // value of 1.0 corresponds to RHD_FULL_SCALE_UV microvolts.  We want
+    // amp_scale µV to fill one lane (= 3 * DEFAULT_CHANNEL_SPACING Y-units).
+    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (RHD_FULL_SCALE_UV / amp_scale.max(1.0));
 
     // Sweep-mode window: FIXED bounds for the duration of this sweep.
     // The cursor (ring.latest_time_ms) sweeps from x_left to x_right.
@@ -350,7 +360,7 @@ pub fn draw_waveform_area(
         let disp_pos = hovered_ch.saturating_sub(start_ch);
         let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
-        let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
+        let amp_uv = delta_y * RHD_FULL_SCALE_UV / (3.0 * DEFAULT_CHANNEL_SPACING);
         let amp_str = if amp_uv.abs() >= 1000.0 {
             format!("{:+.2} mV", amp_uv / 1000.0)
         } else {
@@ -400,11 +410,8 @@ fn draw_scale_bar(
     let plot_rect = response.response.rect;
 
     // The scale bar shows the amp_scale setting as a visual reference.
-    // gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000 / amp_scale).
-    // A normalized amplitude of amp_scale/1000 (the "unit" signal) maps to:
-    //   (amp_scale/1000) * gain = DEFAULT_CHANNEL_SPACING * 3.0 Y-units.
-    // So the bar representing amp_scale µV has height DEFAULT_CHANNEL_SPACING * 3.0.
-    // That's the entire lane (too tall). Instead show amp_scale/3 µV (1/3 lane):
+    // gain maps amp_scale µV to one full lane (3 * DEFAULT_CHANNEL_SPACING Y-units).
+    // Show 1/3 of the lane = amp_scale/3 µV:
     let bar_y_units = DEFAULT_CHANNEL_SPACING;
     let bar_voltage_uv = amp_scale_uv / 3.0;
 

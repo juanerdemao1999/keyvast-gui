@@ -310,8 +310,10 @@ impl Rhd2000Registers {
         commands.push(reg_write(0, self.register_value(0)?)?);
         commands.push(reg_write(1, self.register_value(1)?)?);
         commands.push(reg_write(2, self.register_value(2)?)?);
+        commands.push(reg_write(3, self.register_value(3)?)?);
         commands.push(reg_write(4, self.register_value(4)?)?);
         commands.push(reg_write(5, self.register_value(5)?)?);
+        commands.push(reg_write(6, self.register_value(6)?)?);
         commands.push(reg_write(7, self.register_value(7)?)?);
         for register in 8..=17 {
             commands.push(reg_write(register, self.register_value(register)?)?);

@@ -29,7 +29,8 @@ const WIRE_IN_AUX_CMD_LOOP: i32 = 0x0c;
 const WIRE_IN_DATA_STREAM_EN: i32 = 0x14;
 const WIRE_IN_TTL_OUT: i32 = 0x15;
 const WIRE_IN_MULTI_USE: i32 = 0x1f;
-const WIRE_OUT_NUM_WORDS: i32 = 0x20;
+const WIRE_OUT_NUM_WORDS_LSB: i32 = 0x20;
+const WIRE_OUT_NUM_WORDS_MSB: i32 = 0x26;
 const WIRE_OUT_SPI_RUNNING: i32 = 0x22;
 const WIRE_OUT_DATA_CLK_LOCKED: i32 = 0x24;
 const WIRE_OUT_BOARD_ID: i32 = 0x3e;
@@ -601,22 +602,19 @@ impl RhythmFrontPanelBoard {
         const PROBE_SAMPLES: usize = 128;
         const PORT_LETTERS: [char; 8] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
-        // Probe (and ultimately enable) exactly `enabled_streams` streams per port so
-        // the FPGA frame size during the scan matches what acquisition will parse.
-        // Enabling a different stream count than the parser expects leaves the data
-        // stream misaligned and triggers a "bad Rhythm frame magic" error.
         let stream_bits = (1_u32 << enabled_streams) - 1;
 
-        // (port index, chosen delay, railed fraction at best delay)
-        let mut best: Option<(usize, u32, f64)> = None;
+        // (port index, chosen delay, has_chip_id)
+        let mut best: Option<(usize, u32, bool)> = None;
 
         for port in 0..8_usize {
             let first_stream = (port * 4) as u32;
             self.enable_stream_mask(stream_bits << first_stream)?;
 
-            let mut good_delays: Vec<u32> = Vec::new();
-            let mut min_railed = f64::INFINITY;
-            let mut min_railed_delay = 0_u32;
+            // Delays where chip ID was verified (strong validation).
+            let mut id_verified_delays: Vec<u32> = Vec::new();
+            // Delays where railed fraction < 50% (weak fallback).
+            let mut low_railed_delays: Vec<u32> = Vec::new();
 
             for delay in 0..16_u32 {
                 self.set_cable_delay_all_ports(delay)?;
@@ -625,63 +623,70 @@ impl RhythmFrontPanelBoard {
                 self.run()?;
                 self.wait_until_not_running()?;
                 let raw = self.read_pipe_block(enabled_streams, PROBE_SAMPLES)?;
-                let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
 
-                if railed < min_railed {
-                    min_railed = railed;
-                    min_railed_delay = delay;
+                let has_id = verify_chip_id_in_probe(&raw, enabled_streams, PROBE_SAMPLES);
+                if has_id {
+                    id_verified_delays.push(delay);
                 }
+
+                let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
                 if railed < 0.5 {
-                    good_delays.push(delay);
+                    low_railed_delays.push(delay);
                 }
             }
+
+            // Prefer chip-ID-verified delays; fall back to low-railed delays.
+            let (good_delays, validated_by_id) = if !id_verified_delays.is_empty() {
+                (id_verified_delays, true)
+            } else {
+                (low_railed_delays, false)
+            };
 
             // Mirror scanPorts: 1-2 good delays -> first; >2 -> a middle one (margin).
             let chosen_delay = if good_delays.len() > 2 {
                 good_delays[good_delays.len() / 2]
+            } else if let Some(&d) = good_delays.first() {
+                d
             } else {
-                good_delays.first().copied().unwrap_or(min_railed_delay)
+                continue;
             };
 
-            let responding = min_railed < 0.5;
+            let method = if validated_by_id { "chip ID" } else { "railed fraction" };
             eprintln!(
-                "[kv-rhd] port {} ({}): best invalid words {:>3.0}% @ delay {}{}",
+                "[kv-rhd] port {} ({}): {} good delays ({} verified) @ chosen delay {}  <- responding",
                 PORT_LETTERS[port],
                 stream_range_label(first_stream, enabled_streams),
-                min_railed * 100.0,
+                good_delays.len(),
+                method,
                 chosen_delay,
-                if responding { "  <- chip responding" } else { "" }
             );
 
-            if best.map_or(true, |(_, _, best_railed)| min_railed < best_railed) {
-                best = Some((port, chosen_delay, min_railed));
+            // Prefer chip-ID-verified ports over railed-fraction-only ports.
+            let dominated = best.as_ref().is_some_and(|&(_, _, prev_id)| prev_id && !validated_by_id);
+            if !dominated && best.as_ref().map_or(true, |&(_, _, prev_id)| validated_by_id >= prev_id) {
+                best = Some((port, chosen_delay, validated_by_id));
             }
         }
 
         match best {
-            Some((port, delay, railed)) if railed < 0.5 => {
+            Some((port, delay, _)) => {
                 let first_stream = (port * 4) as u32;
                 eprintln!(
-                    "[kv-rhd] FOUND headstage on port {} ({}) at MISO delay {} ({:.0}% invalid words)",
+                    "[kv-rhd] FOUND headstage on port {} ({}) at MISO delay {}",
                     PORT_LETTERS[port],
                     stream_range_label(first_stream, enabled_streams),
                     delay,
-                    railed * 100.0
                 );
                 Ok((stream_bits << first_stream, delay))
             }
-            other => {
-                let delay = other.map(|(_, delay, _)| delay).unwrap_or(0);
-                let railed = other.map(|(_, _, railed)| railed).unwrap_or(1.0);
+            None => {
                 eprintln!(
-                    "[kv-rhd] WARNING: no responding RHD chip found on any of the 8 SPI ports \
-                     (best port was still {:.0}% invalid). Defaulting to Port A at delay {delay}; \
-                     expect flat data. Check that the headstage is connected and powered, and that \
-                     this is a KeyVast bitstream (the stock Intan bit cannot drive the KeyVast \
-                     headstage SPI pins).",
-                    railed * 100.0
+                    "[kv-rhd] WARNING: no responding RHD chip found on any of the 8 SPI ports. \
+                     Defaulting to Port A at delay 0; expect flat data. Check that the headstage \
+                     is connected and powered, and that this is a KeyVast bitstream (the stock \
+                     Intan bit cannot drive the KeyVast headstage SPI pins)."
                 );
-                Ok((stream_bits, delay))
+                Ok((stream_bits, 0))
             }
         }
     }
@@ -702,7 +707,7 @@ impl RhythmFrontPanelBoard {
     }
 
     fn flush_fifo(&self) {
-        for _ in 0..8 {
+        for _ in 0..10_000 {
             let available_words = self.num_words_in_fifo();
             if available_words == 0 {
                 return;
@@ -715,11 +720,14 @@ impl RhythmFrontPanelBoard {
                 .device
                 .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
         }
+        eprintln!("[kv-rhd] WARNING: flush_fifo did not fully drain after 10 000 iterations");
     }
 
     fn num_words_in_fifo(&self) -> u32 {
         self.device.update_wire_outs();
-        self.device.get_wire_out_value(WIRE_OUT_NUM_WORDS)
+        let msb = self.device.get_wire_out_value(WIRE_OUT_NUM_WORDS_MSB);
+        let lsb = self.device.get_wire_out_value(WIRE_OUT_NUM_WORDS_LSB);
+        (msb << 16) | (lsb & 0xFFFF)
     }
 
     fn wait_for_dcm_done(&self) {
@@ -845,6 +853,56 @@ fn stream_range_label(first_stream: u32, enabled_streams: usize) -> String {
             first_stream + enabled_streams as u32 - 1
         )
     }
+}
+
+/// Verify that the AuxCmd3 results in a probe block contain the RHD chip
+/// identification signature "INTAN" (registers 63, 62, 61, 60, 59). This is a
+/// strong validation — it proves SPI communication is correctly aligned and a
+/// real RHD2000 chip is responding. Returns true if the pattern is found on any
+/// stream.
+///
+/// The register config command list (`create_command_list_register_config`) reads
+/// these identification registers after writing config registers. The MISO
+/// response for each command arrives one SPI cycle later, so the 'I','N','T','A','N'
+/// bytes appear in consecutive AuxCmd3 result words. Rather than relying on exact
+/// command-list indices, we scan all samples for the pattern.
+fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, samples: usize) -> bool {
+    if enabled_streams == 0 || samples < 5 {
+        return false;
+    }
+
+    // Frame layout per sample (in bytes):
+    //   8 (magic) + 4 (timestamp) + 3*enabled_streams*2 (aux results)
+    //   + CHANNELS_PER_STREAM*enabled_streams*2 (amplifier)
+    //   + (enabled_streams%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
+    let frame_bytes = (4 + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + (enabled_streams % 4)
+        + 8
+        + 2)
+        * 2;
+
+    // AuxCmd3 results start after magic(8) + timestamp(4) + AuxCmd1(streams*2) + AuxCmd2(streams*2)
+    let auxcmd3_base = 12 + 2 * enabled_streams * 2;
+
+    let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
+
+    for stream in 0..enabled_streams {
+        let word_offset_in_frame = auxcmd3_base + stream * 2;
+        let mut aux_bytes: Vec<u8> = Vec::with_capacity(samples);
+        for s in 0..samples {
+            let off = s * frame_bytes + word_offset_in_frame;
+            if off + 2 > raw.len() {
+                return false;
+            }
+            let word = u16::from_le_bytes([raw[off], raw[off + 1]]);
+            aux_bytes.push((word & 0xFF) as u8);
+        }
+        if aux_bytes.windows(5).any(|w| w == pattern) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Fraction (0.0..=1.0) of amplifier words that are railed/invalid (0xFFFF or

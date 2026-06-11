@@ -1,5 +1,7 @@
 //! Raw recorder for Keyvast sample blocks.
 
+pub mod export_formats;
+
 use std::{
     fmt,
     fs::{self, File},

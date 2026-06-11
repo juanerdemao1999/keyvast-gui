@@ -20,11 +20,49 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-08 (session 18 - RHD chip register config + ADC calibration)
+Last updated: 2026-06-10 (Phase 3 — recording integration, trigger, audio monitor, remote API)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+The project has progressed through 6 PRs on `v2.0`:
+- PR #2: Signal quality fixes (chip ID validation, FIFO MSB)
+- PR #3: Open Ephys alignment (11 fixes)
+- PR #4: Code audit bug fixes + architecture improvements
+- PR #5: Phase 1 — impedance measurement + offline .kvraw playback
+- PR #6: Phase 2 — Roll mode, channel colors, FFT spectrum, channel mapping
+- PR #7: Phase 3 — Recording format export, Gate/Trigger, Audio monitor, Remote API
 
-Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+None of the PRs have been merged yet (v2.0 still has only the initial commit).
+
+### Phase 3: Recording & Integration Features
+
+**New modules added:**
+
+1. **`kv-recorder/src/export_formats.rs`** — Export to Intan .rhd (magic 0xC6912702, v2.0 header with Qt QStrings, 128-sample data blocks) and flat binary (.bin + .meta.json). Tests: roundtrip, empty-blocks error, file creation.
+
+2. **`kv-gui/src/trigger.rs`** — Gate/Trigger recording control. TriggerEdge (Rising/Falling), TriggerMode (Level/EdgeToggle/EdgeTimed), TriggerState (Disabled/Armed/Triggered). `process_block()` returns TriggerAction (None/StartRecording/StopRecording). Tests: 5 scenarios.
+
+3. **`kv-gui/src/audio_monitor.rs`** — Audio buffer-only interface (ready for cpal integration). Decimates 30kHz → configurable output rate, volume control, ring buffer with overflow handling. Tests: 5 scenarios.
+
+4. **`kv-gui/src/remote_api.rs`** — TCP server + JSON-RPC 2.0 (newline-delimited). Commands: Ping, GetStatus, GetChannelCount, StartAcquisition, StopAcquisition, StartRecording, StopRecording, SetDisplayMode. Default port 4444. Tests: 6 parse/format tests.
+
+**Integration in `app.rs`:**
+- TriggerConfig, AudioMonitorState, RemoteApiState, RemoteApiHandle fields added to KvApp
+- Trigger actions processed in ingest_block → calls begin_recording/stop_recording
+- Audio monitor fed from block data each ingest
+- Remote command queue polled each frame, responses sent back
+- Export format selector UI in sidebar (CollapsingHeader)
+- Remote API start/stop logic tied to enabled toggle
+
+**Build verification:**
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-recorder` ✓
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-gui --target x86_64-pc-windows-msvc` ✓ (warnings only)
+- `RUSTUP_TOOLCHAIN=nightly cargo test --workspace --exclude kv-gui` ✓ (92 tests pass)
+
+**Next (Phase 4):**
+- Probe Map visualization
+- Selective channel save
+- Config persistence (save/load session settings)
+
+---
 
 ### Session 18: RHD chip register configuration + ADC calibration (flat-signal fix)
 

@@ -32,8 +32,11 @@ use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
 use crate::audio_monitor::{self, AudioMonitorState};
 use crate::channel_map::{self, ChannelMapState};
+use crate::channel_select::{self, ChannelSelectState};
+use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
 use crate::fft_panel::{self, FftState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
+use crate::probe_map::{self, ProbeMapState};
 use crate::remote_api::{self, RemoteApiState, RemoteApiHandle, RemoteCommand, RemoteResponse, AppStatus};
 use crate::trigger::{self, TriggerConfig, TriggerAction};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
@@ -140,6 +143,10 @@ pub struct KvApp {
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
     export_format: kv_recorder::export_formats::ExportFormat,
+    // Phase 4 features
+    probe_map: ProbeMapState,
+    channel_select: ChannelSelectState,
+    config_persist: ConfigPersistState,
 }
 
 impl KvApp {
@@ -193,6 +200,9 @@ impl KvApp {
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
             export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            probe_map: ProbeMapState::default(),
+            channel_select: ChannelSelectState::default(),
+            config_persist: ConfigPersistState::default(),
         }
     }
 
@@ -1434,7 +1444,78 @@ impl eframe::App for KvApp {
                             .color(theme::TEXT_DIM),
                     );
                 });
+
+                // Phase 4: Probe Map config
+                ui.add_space(4.0);
+                probe_map::draw_probe_map_section(ui, &mut self.probe_map, total_ch);
+
+                // Phase 4: Selective channel save
+                ui.add_space(4.0);
+                self.channel_select.sync_channel_count(total_ch);
+                channel_select::draw_channel_select_section(
+                    ui,
+                    &mut self.channel_select,
+                );
+
+                // Phase 4: Config persistence
+                ui.add_space(4.0);
+                let mut save_clicked = false;
+                let mut load_clicked = false;
+                config_persist::draw_config_section(
+                    ui,
+                    &mut self.config_persist,
+                    &mut save_clicked,
+                    &mut load_clicked,
+                );
+                if save_clicked {
+                    let cfg = PersistentConfig::capture_from(
+                        &self.display,
+                        &self.filters,
+                        &self.recording.output_dir,
+                        &self.recording.file_prefix,
+                        self.audio_monitor.channel,
+                        self.audio_monitor.volume,
+                        self.remote_api_state.port,
+                        self.probe_map.geometry.label(),
+                        self.probe_map.site_radius,
+                    );
+                    match config_persist::save_config(&self.config_persist.config_path, &cfg) {
+                        Ok(()) => {
+                            self.config_persist.status_message = Some("Saved".to_string());
+                        }
+                        Err(e) => {
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
+                }
+                if load_clicked {
+                    match config_persist::load_config(&self.config_persist.config_path) {
+                        Ok(cfg) => {
+                            cfg.apply_to(
+                                &mut self.display,
+                                &mut self.filters,
+                                &mut self.recording.output_dir,
+                                &mut self.recording.file_prefix,
+                                &mut self.audio_monitor.channel,
+                                &mut self.audio_monitor.volume,
+                                &mut self.remote_api_state.port,
+                            );
+                            self.config_persist.status_message = Some("Loaded".to_string());
+                            self.config_persist.loaded = true;
+                        }
+                        Err(e) => {
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
+                }
             });
+
+        // ── Probe Map window (floating) ─────────────────────────
+        if self.probe_map.visible {
+            let map_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+            self.probe_map.update_activity(&self.disp_ring, map_ch);
+            probe_map::draw_probe_map_window(ctx, &self.probe_map, map_ch);
+        }
 
         // ── Multi-view tile canvas ──────────────────────────────
         //

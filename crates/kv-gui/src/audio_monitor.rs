@@ -88,6 +88,7 @@ impl AudioMonitorState {
     }
 
     /// Feed samples from the display ring (called each frame when enabled).
+    #[allow(dead_code)] // pending cpal output integration
     pub fn feed_from_ring(&mut self, ring: &DisplayRing, acq_sample_rate: f64) {
         if !self.enabled || !ring.ready {
             return;
@@ -101,6 +102,7 @@ impl AudioMonitorState {
 
     /// Drain available audio samples for the output callback.
     /// Returns up to `max_samples` normalized [-1.0, 1.0] samples.
+    #[allow(dead_code)] // pending cpal output integration
     pub fn drain_audio_samples(&mut self, max_samples: usize) -> Vec<f32> {
         let n = self.audio_buffer.len().min(max_samples);
         self.audio_buffer.drain(..n).collect()

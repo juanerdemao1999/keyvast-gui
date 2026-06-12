@@ -8,7 +8,6 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use kv_types::SampleBlock;
-use rfd;
 
 use crate::preview::BlockStats;
 use crate::theme;
@@ -53,6 +52,7 @@ pub struct DisplaySettings {
     pub amp_scale_idx: usize,
     pub show_grid: bool,
     pub show_channel_labels: bool,
+    #[allow(dead_code)] // planned overlay display mode
     pub overlay_mode: bool,
     /// When true: hovering over a channel highlights it white and dims others.
     /// When false (default): all channels always render at full brightness.
@@ -136,6 +136,7 @@ impl DisplaySettings {
 
     /// Map a display position to a physical channel index.
     /// If `channel_order` is empty, returns the identity mapping.
+    #[allow(dead_code)] // inverse of physical_to_display, kept for symmetry
     pub fn display_to_physical(&self, display_pos: usize) -> usize {
         if self.channel_order.is_empty() {
             display_pos
@@ -274,8 +275,8 @@ fn default_bitfile_path() -> Option<PathBuf> {
     ];
 
     // 1. Search relative to the executable (works in deployed builds).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent() {
             for name in &bitfile_names {
                 let candidate = exe_dir.join(name);
                 if candidate.exists() {
@@ -283,7 +284,6 @@ fn default_bitfile_path() -> Option<PathBuf> {
                 }
             }
         }
-    }
 
     // 2. Search current working directory.
     if let Ok(cwd) = std::env::current_dir() {
@@ -894,14 +894,12 @@ fn draw_recording_section(
                 .button(egui::RichText::new("📁").size(13.0))
                 .on_hover_text("Browse for output folder")
                 .clicked()
-            {
-                if let Some(path) = rfd::FileDialog::new()
+                && let Some(path) = rfd::FileDialog::new()
                     .set_title("Select recording output folder")
                     .pick_folder()
                 {
                     recording.output_dir = path.to_string_lossy().into_owned();
                 }
-            }
         });
 
         // Arm / Record / Stop buttons — all go through toggle_rec so that

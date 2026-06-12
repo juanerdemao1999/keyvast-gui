@@ -18,3 +18,5 @@ kv-rhd = { path = "../kv-rhd" }
 kv-simulator = { path = "../kv-simulator" }
 kv-types = { path = "../kv-types" }
 egui_tiles = "0.12"
+log = "0.4"
+env_logger = "0.11"

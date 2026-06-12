@@ -105,11 +105,10 @@ impl Default for ConfigPersistState {
 
 /// Default config file location (next to executable or in CWD).
 fn default_config_path() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent() {
             return dir.join("keyvast_config.json");
         }
-    }
     PathBuf::from("keyvast_config.json")
 }
 
@@ -199,6 +198,7 @@ impl PersistentConfig {
     }
 
     /// Capture current settings from the live application state.
+    #[allow(clippy::too_many_arguments)]
     pub fn capture_from(
         display: &DisplaySettings,
         filters: &FilterSettings,
@@ -240,6 +240,7 @@ impl PersistentConfig {
     }
 
     /// Apply loaded config to application state.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_to(
         &self,
         display: &mut DisplaySettings,

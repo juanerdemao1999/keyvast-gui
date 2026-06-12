@@ -67,9 +67,9 @@ pub fn compute_spectrum(
     let mut real = Vec::with_capacity(n);
     let mut imag = vec![0.0_f64; n];
     let pi2_over_n = 2.0 * std::f64::consts::PI / n as f64;
-    for i in 0..n {
+    for (i, &sample) in raw.iter().enumerate().take(n) {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
-        real.push(raw[i] as f64 * 0.195 * w); // convert to µV
+        real.push(sample as f64 * 0.195 * w); // convert to µV
     }
 
     // In-place radix-2 FFT.

@@ -265,7 +265,7 @@ fn spike_component(seed: u64, sample_index: u64, channel: usize) -> i32 {
 
     let event_seed =
         seed ^ (sample_index / DEFAULT_SAMPLES_PER_PACKET as u64) ^ (channel as u64 * 17);
-    if mix_u64(event_seed) % rarity == 0 && sample_index % 6 <= 2 {
+    if mix_u64(event_seed).is_multiple_of(rarity) && sample_index % 6 <= 2 {
         // 3-sample biphasic spike template
         match sample_index % 6 {
             0 => -180,

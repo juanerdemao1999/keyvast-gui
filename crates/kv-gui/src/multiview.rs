@@ -283,9 +283,9 @@ impl<'a> KvTileBehavior<'a> {
         let cursor_pos = ui.input(|i| i.pointer.hover_pos());
 
         // Route raw scroll into the correct accumulator (zone-aware)
-        if raw_scroll.abs() > 0.5 {
-            if let Some(pos) = cursor_pos {
-                if tile_rect.contains(pos) {
+        if raw_scroll.abs() > 0.5
+            && let Some(pos) = cursor_pos
+                && tile_rect.contains(pos) {
                     let in_y_strip = pos.x < tile_rect.left() + Y_STRIP_W;
                     let in_x_strip = pos.y > tile_rect.bottom() - X_STRIP_H;
                     if in_y_strip && !in_x_strip {
@@ -296,8 +296,6 @@ impl<'a> KvTileBehavior<'a> {
                         *scroll_accum_browse += raw_scroll;
                     }
                 }
-            }
-        }
 
         // Y-axis accumulator → amplitude scale
         {
@@ -411,13 +409,11 @@ impl<'a> KvTileBehavior<'a> {
 
         // Mouse wheel scrolls channels in this tile
         let raw_scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if raw_scroll.abs() > 0.5 {
-            if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                if tile_rect.contains(pos) {
+        if raw_scroll.abs() > 0.5
+            && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
+                && tile_rect.contains(pos) {
                     *scroll_accum_ch += raw_scroll;
                 }
-            }
-        }
         while *scroll_accum_ch >= SCROLL_STEP_PX {
             *scroll_accum_ch -= SCROLL_STEP_PX;
             *start_ch = start_ch.saturating_sub(1);

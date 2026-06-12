@@ -184,12 +184,9 @@ impl TriggerConfig {
                         }
                     }
                     TriggerMode::EdgeTimed => {
-                        if self.timed_duration_blocks > 0
-                            && self.blocks_since_trigger >= self.timed_duration_blocks
-                        {
-                            self.state = TriggerState::Armed;
-                            TriggerAction::StopRecording
-                        } else if opposite_edge {
+                        let duration_elapsed = self.timed_duration_blocks > 0
+                            && self.blocks_since_trigger >= self.timed_duration_blocks;
+                        if duration_elapsed || opposite_edge {
                             self.state = TriggerState::Armed;
                             TriggerAction::StopRecording
                         } else {
@@ -316,22 +313,20 @@ pub fn draw_trigger_section(ui: &mut egui::Ui, config: &mut TriggerConfig) {
                     .color(status_color),
             );
 
-            if config.state == TriggerState::Disabled || config.state == TriggerState::Armed {
-                if ui
+            if (config.state == TriggerState::Disabled || config.state == TriggerState::Armed)
+                && ui
                     .small_button(egui::RichText::new("Arm").size(9.0))
                     .clicked()
                 {
                     config.arm();
                 }
-            }
-            if config.state != TriggerState::Disabled {
-                if ui
+            if config.state != TriggerState::Disabled
+                && ui
                     .small_button(egui::RichText::new("Disarm").size(9.0))
                     .clicked()
                 {
                     config.disarm();
                 }
-            }
         });
     });
 }

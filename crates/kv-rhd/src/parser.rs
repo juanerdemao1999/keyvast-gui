@@ -7,6 +7,8 @@ use crate::protocol::{
     RhythmConfigError, RhythmDataConfig, bytes_per_block, raw_word_to_signed_count,
 };
 
+// Index-based loops mirror the Rhythm wire layout (stream-major word order).
+#[allow(clippy::needless_range_loop)]
 pub fn parse_rhythm_data_block(
     packet_id: u64,
     raw: &[u8],

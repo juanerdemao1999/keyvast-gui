@@ -20,7 +20,40 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (P1: ingest/display performance)
+Last updated: 2026-06-12 (P2: CI, clippy clean, log crate)
+
+### Session 25: P2 — Engineering (CI workflow, clippy zero-warning, eprintln→log)
+
+Branch `devin/1781284000-p2-engineering` (stacked on the P1 branch → `v2.0`):
+
+1. **GitHub Actions CI** — `.github/workflows/ci.yml`, two jobs on every PR
+   and pushes to `main`/`v2.0`:
+   - `test`: `cargo test --workspace --exclude kv-gui`
+   - `lint`: `cargo clippy --workspace --exclude kv-gui --all-targets -- -D warnings`
+     plus `cargo clippy -p kv-gui --target x86_64-pc-windows-msvc -- -D warnings`
+     (kv-gui only builds for Windows; checking against the MSVC target needs
+     no linker). No `cargo fmt --check`: the codebase intentionally is not
+     rustfmt-formatted (242 diff hunks) — decide separately before adding it.
+2. **Clippy zero-warning** — `cargo clippy --fix` plus manual fixes (strip_prefix,
+   needless_range_loop, clamp, `&PathBuf`→`&Path`, collapsed identical trigger
+   branches). Intentionally-unused API (hardware bring-up constants/`RhdChipType`,
+   audio-monitor plumbing, custom probe geometry, scrub-bar `read_block_at`,
+   channel stats) carries targeted `#[allow(dead_code)]` with a reason comment.
+   Removed `ChannelSelectState::filter_block_data` (superseded by
+   `filter_block_channels`; test migrated).
+3. **eprintln → `log` crate** — all `eprintln!` in `kv-rhd` (backend,
+   frontpanel) and `kv-gui` (app) replaced with `log::info!/warn!/error!`;
+   `kv-gui` main initializes `env_logger` (default level `info`, override via
+   `RUST_LOG`). `kv-cli` keeps `println!` (CLI output, not logging).
+
+**Verification:** clippy zero warnings on both halves; `cargo test --workspace
+--exclude kv-gui` all pass; `cargo check -p kv-gui --target
+x86_64-pc-windows-msvc` clean. GUI smoke test still pending on Windows.
+
+**Next:** merge chain #10 → #11 → P2 PR; future: app.rs split, cpal audio
+monitoring, rustfmt decision.
+
+---
 
 ### Session 24: P1 — Performance (lazy band filters, history dedup, refilter debounce, LTO)
 

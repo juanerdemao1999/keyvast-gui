@@ -90,8 +90,10 @@ pub struct ProbeMapState {
     pub visible: bool,
     pub geometry: ProbeGeometry,
     /// Custom positions (only used when geometry == Custom).
+    #[allow(dead_code)] // pending custom-geometry editor
     pub custom_positions: Vec<(f32, f32)>,
     /// Custom position text input buffer.
+    #[allow(dead_code)] // pending custom-geometry editor
     pub custom_input: String,
     /// Per-channel activity computed each frame.
     pub activities: Vec<SiteActivity>,

@@ -320,8 +320,8 @@ impl KvApp {
                 AcqMode::Demo => {
                     if let Some(rec) = self.active_recorder.take() {
                         match rec.finish() {
-                            Ok(summary) => eprintln!(
-                                "[recorder] Auto-stopped: {} blocks saved → {}",
+                            Ok(summary) => log::info!(
+                                "Auto-stopped: {} blocks saved → {}",
                                 summary.recording.block_count,
                                 summary.recording.raw_path.display()
                             ),
@@ -576,8 +576,8 @@ impl KvApp {
 
         // Feed the block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
-        if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording {
-            if let Some(ref mut rec) = self.active_recorder {
+        if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording
+            && let Some(ref mut rec) = self.active_recorder {
                 let (write_result, written_values) = match self.record_channels {
                     Some(ref indices) => {
                         let filtered = channel_select::filter_block_channels(&block, indices);
@@ -600,7 +600,6 @@ impl KvApp {
                     }
                 }
             }
-        }
 
         // Store raw + filtered history for pause/browse and re-filter.
         // filtered_history stays empty while no user filter is active — the
@@ -736,8 +735,8 @@ impl KvApp {
                 if let Some(rec) = self.active_recorder.take() {
                     match rec.finish() {
                         Ok(summary) => {
-                            eprintln!(
-                                "[recorder] Saved {} blocks ({} bytes) → {}",
+                            log::info!(
+                                "Saved {} blocks ({} bytes) → {}",
                                 summary.recording.block_count,
                                 summary.recording.byte_count,
                                 summary.recording.raw_path.display()
@@ -1033,11 +1032,10 @@ impl KvApp {
             while let Ok(block) = pipeline.preview_rx.try_recv() {
                 pipeline.total_blocks += 1;
                 // Detect dropped blocks via packet-ID discontinuity
-                if let Some(expected) = pipeline.expected_next_packet_id {
-                    if block.packet_id > expected {
+                if let Some(expected) = pipeline.expected_next_packet_id
+                    && block.packet_id > expected {
                         pipeline.dropped_blocks += block.packet_id - expected;
                     }
-                }
                 pipeline.expected_next_packet_id = Some(block.packet_id + 1);
                 preview_blocks.push(block);
             }
@@ -1213,11 +1211,10 @@ impl eframe::App for KvApp {
         self.poll_export();
 
         // Tick playback if active.
-        if self.playback_mgr.is_loaded() {
-            if let Some(block) = self.playback_mgr.tick() {
+        if self.playback_mgr.is_loaded()
+            && let Some(block) = self.playback_mgr.tick() {
                 self.ingest_block(block);
             }
-        }
 
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
@@ -1572,11 +1569,10 @@ impl eframe::App for KvApp {
                 }
 
                 // Handle playback file open (outside borrow scope)
-                if open_playback_file {
-                    if let Some(path) = playback::pick_kvraw_file() {
+                if open_playback_file
+                    && let Some(path) = playback::pick_kvraw_file() {
                         self.playback_mgr.load_file(path);
                     }
-                }
 
                 // FFT spectrum panel
                 ui.add_space(4.0);
@@ -1680,11 +1676,9 @@ impl eframe::App for KvApp {
                         )
                         .on_hover_text("Convert a .kvraw recording to the selected format")
                         .clicked()
-                    {
-                        if let Some(path) = playback::pick_kvraw_file() {
+                        && let Some(path) = playback::pick_kvraw_file() {
                             self.start_export(path);
                         }
-                    }
                     if exporting {
                         ui.label(
                             egui::RichText::new("Exporting…")

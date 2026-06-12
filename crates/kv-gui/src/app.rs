@@ -51,6 +51,10 @@ use crate::preview::{BlockStats, compute_block_stats};
 use crate::theme;
 
 
+/// How long filter settings must stay unchanged before the full history
+/// is re-filtered (lets slider drags settle first).
+const REFILTER_DEBOUNCE_MS: u64 = 150;
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,7 +83,9 @@ pub struct KvApp {
     device_error: Option<String>,
     // Shared view state
     block_history: VecDeque<SampleBlock>,
-    /// Pre-filtered version of block_history (kept in sync).
+    /// Pre-filtered version of block_history. Only populated while a user
+    /// filter (or CAR) is active — empty otherwise to avoid duplicating
+    /// block_history in memory.
     filtered_history: VecDeque<SampleBlock>,
     history_capacity: usize,
     latest_block: Option<SampleBlock>,
@@ -90,6 +96,12 @@ pub struct KvApp {
     /// The settings that `filter_chains` was built with.  When the user
     /// changes filter parameters we detect the mismatch and rebuild.
     filter_settings_snapshot: FilterSettings,
+    /// Instant of the most recent (still unapplied) filter-settings change.
+    /// Re-filtering the full history is debounced behind this so dragging a
+    /// cutoff slider doesn't re-filter 10k blocks every frame.
+    filter_change_pending_since: Option<Instant>,
+    /// Filter settings as of the previous frame (debounce change detection).
+    filters_last_frame: FilterSettings,
     /// Pre-computed display ring buffer — user-configured filter (main tile).
     disp_ring: DisplayRing,
     /// Fixed LP 250 Hz ring for the LFP tile.
@@ -184,6 +196,8 @@ impl KvApp {
             latest_stats: None,
             filter_chains: Vec::new(),
             filter_settings_snapshot: filters,
+            filter_change_pending_since: None,
+            filters_last_frame: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
             disp_ring_ap: DisplayRing::new(16, 30_000.0),
@@ -399,10 +413,13 @@ impl KvApp {
         let sample_rate = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
         let channel_count = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
         let mut chains = Self::build_filter_chains(&self.filters, sample_rate, channel_count);
-        let car_enabled = self.filters.car_enabled;
-        for block in self.block_history.iter() {
-            let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
-            self.filtered_history.push_back(filtered);
+        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
+        if needs_filter {
+            let car_enabled = self.filters.car_enabled;
+            for block in self.block_history.iter() {
+                let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
+                self.filtered_history.push_back(filtered);
+            }
         }
         // Keep persistent chains in sync (their state now reflects all history)
         self.filter_chains = chains;
@@ -415,7 +432,6 @@ impl KvApp {
         } else {
             self.disp_ring.reset();
         }
-        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
         let source = if needs_filter {
             &self.filtered_history
         } else {
@@ -470,8 +486,10 @@ impl KvApp {
         let ch_count = block.channel_count;
         let sample_rate = block.sample_rate;
 
-        // Detect filter settings change → rebuild chains
-        if self.filters != self.filter_settings_snapshot || self.filter_chains.len() != ch_count {
+        // Rebuild chains on channel-count change. Filter-settings changes are
+        // handled (debounced) in update() so slider drags don't re-filter the
+        // full history every frame.
+        if self.filter_chains.len() != ch_count {
             self.rebuild_filter_chains(sample_rate, ch_count);
         }
 
@@ -506,18 +524,26 @@ impl KvApp {
         // Feed main display ring from the display-ready (filtered or raw) block.
         self.disp_ring.push_block(filtered.as_ref().unwrap_or(&block));
 
-        // Feed fixed-filter rings (always incremental, never CAR).
-        let lfp_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
-        self.disp_ring_lfp.push_block(&lfp_block);
-
-        let ap_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
-        self.disp_ring_ap.push_block(&ap_block);
-
-        // Feed AP-filtered block to the spike snippet detector.
-        if self.snippet_store.channel_count() != ch_count {
-            self.snippet_store.reconfigure(ch_count, sample_rate);
+        // Feed fixed-filter rings (always incremental, never CAR) — but only
+        // when a tile actually consumes them, so the default single-tile
+        // layout pays for one filter pass instead of three.
+        if self.lfp_tile_open() {
+            let lfp_block =
+                Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
+            self.disp_ring_lfp.push_block(&lfp_block);
         }
-        self.snippet_store.process_block(&ap_block);
+
+        // The AP band feeds both the AP tile and the spike snippet detector.
+        if self.ap_band_needed() {
+            let ap_block =
+                Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
+            self.disp_ring_ap.push_block(&ap_block);
+
+            if self.snippet_store.channel_count() != ch_count {
+                self.snippet_store.reconfigure(ch_count, sample_rate);
+            }
+            self.snippet_store.process_block(&ap_block);
+        }
 
         // Phase 3: Process trigger/gate logic
         let trigger_action = self.trigger.process_block(&block);
@@ -577,15 +603,41 @@ impl KvApp {
         }
 
         // Store raw + filtered history for pause/browse and re-filter.
-        // When no user filter is active, the filtered copy equals the raw block.
-        let filtered_block = filtered.unwrap_or_else(|| block.clone());
+        // filtered_history stays empty while no user filter is active — the
+        // raw history serves both roles in that case.
+        if let Some(filtered_block) = filtered {
+            self.filtered_history.push_back(filtered_block);
+        }
         self.latest_block = Some(block.clone());
         self.block_history.push_back(block);
-        self.filtered_history.push_back(filtered_block);
         while self.block_history.len() > self.history_capacity {
             self.block_history.pop_front();
+        }
+        while self.filtered_history.len() > self.history_capacity {
             self.filtered_history.pop_front();
         }
+    }
+
+    /// True when an LFP tile exists in the layout.
+    fn lfp_tile_open(&self) -> bool {
+        self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
+    }
+
+    /// True when the AP band must be computed: an AP tile or a spike-overlay
+    /// tile (which consumes the snippet detector) exists in the layout.
+    fn ap_band_needed(&self) -> bool {
+        self.tile_has_pane(|kind| {
+            matches!(kind, TileKind::ApView { .. } | TileKind::SpikeOverlay { .. })
+        })
+    }
+
+    fn tile_has_pane(&self, pred: impl Fn(&TileKind) -> bool) -> bool {
+        self.tile_tree.as_ref().is_some_and(|tree| {
+            tree.tiles.tiles().any(|tile| match tile {
+                egui_tiles::Tile::Pane(kind) => pred(kind),
+                egui_tiles::Tile::Container(_) => false,
+            })
+        })
     }
 
     fn is_running(&self) -> bool {
@@ -1170,12 +1222,28 @@ impl eframe::App for KvApp {
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
 
-        // Detect filter settings change (user toggled in UI) — re-filter history
+        // Detect filter settings change (user toggled in UI) — re-filter
+        // history once the settings have been stable for the debounce window,
+        // so dragging a cutoff slider doesn't re-filter 10k blocks per frame.
         if self.filters != self.filter_settings_snapshot {
-            let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
-            let ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-            self.rebuild_filter_chains(sr, ch);
+            if self.filters != self.filters_last_frame
+                || self.filter_change_pending_since.is_none()
+            {
+                self.filter_change_pending_since = Some(Instant::now());
+            }
+            let stable = self
+                .filter_change_pending_since
+                .is_some_and(|t| t.elapsed().as_millis() as u64 >= REFILTER_DEBOUNCE_MS);
+            if stable {
+                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+                let ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+                self.rebuild_filter_chains(sr, ch);
+                self.filter_change_pending_since = None;
+            }
+        } else {
+            self.filter_change_pending_since = None;
         }
+        self.filters_last_frame = self.filters;
 
         let elapsed_live = self.elapsed_seconds();
         // Use frozen elapsed for display when paused
@@ -1765,6 +1833,7 @@ impl eframe::App for KvApp {
             || self.display_paused
             || self.impedance_rx.is_some()
             || self.export_rx.is_some()
+            || self.filter_change_pending_since.is_some()
         {
             ctx.request_repaint();
         }

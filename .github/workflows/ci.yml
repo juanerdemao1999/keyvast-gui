@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The committed mirror in .cargo/config.toml is for China-side dev
+      # machines; GitHub runners must use upstream crates.io.
+      - run: sed -i 's/^replace-with/#replace-with/' .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude kv-gui
@@ -23,6 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sed -i 's/^replace-with/#replace-with/' .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

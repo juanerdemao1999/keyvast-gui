@@ -7,7 +7,6 @@
 //! signals (spikes, LFP, bursts) for demonstration without hardware.
 
 mod app;
-mod audio_monitor;
 mod channel_map;
 mod channel_select;
 mod config_persist;

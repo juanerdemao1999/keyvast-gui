@@ -68,6 +68,8 @@ pub enum RecorderEvent {
     Started,
     /// Recording finalized — carries final block and byte counts.
     Stopped { blocks: u64, bytes: u64 },
+    /// Periodic progress report while recording (sent ~5/s).
+    Progress { blocks: u64, bytes: u64 },
     /// Error opening or writing the recording.
     Error(String),
     /// Periodic buffer health report (sent ~5/s while running).
@@ -337,7 +339,17 @@ fn recorder_loop(
                     None => rec.write_block(&block),
                 };
                 if let Err(e) = result {
-                    let _ = event_tx.send(RecorderEvent::Error(format!("write failed: {e}")));
+                    // A failed write means the file can no longer be trusted —
+                    // stop and finalize immediately rather than keep writing
+                    // into a possibly corrupt recording.
+                    let _ = event_tx.send(RecorderEvent::Error(format!(
+                        "write failed: {e} — recording stopped; file may be incomplete"
+                    )));
+                    log::error!("recording write failed, stopping: {e}");
+                    if let Some(rec) = recorder.take() {
+                        finish_recording(rec, &event_tx);
+                    }
+                    record_channels = None;
                 }
             }
             // If not recording, block is silently discarded.
@@ -358,6 +370,12 @@ fn recorder_loop(
                     .unwrap_or(0.0)
             };
             let _ = event_tx.send(RecorderEvent::BufferStatus { occupancy });
+            if let Some(ref rec) = recorder {
+                let _ = event_tx.send(RecorderEvent::Progress {
+                    blocks: rec.block_count(),
+                    bytes: rec.byte_count(),
+                });
+            }
             last_status_report = Instant::now();
         }
 

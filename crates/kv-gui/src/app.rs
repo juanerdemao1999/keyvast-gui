@@ -30,7 +30,6 @@ use kv_recorder::StreamingRecorder;
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
-use crate::audio_monitor::{self, AudioMonitorState};
 use crate::channel_map::{self, ChannelMapState};
 use crate::channel_select::{self, ChannelSelectState};
 use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
@@ -157,7 +156,6 @@ pub struct KvApp {
     channel_map: ChannelMapState,
     // Phase 3 features
     trigger: TriggerConfig,
-    audio_monitor: AudioMonitorState,
     remote_api_state: RemoteApiState,
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
@@ -226,7 +224,6 @@ impl KvApp {
             fft: FftState::default(),
             channel_map: ChannelMapState::default(),
             trigger: TriggerConfig::default(),
-            audio_monitor: AudioMonitorState::default(),
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
             export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
@@ -561,21 +558,9 @@ impl KvApp {
             TriggerAction::None => {}
         }
 
-        // Phase 3: Feed audio monitor
-        if self.audio_monitor.enabled {
-            let ach = self.audio_monitor.channel;
-            if ach < ch_count {
-                let spc = block.samples_per_channel;
-                let ch_samples: Vec<i16> = (0..spc)
-                    .map(|s| block.data[s * ch_count + ach])
-                    .collect();
-                self.audio_monitor.update_sample_rate(sample_rate);
-                self.audio_monitor.feed_samples(&ch_samples);
-            }
-        }
-
         // Feed the block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
+        let mut demo_write_failed = false;
         if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording
             && let Some(ref mut rec) = self.active_recorder {
                 let (write_result, written_values) = match self.record_channels {
@@ -596,10 +581,20 @@ impl KvApp {
                             .saturating_add(written_values * 2);
                     }
                     Err(e) => {
-                        self.recording_error = Some(format!("Recording write failed: {e}"));
+                        // A failed write means the file can no longer be
+                        // trusted — stop instead of writing into a possibly
+                        // corrupt recording.
+                        self.recording_error = Some(format!(
+                            "Recording write failed: {e} — recording stopped; file may be incomplete"
+                        ));
+                        log::error!("recording write failed, stopping: {e}");
+                        demo_write_failed = true;
                     }
                 }
             }
+        if demo_write_failed {
+            self.stop_recording();
+        }
 
         // Store raw + filtered history for pause/browse and re-filter.
         // filtered_history stays empty while no user filter is active — the
@@ -926,6 +921,7 @@ impl KvApp {
                     return Err("acquisition not running".to_string());
                 }
                 if let Some(dir) = output_dir {
+                    remote_api::validate_output_dir(dir)?;
                     self.recording.output_dir = dir.clone();
                 }
                 self.begin_recording();
@@ -1052,6 +1048,10 @@ impl KvApp {
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
+                RecorderEvent::Progress { blocks, bytes } => {
+                    self.recording.recorded_blocks = blocks;
+                    self.recording.recorded_bytes = bytes;
+                }
                 RecorderEvent::Error(e) => {
                     self.recording_error = Some(e);
                 }
@@ -1077,7 +1077,7 @@ impl KvApp {
         let remote_cmds: Vec<(u64, RemoteCommand)> = self
             .remote_api_handle
             .as_ref()
-            .map(|h| h.commands.lock().unwrap().drain(..).collect())
+            .map(|h| remote_api::lock_recover(&h.commands).drain(..).collect())
             .unwrap_or_default();
         if !remote_cmds.is_empty() {
             let mut responses: Vec<RemoteResponse> = Vec::new();
@@ -1086,7 +1086,7 @@ impl KvApp {
                 responses.push(RemoteResponse { id, result });
             }
             if let Some(ref handle) = self.remote_api_handle {
-                let mut resp_q = handle.responses.lock().unwrap();
+                let mut resp_q = remote_api::lock_recover(&handle.responses);
                 for r in responses {
                     resp_q.push_back(r);
                 }
@@ -1599,14 +1599,6 @@ impl eframe::App for KvApp {
                 ui.add_space(4.0);
                 trigger::draw_trigger_section(ui, &mut self.trigger);
 
-                // Phase 3: Audio monitor
-                ui.add_space(4.0);
-                audio_monitor::draw_audio_monitor_section(
-                    ui,
-                    &mut self.audio_monitor,
-                    total_ch,
-                );
-
                 // Phase 3: Remote API
                 ui.add_space(4.0);
                 let prev_enabled = self.remote_api_state.enabled;
@@ -1633,7 +1625,7 @@ impl eframe::App for KvApp {
                 // Update client count
                 if let Some(ref handle) = self.remote_api_handle {
                     self.remote_api_state.client_count =
-                        *handle.client_count.lock().unwrap();
+                        *remote_api::lock_recover(&handle.client_count);
                 }
 
                 // Phase 3: Export format selector (below recording)
@@ -1722,8 +1714,6 @@ impl eframe::App for KvApp {
                         &self.filters,
                         &self.recording.output_dir,
                         &self.recording.file_prefix,
-                        self.audio_monitor.channel,
-                        self.audio_monitor.volume,
                         self.remote_api_state.port,
                         self.probe_map.geometry.label(),
                         self.probe_map.site_radius,
@@ -1745,8 +1735,6 @@ impl eframe::App for KvApp {
                                 &mut self.filters,
                                 &mut self.recording.output_dir,
                                 &mut self.recording.file_prefix,
-                                &mut self.audio_monitor.channel,
-                                &mut self.audio_monitor.volume,
                                 &mut self.remote_api_state.port,
                             );
                             self.config_persist.status_message = Some("Loaded".to_string());

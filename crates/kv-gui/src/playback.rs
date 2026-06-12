@@ -38,6 +38,10 @@ pub struct PlaybackManager {
     pub speed: f64,
     /// Wall-clock time of last play tick.
     last_tick: Instant,
+    /// Cursor position of the last block emitted by `tick` — lets paused
+    /// frames skip re-reading/re-ingesting the same data while still
+    /// refreshing immediately after a seek/scrub.
+    last_emitted_frame: Option<u64>,
     /// Error message from file loading.
     pub error: Option<String>,
 }
@@ -52,6 +56,7 @@ impl Default for PlaybackManager {
             cursor_frame: 0,
             speed: 1.0,
             last_tick: Instant::now(),
+            last_emitted_frame: None,
             error: None,
         }
     }
@@ -78,6 +83,7 @@ impl PlaybackManager {
                 self.reader = Some(reader);
                 self.file_path = Some(path);
                 self.cursor_frame = 0;
+                self.last_emitted_frame = None;
                 self.state = PlaybackState::Paused;
                 self.error = None;
             }
@@ -94,6 +100,7 @@ impl PlaybackManager {
         self.metadata = None;
         self.file_path = None;
         self.cursor_frame = 0;
+        self.last_emitted_frame = None;
         self.state = PlaybackState::Idle;
         self.error = None;
     }
@@ -141,7 +148,10 @@ impl PlaybackManager {
     /// Returns None if there's no more data or not playing.
     pub fn tick(&mut self) -> Option<SampleBlock> {
         let meta = self.metadata.as_ref()?;
-        let reader = self.reader.as_mut()?;
+        self.reader.as_ref()?;
+        let sample_rate = meta.sample_rate;
+        let total_frames = meta.total_frames();
+        let samples_per_channel = meta.samples_per_channel;
 
         if self.state == PlaybackState::Playing {
             let now = Instant::now();
@@ -149,65 +159,43 @@ impl PlaybackManager {
             self.last_tick = now;
 
             let frames_to_advance =
-                (dt * meta.sample_rate * self.speed).round() as u64;
+                (dt * sample_rate * self.speed).round() as u64;
             self.cursor_frame = self
                 .cursor_frame
                 .saturating_add(frames_to_advance)
-                .min(meta.total_frames());
+                .min(total_frames);
 
             // Auto-pause at end of file.
-            if self.cursor_frame >= meta.total_frames() {
+            if self.cursor_frame >= total_frames {
                 self.state = PlaybackState::Paused;
             }
         }
 
-        // Read a chunk of data around the cursor for display.
-        let ch = meta.channel_count;
-        if ch == 0 {
+        // While paused, only emit a fresh block when the cursor actually
+        // moved (e.g. the user dragged the timeline scrubber) — re-reading
+        // and re-ingesting the same data every frame is wasted work.
+        if self.last_emitted_frame == Some(self.cursor_frame) {
             return None;
         }
 
         // Read up to one "block" of data (samples_per_channel or a reasonable chunk).
-        let block_frames = if meta.samples_per_channel > 0 {
-            meta.samples_per_channel
+        let block_frames = if samples_per_channel > 0 {
+            samples_per_channel
         } else {
             256
         };
-
         let start = self.cursor_frame.saturating_sub(block_frames as u64);
-        let actual_start = start;
-        let frames_to_read = (self.cursor_frame - actual_start) as usize;
-        let frames_to_read = frames_to_read.max(block_frames).min(MAX_DISPLAY_FRAMES);
+        let frames_to_read = ((self.cursor_frame - start) as usize)
+            .max(block_frames)
+            .min(MAX_DISPLAY_FRAMES);
 
-        let data = reader
-            .read_frames(actual_start, frames_to_read)
-            .ok()?;
-
-        if data.is_empty() {
-            return None;
-        }
-
-        let actual_frames = data.len() / ch;
-
-        Some(SampleBlock {
-            device_id: meta.device_id.clone(),
-            stream_id: 0,
-            packet_id: actual_start,
-            timestamp_start: actual_start,
-            sample_rate: meta.sample_rate,
-            channel_count: ch,
-            samples_per_channel: actual_frames,
-            ttl_bits: 0,
-            data,
-            aux_data: None,
-            board_adc_data: None,
-            ttl_in_per_sample: None,
-            ttl_out_per_sample: None,
-        })
+        let block = self.read_block_at(start, frames_to_read)?;
+        self.last_emitted_frame = Some(self.cursor_frame);
+        Some(block)
     }
 
-    /// Read a specific range of frames as a SampleBlock (for seek/scrub).
-    #[allow(dead_code)] // pending scrub-bar integration
+    /// Read a specific range of frames as a SampleBlock (used by `tick` and
+    /// the seek/scrub path).
     pub fn read_block_at(&mut self, start_frame: u64, num_frames: usize) -> Option<SampleBlock> {
         let meta = self.metadata.as_ref()?;
         let reader = self.reader.as_mut()?;

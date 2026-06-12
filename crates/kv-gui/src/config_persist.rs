@@ -1,7 +1,7 @@
 //! Config persistence — save/load session settings to a JSON file.
 //!
 //! Saves filter settings, display preferences, device configuration,
-//! channel selection, trigger config, audio monitor settings, and probe
+//! channel selection, trigger config, and probe
 //! map geometry to a config file that persists across sessions.
 //!
 //! Uses manual JSON serialization (no serde) to maintain consistency with
@@ -40,9 +40,6 @@ pub struct PersistentConfig {
     // Recording
     pub output_dir: String,
     pub file_prefix: String,
-    // Audio monitor
-    pub audio_channel: usize,
-    pub audio_volume: f32,
     // Remote API
     pub remote_port: u16,
     // Probe map
@@ -70,8 +67,6 @@ impl Default for PersistentConfig {
             car_enabled: false,
             output_dir: "recordings".to_string(),
             file_prefix: "session".to_string(),
-            audio_channel: 0,
-            audio_volume: 0.5,
             remote_port: 4444,
             probe_geometry: "linear_dual".to_string(),
             probe_site_radius: 6.0,
@@ -136,8 +131,6 @@ impl PersistentConfig {
   "car_enabled": {car_enabled},
   "output_dir": "{output_dir}",
   "file_prefix": "{file_prefix}",
-  "audio_channel": {audio_channel},
-  "audio_volume": {audio_volume:.2},
   "remote_port": {remote_port},
   "probe_geometry": "{probe_geometry}",
   "probe_site_radius": {probe_site_radius:.1}
@@ -159,8 +152,6 @@ impl PersistentConfig {
             car_enabled = self.car_enabled,
             output_dir = self.output_dir.replace('\\', "\\\\").replace('"', "\\\""),
             file_prefix = self.file_prefix.replace('"', "\\\""),
-            audio_channel = self.audio_channel,
-            audio_volume = self.audio_volume,
             remote_port = self.remote_port,
             probe_geometry = self.probe_geometry,
             probe_site_radius = self.probe_site_radius,
@@ -188,8 +179,6 @@ impl PersistentConfig {
         if let Some(v) = extract_bool(json, "car_enabled") { cfg.car_enabled = v; }
         if let Some(v) = extract_string(json, "output_dir") { cfg.output_dir = v; }
         if let Some(v) = extract_string(json, "file_prefix") { cfg.file_prefix = v; }
-        if let Some(v) = extract_usize(json, "audio_channel") { cfg.audio_channel = v; }
-        if let Some(v) = extract_f64(json, "audio_volume") { cfg.audio_volume = v as f32; }
         if let Some(v) = extract_usize(json, "remote_port") { cfg.remote_port = v as u16; }
         if let Some(v) = extract_string(json, "probe_geometry") { cfg.probe_geometry = v; }
         if let Some(v) = extract_f64(json, "probe_site_radius") { cfg.probe_site_radius = v as f32; }
@@ -198,14 +187,11 @@ impl PersistentConfig {
     }
 
     /// Capture current settings from the live application state.
-    #[allow(clippy::too_many_arguments)]
     pub fn capture_from(
         display: &DisplaySettings,
         filters: &FilterSettings,
         output_dir: &str,
         file_prefix: &str,
-        audio_channel: usize,
-        audio_volume: f32,
         remote_port: u16,
         probe_geometry: &str,
         probe_site_radius: f32,
@@ -231,8 +217,6 @@ impl PersistentConfig {
             car_enabled: filters.car_enabled,
             output_dir: output_dir.to_string(),
             file_prefix: file_prefix.to_string(),
-            audio_channel,
-            audio_volume,
             remote_port,
             probe_geometry: probe_geometry.to_string(),
             probe_site_radius,
@@ -240,15 +224,12 @@ impl PersistentConfig {
     }
 
     /// Apply loaded config to application state.
-    #[allow(clippy::too_many_arguments)]
     pub fn apply_to(
         &self,
         display: &mut DisplaySettings,
         filters: &mut FilterSettings,
         output_dir: &mut String,
         file_prefix: &mut String,
-        audio_channel: &mut usize,
-        audio_volume: &mut f32,
         remote_port: &mut u16,
     ) {
         display.visible_channels = self.visible_channels;
@@ -273,8 +254,6 @@ impl PersistentConfig {
 
         *output_dir = self.output_dir.clone();
         *file_prefix = self.file_prefix.clone();
-        *audio_channel = self.audio_channel;
-        *audio_volume = self.audio_volume;
         *remote_port = self.remote_port;
     }
 }

@@ -35,7 +35,7 @@ use crate::channel_map::{self, ChannelMapState};
 use crate::channel_select::{self, ChannelSelectState};
 use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
 use crate::fft_panel::{self, FftState};
-use crate::impedance_panel::{self, ImpedanceState};
+use crate::impedance_panel::{self, ImpedanceMsg, ImpedanceState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
 use crate::probe_map::{self, ProbeMapState};
 use crate::remote_api::{self, RemoteApiState, RemoteApiHandle, RemoteCommand, RemoteResponse, AppStatus};
@@ -137,6 +137,8 @@ pub struct KvApp {
     render_ms_ema: f64,
     // Phase 1 features
     impedance: ImpedanceState,
+    /// Receiver for progress/results from a background impedance thread.
+    impedance_rx: Option<std::sync::mpsc::Receiver<ImpedanceMsg>>,
     playback_mgr: PlaybackManager,
     // Phase 2 features
     fft: FftState,
@@ -148,6 +150,12 @@ pub struct KvApp {
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
     export_format: kv_recorder::export_formats::ExportFormat,
+    /// Receiver for the result of a background .kvraw export.
+    export_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    /// Outcome of the last export (output path or error message).
+    export_status: Option<String>,
+    /// Channel subset captured when a Demo-mode recording starts.
+    record_channels: Option<Vec<usize>>,
     // Phase 4 features
     probe_map: ProbeMapState,
     channel_select: ChannelSelectState,
@@ -199,6 +207,7 @@ impl KvApp {
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
             impedance: ImpedanceState::default(),
+            impedance_rx: None,
             playback_mgr: PlaybackManager::default(),
             fft: FftState::default(),
             channel_map: ChannelMapState::default(),
@@ -207,6 +216,9 @@ impl KvApp {
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
             export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            export_rx: None,
+            export_status: None,
+            record_channels: None,
             probe_map: ProbeMapState::default(),
             channel_select: ChannelSelectState::default(),
             config_persist: ConfigPersistState::default(),
@@ -299,9 +311,13 @@ impl KvApp {
                                 summary.recording.block_count,
                                 summary.recording.raw_path.display()
                             ),
-                            Err(e) => eprintln!("[recorder] Auto-stop finish error: {e}"),
+                            Err(e) => {
+                                self.recording_error =
+                                    Some(format!("Auto-stop finish error: {e}"));
+                            }
                         }
                     }
+                    self.record_channels = None;
                 }
                 AcqMode::Device => {
                     // Recorder thread will finalize on Terminate (sent by pipeline stop below)
@@ -532,21 +548,29 @@ impl KvApp {
             }
         }
 
-        // Feed raw block to the streaming recorder — Demo mode only.
+        // Feed the block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
         if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording {
             if let Some(ref mut rec) = self.active_recorder {
-                match rec.write_block(&block) {
+                let (write_result, written_values) = match self.record_channels {
+                    Some(ref indices) => {
+                        let filtered = channel_select::filter_block_channels(&block, indices);
+                        let len = filtered.data.len() as u64;
+                        (rec.write_block(&filtered), len)
+                    }
+                    None => (rec.write_block(&block), block.data.len() as u64),
+                };
+                match write_result {
                     Ok(()) => {
                         self.recording.recorded_blocks =
                             self.recording.recorded_blocks.saturating_add(1);
                         self.recording.recorded_bytes = self
                             .recording
                             .recorded_bytes
-                            .saturating_add(block.data.len() as u64 * 2);
+                            .saturating_add(written_values * 2);
                     }
                     Err(e) => {
-                        eprintln!("[recorder] write_block error: {e}");
+                        self.recording_error = Some(format!("Recording write failed: {e}"));
                     }
                 }
             }
@@ -602,80 +626,23 @@ impl KvApp {
                     self.recording.state = RecordingState::Armed;
                 }
             }
-            RecordingState::Armed => match self.mode {
-                AcqMode::Device => {
-                    // Device mode: tell the recorder thread to open the file.
-                    if let Some(ref pipeline) = self.live_pipeline {
-                        let path: std::path::PathBuf = self.recording.output_dir.clone().into();
-                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start(path));
-                        self.recording.state = RecordingState::Recording;
-                        self.recording.recorded_blocks = 0;
-                        self.recording.recorded_bytes = 0;
-                        self.recording_start_time = Some(Instant::now());
-                        self.recording_error = None;
-                    }
-                }
-                AcqMode::Demo => {
-                    // Demo mode: open recorder in GUI thread (legacy path).
-                    match StreamingRecorder::new(&self.recording.output_dir) {
-                        Ok(rec) => {
-                            self.active_recorder = Some(rec);
-                            self.recording.state = RecordingState::Recording;
-                            self.recording.recorded_blocks = 0;
-                            self.recording.recorded_bytes = 0;
-                            self.recording_start_time = Some(Instant::now());
-                            self.recording_error = None;
-                        }
-                        Err(e) => {
-                            self.recording_error = Some(format!("Failed to open output: {e}"));
-                        }
-                    }
-                }
-            },
-            RecordingState::Recording => match self.mode {
-                AcqMode::Device => {
-                    // Device mode: tell the recorder thread to finalize.
-                    // State will be updated to Idle via RecorderEvent::Stopped.
-                    if let Some(ref pipeline) = self.live_pipeline {
-                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
-                        self.recording_start_time = None;
-                        self.recorder_buffer_occupancy = 0.0;
-                    }
-                }
-                AcqMode::Demo => {
-                    // Demo mode: finalize in GUI thread.
-                    if let Some(rec) = self.active_recorder.take() {
-                        match rec.finish() {
-                            Ok(summary) => {
-                                eprintln!(
-                                    "[recorder] Saved {} blocks ({} bytes) → {}",
-                                    summary.recording.block_count,
-                                    summary.recording.byte_count,
-                                    summary.recording.raw_path.display()
-                                );
-                            }
-                            Err(e) => {
-                                self.recording_error =
-                                    Some(format!("Finish error: {e}"));
-                            }
-                        }
-                    }
-                    self.recording.state = RecordingState::Idle;
-                    self.recording_start_time = None;
-                    self.recorder_buffer_occupancy = 0.0;
-                }
-            },
+            RecordingState::Armed => self.begin_recording(),
+            RecordingState::Recording => self.stop_recording(),
         }
     }
 
-    /// Start recording (trigger-callable shortcut for toggle logic).
+    /// Start recording (used by the Armed → Recording transition, triggers,
+    /// and the remote API). Captures the channel selection at start so a
+    /// mid-recording selection change cannot change the file's layout.
     fn begin_recording(&mut self) {
-        // Same logic as Armed → Recording transition
+        let channels = self.channel_select.recording_selection();
         match self.mode {
             AcqMode::Device => {
                 if let Some(ref pipeline) = self.live_pipeline {
                     let path: std::path::PathBuf = self.recording.output_dir.clone().into();
-                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start(path));
+                    let _ = pipeline
+                        .recorder_cmd_tx
+                        .send(RecorderCmd::Start { path, channels });
                     self.recording.state = RecordingState::Recording;
                     self.recording.recorded_blocks = 0;
                     self.recording.recorded_bytes = 0;
@@ -687,6 +654,7 @@ impl KvApp {
                 match StreamingRecorder::new(&self.recording.output_dir) {
                     Ok(rec) => {
                         self.active_recorder = Some(rec);
+                        self.record_channels = channels;
                         self.recording.state = RecordingState::Recording;
                         self.recording.recorded_blocks = 0;
                         self.recording.recorded_bytes = 0;
@@ -694,17 +662,18 @@ impl KvApp {
                         self.recording_error = None;
                     }
                     Err(e) => {
-                        self.recording_error = Some(format!("Trigger start error: {e}"));
+                        self.recording_error = Some(format!("Failed to open output: {e}"));
                     }
                 }
             }
         }
     }
 
-    /// Stop recording (trigger-callable shortcut).
+    /// Stop recording (used by the toggle, triggers, and the remote API).
     fn stop_recording(&mut self) {
         match self.mode {
             AcqMode::Device => {
+                // Recorder thread finalizes; state goes Idle via RecorderEvent::Stopped.
                 if let Some(ref pipeline) = self.live_pipeline {
                     let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
                     self.recording_start_time = None;
@@ -716,8 +685,9 @@ impl KvApp {
                     match rec.finish() {
                         Ok(summary) => {
                             eprintln!(
-                                "[recorder/trigger] Saved {} blocks → {}",
+                                "[recorder] Saved {} blocks ({} bytes) → {}",
                                 summary.recording.block_count,
+                                summary.recording.byte_count,
                                 summary.recording.raw_path.display()
                             );
                         }
@@ -726,9 +696,139 @@ impl KvApp {
                         }
                     }
                 }
+                self.record_channels = None;
                 self.recording.state = RecordingState::Idle;
                 self.recording_start_time = None;
                 self.recorder_buffer_occupancy = 0.0;
+            }
+        }
+    }
+
+    /// Launch a background impedance measurement on the RHD hardware.
+    /// The test drives the SPI bus itself, so any running acquisition is
+    /// stopped first and the device is reopened by the worker thread.
+    fn start_impedance_test(&mut self) {
+        if self.impedance.measuring {
+            return;
+        }
+        if self.device.kind != DeviceKind::Rhd {
+            self.impedance.error =
+                Some("Impedance test requires the RHD hardware source".to_string());
+            return;
+        }
+        let Some(bitfile) = self.device.rhd_bitfile.clone() else {
+            self.impedance.error =
+                Some("Select an FPGA bitfile in the DEVICE panel first".to_string());
+            return;
+        };
+        self.stop_all();
+
+        let streams = self.device.rhd_streams;
+        let config = kv_rhd::ImpedanceTestConfig {
+            frequency_hz: self.impedance.frequency_hz,
+            num_periods: self.impedance.num_periods,
+            channel_count: kv_rhd::CHANNELS_PER_STREAM * streams,
+            ..Default::default()
+        };
+        let options = RhdHardwareOptions::new(bitfile, streams);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.impedance.measuring = true;
+        self.impedance.error = None;
+        self.impedance.progress = (0, config.channel_count);
+        self.impedance_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let backend = match kv_rhd::RhdHardwareBackend::open(options) {
+                Ok(backend) => backend,
+                Err(e) => {
+                    let _ = tx.send(ImpedanceMsg::Failed(format!("device open failed: {e}")));
+                    return;
+                }
+            };
+            let progress_tx = tx.clone();
+            let progress = move |cur: usize, total: usize| {
+                let _ = progress_tx.send(ImpedanceMsg::Progress(cur, total));
+            };
+            match backend.run_impedance_test(&config, Some(&progress)) {
+                Ok(result) => {
+                    let _ = tx.send(ImpedanceMsg::Done(result));
+                }
+                Err(e) => {
+                    let _ = tx.send(ImpedanceMsg::Failed(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Drain progress/results from the background impedance thread.
+    fn poll_impedance(&mut self) {
+        let Some(rx) = self.impedance_rx.as_ref() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(ImpedanceMsg::Progress(cur, total)) => {
+                    self.impedance.progress = (cur, total);
+                }
+                Ok(ImpedanceMsg::Done(result)) => {
+                    self.impedance.results = Some(result);
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+                Ok(ImpedanceMsg::Failed(e)) => {
+                    self.impedance.error = Some(e);
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.impedance.error =
+                        Some("impedance thread exited unexpectedly".to_string());
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.impedance_rx = None;
+        }
+    }
+
+    /// Convert a .kvraw recording to the selected export format on a
+    /// background thread, writing the output next to the source file.
+    fn start_export(&mut self, source: std::path::PathBuf) {
+        let format = self.export_format;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.export_rx = Some(rx);
+        self.export_status = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(export_kvraw(&source, format));
+        });
+    }
+
+    /// Drain the result of the background .kvraw export, if any.
+    fn poll_export(&mut self) {
+        let Some(rx) = self.export_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.export_status = Some(format!("Exported → {}", path.display()));
+                self.export_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.export_status = Some(format!("Export failed: {e}"));
+                self.export_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.export_status = Some("export thread exited unexpectedly".to_string());
+                self.export_rx = None;
             }
         }
     }
@@ -1056,6 +1156,10 @@ impl eframe::App for KvApp {
             AcqMode::Device => self.tick_device(),
         }
 
+        // Drain background impedance-test and export results.
+        self.poll_impedance();
+        self.poll_export();
+
         // Tick playback if active.
         if self.playback_mgr.is_loaded() {
             if let Some(block) = self.playback_mgr.tick() {
@@ -1365,13 +1469,17 @@ impl eframe::App for KvApp {
                 // Impedance panel
                 ui.add_space(4.0);
                 let mut start_impedance = false;
-                let acq_running = self.is_running();
+                let can_measure =
+                    self.device.kind == DeviceKind::Rhd && self.device.rhd_bitfile.is_some();
                 impedance_panel::draw_impedance_section(
                     ui,
                     &mut self.impedance,
-                    acq_running,
+                    can_measure,
                     &mut start_impedance,
                 );
+                if start_impedance {
+                    self.start_impedance_test();
+                }
 
                 // Playback panel
                 ui.add_space(4.0);
@@ -1493,6 +1601,35 @@ impl eframe::App for KvApp {
                             .italics()
                             .color(theme::TEXT_DIM),
                     );
+                    ui.add_space(2.0);
+                    let exporting = self.export_rx.is_some();
+                    if ui
+                        .add_enabled(
+                            !exporting,
+                            egui::Button::new(
+                                egui::RichText::new("Export .kvraw…").size(10.0),
+                            ),
+                        )
+                        .on_hover_text("Convert a .kvraw recording to the selected format")
+                        .clicked()
+                    {
+                        if let Some(path) = playback::pick_kvraw_file() {
+                            self.start_export(path);
+                        }
+                    }
+                    if exporting {
+                        ui.label(
+                            egui::RichText::new("Exporting…")
+                                .size(9.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    } else if let Some(ref status) = self.export_status {
+                        ui.label(
+                            egui::RichText::new(status)
+                                .size(9.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
                 });
 
                 // Phase 4: Probe Map config
@@ -1623,10 +1760,80 @@ impl eframe::App for KvApp {
             });
 
         // Request continuous repaints while running (or paused — for overlay)
-        if self.is_running() || self.display_paused {
+        // and while background impedance/export work needs progress updates.
+        if self.is_running()
+            || self.display_paused
+            || self.impedance_rx.is_some()
+            || self.export_rx.is_some()
+        {
             ctx.request_repaint();
         }
     }
+}
+
+/// Read an entire .kvraw file and export it in the requested format.
+/// Returns the output path on success.
+fn export_kvraw(
+    source: &std::path::Path,
+    format: kv_recorder::export_formats::ExportFormat,
+) -> Result<std::path::PathBuf, String> {
+    use kv_recorder::KvrawReader;
+    use kv_recorder::export_formats::{self, ExportFormat};
+
+    let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
+    let meta = reader.metadata().clone();
+    if meta.channel_count == 0 {
+        return Err("kvraw file has no channels".to_string());
+    }
+    let total_frames = reader.total_frames();
+
+    // Read in ~1 s chunks; the exporters re-chunk internally as needed.
+    const FRAMES_PER_CHUNK: usize = 30_000;
+    let mut blocks: Vec<SampleBlock> = Vec::new();
+    let mut frame: u64 = 0;
+    let mut packet_id: u64 = 0;
+    while frame < total_frames {
+        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+        let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
+        if data.is_empty() {
+            break;
+        }
+        let frames_read = data.len() / meta.channel_count;
+        blocks.push(SampleBlock {
+            device_id: meta.device_id.clone(),
+            stream_id: 0,
+            packet_id,
+            timestamp_start: frame,
+            sample_rate: meta.sample_rate,
+            channel_count: meta.channel_count,
+            samples_per_channel: frames_read,
+            ttl_bits: 0,
+            data,
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        });
+        packet_id += 1;
+        frame += frames_read as u64;
+    }
+    if blocks.is_empty() {
+        return Err("no data to export".to_string());
+    }
+
+    let notes = format!("exported from {}", source.display());
+    match format {
+        ExportFormat::IntanRhd => {
+            let output = source.with_extension(format.extension());
+            export_formats::export_intan_rhd(&output, &blocks, &notes)
+        }
+        ExportFormat::FlatBinary => {
+            // Flat binary writes recording.bin + recording.meta.json into a directory.
+            let output_dir = source.with_extension("export");
+            export_formats::export_flat_binary(&output_dir, &blocks, &notes)
+        }
+    }
+    .map_err(|e| e.to_string())
 }
 
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

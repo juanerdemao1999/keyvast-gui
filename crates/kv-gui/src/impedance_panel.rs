@@ -9,6 +9,17 @@ use kv_rhd::impedance::{ChannelImpedance, ImpedanceResult};
 
 use crate::theme;
 
+/// Messages sent from the background impedance-measurement thread to the GUI.
+#[derive(Debug)]
+pub enum ImpedanceMsg {
+    /// Per-channel progress: (current_channel, total_channels).
+    Progress(usize, usize),
+    /// Measurement finished successfully.
+    Done(ImpedanceResult),
+    /// Measurement failed.
+    Failed(String),
+}
+
 /// State for the impedance panel.
 #[derive(Debug)]
 pub struct ImpedanceState {
@@ -43,7 +54,7 @@ impl Default for ImpedanceState {
 pub fn draw_impedance_section(
     ui: &mut egui::Ui,
     state: &mut ImpedanceState,
-    acquiring: bool,
+    can_measure: bool,
     start_impedance: &mut bool,
 ) {
     egui::CollapsingHeader::new(
@@ -97,11 +108,11 @@ pub fn draw_impedance_section(
                     .text(format!("Channel {cur}/{total}")),
             );
         } else {
-            let enabled = acquiring;
-            let tooltip = if !acquiring {
-                "Start acquisition first"
+            let enabled = can_measure;
+            let tooltip = if !can_measure {
+                "Select the RHD source and an FPGA bitfile in the DEVICE panel first"
             } else {
-                "Measure impedance on all channels"
+                "Measure impedance on all channels (stops acquisition during the test)"
             };
             if ui
                 .add_enabled(

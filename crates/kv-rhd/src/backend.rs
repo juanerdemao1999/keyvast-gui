@@ -149,6 +149,20 @@ impl RhdHardwareBackend {
 
         Ok(block)
     }
+
+    /// Run an impedance measurement across all channels.
+    ///
+    /// The test drives the SPI bus itself, so it requires exclusive device
+    /// access — call this on a freshly opened backend, not while continuous
+    /// acquisition is streaming.
+    pub fn run_impedance_test(
+        &self,
+        config: &impedance::ImpedanceTestConfig,
+        progress_callback: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<impedance::ImpedanceResult, RhdReadError> {
+        self.board
+            .run_impedance_test(config, self.config.enabled_streams, progress_callback)
+    }
 }
 
 struct RhythmFrontPanelBoard {

@@ -20,7 +20,29 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (Reliability: write-failure auto-stop, live progress, poison-safe locks, input validation; audio monitor removed)
+Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
+
+### Session 27: Feature triage — remove probe map + per-channel stats
+
+Product decisions (user): the probe map panel/window and the per-channel
+RMS/peak-to-peak statistics are dropped; development focus moves to GUI
+visual design and interaction-logic polish.
+
+1. **Probe map removed**: `probe_map.rs` deleted, sidebar section + floating
+   window gone, `probe_geometry`/`probe_site_radius` config fields removed
+   (old config files still load — unknown keys are ignored).
+2. **Per-channel stats removed**: `ChannelStats` and `compute_channel_stats`
+   deleted from `preview.rs`; `BlockStats` keeps only the status-bar scalars
+   (data rate, block rate, totals, dropped blocks), saving a per-block
+   O(channels × samples) pass.
+3. Branch admin this session: PRs #10/#14/#12/#13/#15 merged into `v2.0`;
+   `v2.0` and `main` share no git history, so the default branch should be
+   switched to `v2.0` in repo settings (needs admin); stale feature branches
+   deleted — only `main`, `v2.0`, `dev` remain.
+
+Verification: workspace tests pass; clippy zero warnings (workspace and
+kv-gui MSVC target); `cargo check -p kv-gui --target x86_64-pc-windows-msvc`
+clean. Not run: Windows GUI smoke test.
 
 ### Session 26: Reliability + cleanup (stacked on P2 branch)
 

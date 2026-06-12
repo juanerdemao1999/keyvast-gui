@@ -1,8 +1,8 @@
 //! Config persistence — save/load session settings to a JSON file.
 //!
 //! Saves filter settings, display preferences, device configuration,
-//! channel selection, trigger config, and probe
-//! map geometry to a config file that persists across sessions.
+//! channel selection, and trigger config to a config file that persists
+//! across sessions.
 //!
 //! Uses manual JSON serialization (no serde) to maintain consistency with
 //! the rest of the codebase.
@@ -42,9 +42,6 @@ pub struct PersistentConfig {
     pub file_prefix: String,
     // Remote API
     pub remote_port: u16,
-    // Probe map
-    pub probe_geometry: String,
-    pub probe_site_radius: f32,
 }
 
 impl Default for PersistentConfig {
@@ -68,8 +65,6 @@ impl Default for PersistentConfig {
             output_dir: "recordings".to_string(),
             file_prefix: "session".to_string(),
             remote_port: 4444,
-            probe_geometry: "linear_dual".to_string(),
-            probe_site_radius: 6.0,
         }
     }
 }
@@ -131,9 +126,7 @@ impl PersistentConfig {
   "car_enabled": {car_enabled},
   "output_dir": "{output_dir}",
   "file_prefix": "{file_prefix}",
-  "remote_port": {remote_port},
-  "probe_geometry": "{probe_geometry}",
-  "probe_site_radius": {probe_site_radius:.1}
+  "remote_port": {remote_port}
 }}"#,
             visible_channels = self.visible_channels,
             time_scale_idx = self.time_scale_idx,
@@ -153,8 +146,6 @@ impl PersistentConfig {
             output_dir = self.output_dir.replace('\\', "\\\\").replace('"', "\\\""),
             file_prefix = self.file_prefix.replace('"', "\\\""),
             remote_port = self.remote_port,
-            probe_geometry = self.probe_geometry,
-            probe_site_radius = self.probe_site_radius,
         )
     }
 
@@ -180,8 +171,6 @@ impl PersistentConfig {
         if let Some(v) = extract_string(json, "output_dir") { cfg.output_dir = v; }
         if let Some(v) = extract_string(json, "file_prefix") { cfg.file_prefix = v; }
         if let Some(v) = extract_usize(json, "remote_port") { cfg.remote_port = v as u16; }
-        if let Some(v) = extract_string(json, "probe_geometry") { cfg.probe_geometry = v; }
-        if let Some(v) = extract_f64(json, "probe_site_radius") { cfg.probe_site_radius = v as f32; }
 
         cfg
     }
@@ -193,8 +182,6 @@ impl PersistentConfig {
         output_dir: &str,
         file_prefix: &str,
         remote_port: u16,
-        probe_geometry: &str,
-        probe_site_radius: f32,
     ) -> Self {
         Self {
             visible_channels: display.visible_channels,
@@ -218,8 +205,6 @@ impl PersistentConfig {
             output_dir: output_dir.to_string(),
             file_prefix: file_prefix.to_string(),
             remote_port,
-            probe_geometry: probe_geometry.to_string(),
-            probe_site_radius,
         }
     }
 

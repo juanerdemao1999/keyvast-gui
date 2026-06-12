@@ -24,12 +24,37 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 
 use eframe::egui;
 
 use crate::theme;
+
+/// Lock a mutex, recovering from poisoning. A panicked worker thread must
+/// not take down the GUI thread or stop acquisition.
+pub fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Validate an output directory received from a remote client before it is
+/// used as a recording path. Rejects empty paths, embedded NUL bytes, and
+/// parent-directory traversal components.
+pub fn validate_output_dir(dir: &str) -> Result<(), String> {
+    if dir.trim().is_empty() {
+        return Err("output_dir is empty".to_string());
+    }
+    if dir.contains('\0') {
+        return Err("output_dir contains a NUL byte".to_string());
+    }
+    let traversal = std::path::Path::new(dir)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    if traversal {
+        return Err("output_dir must not contain '..' components".to_string());
+    }
+    Ok(())
+}
 
 /// Default port for the remote control server.
 pub const DEFAULT_PORT: u16 = 4444;
@@ -192,11 +217,11 @@ fn server_loop(
                 let resps_c = Arc::clone(&responses);
                 let cc_c = Arc::clone(&client_count);
 
-                *cc_c.lock().unwrap() += 1;
+                *lock_recover(&cc_c) += 1;
 
                 thread::spawn(move || {
                     handle_client(stream, stop_c, cmds_c, resps_c);
-                    *cc_c.lock().unwrap() -= 1;
+                    *lock_recover(&cc_c) -= 1;
                 });
             }
             Err(_) => {
@@ -229,13 +254,13 @@ fn handle_client(
             Ok(0) => break, // connection closed
             Ok(_) => {
                 if let Some((id, cmd)) = parse_jsonrpc_request(&line) {
-                    commands.lock().unwrap().push_back((id, cmd));
+                    lock_recover(&commands).push_back((id, cmd));
 
                     // Wait briefly for response (poll up to 100ms)
                     let mut response_sent = false;
                     for _ in 0..20 {
                         thread::sleep(std::time::Duration::from_millis(5));
-                        let mut resps = responses.lock().unwrap();
+                        let mut resps = lock_recover(&responses);
                         if let Some(pos) = resps.iter().position(|r| r.id == id) {
                             let resp = resps.remove(pos).unwrap();
                             let json = format_jsonrpc_response(id, &resp.result);
@@ -479,6 +504,22 @@ mod tests {
         } else {
             panic!("wrong command");
         }
+    }
+
+    #[test]
+    fn validate_output_dir_accepts_normal_paths() {
+        assert!(validate_output_dir("recordings").is_ok());
+        assert!(validate_output_dir("data/session1").is_ok());
+        assert!(validate_output_dir("C:\\data\\recordings").is_ok());
+    }
+
+    #[test]
+    fn validate_output_dir_rejects_bad_paths() {
+        assert!(validate_output_dir("").is_err());
+        assert!(validate_output_dir("   ").is_err());
+        assert!(validate_output_dir("data\0dir").is_err());
+        assert!(validate_output_dir("../escape").is_err());
+        assert!(validate_output_dir("data/../../escape").is_err());
     }
 
     #[test]

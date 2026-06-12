@@ -644,6 +644,10 @@ impl StreamingRecorder {
         self.block_count
     }
 
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
     /// Write one block, validating consistency and appending raw samples.
     pub fn write_block(&mut self, block: &SampleBlock) -> Result<(), RecorderError> {
         block

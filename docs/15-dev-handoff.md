@@ -20,7 +20,44 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (P2: CI, clippy clean, log crate)
+Last updated: 2026-06-12 (Reliability: write-failure auto-stop, live progress, poison-safe locks, input validation; audio monitor removed)
+
+### Session 26: Reliability + cleanup (stacked on P2 branch)
+
+Branch `devin/1781290000-reliability`:
+
+1. **Audio monitor removed** (product decision): `audio_monitor.rs` deleted,
+   sidebar section, per-block feed in `ingest_block`, and the
+   `audio_channel`/`audio_volume` config fields are gone. Old config files
+   still load (unknown keys are ignored by the lenient parser).
+2. **Write-failure auto-stop (B1)**: a failed `write_block` now stops and
+   finalizes the recording immediately in both paths (Demo in `ingest_block`,
+   Device in `recorder_loop`) instead of continuing to write into a possibly
+   corrupt file. The error banner says the file may be incomplete.
+3. **Live recording progress (B2)**: new `RecorderEvent::Progress { blocks,
+   bytes }` sent ~5/s by the recorder thread; `StreamingRecorder` gained a
+   `byte_count()` getter. The status panel now updates during Device
+   recordings instead of only at Stop.
+4. **Poison-safe locks (B3)**: all 7 `lock().unwrap()` (remote-API queues,
+   client_count) replaced with `remote_api::lock_recover` —
+   `unwrap_or_else(PoisonError::into_inner)` so a panicked worker can no
+   longer take down the GUI thread.
+5. **Remote-API input validation (B4)**: `validate_output_dir` rejects
+   empty paths, NUL bytes, and `..` traversal before `StartRecording`
+   accepts a client-supplied output_dir (unit tested).
+6. **Playback scrub (A2)**: `tick()` now emits a block only when the cursor
+   moved (`last_emitted_frame`), so paused frames stop re-ingesting the same
+   data every frame while scrubbing still refreshes instantly; `tick` now
+   routes through `read_block_at` (its dead_code allow removed).
+
+**Verification:** `cargo test --workspace --exclude kv-gui` all pass;
+clippy zero warnings on both halves; Windows-target check clean.
+GUI smoke test still pending on Windows.
+
+**Next:** merge chain #10 → #11 → #12 → this PR. Future: windows-latest CI
+job for kv-gui tests, app.rs split, serde_json, rustfmt decision.
+
+---
 
 ### Session 25: P2 — Engineering (CI workflow, clippy zero-warning, eprintln→log)
 

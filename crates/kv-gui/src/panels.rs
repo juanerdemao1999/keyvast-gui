@@ -312,15 +312,13 @@ fn default_bitfile_path() -> Option<PathBuf> {
 // ── Left control panel ──────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
-pub fn draw_left_panel(
+pub fn draw_acquire_core(
     ui: &mut egui::Ui,
     acquiring: bool,
     device: &mut DeviceSettings,
     start_clicked: &mut bool,
     stop_clicked: &mut bool,
     toggle_rec: &mut bool,
-    display: &mut DisplaySettings,
-    filters: &mut FilterSettings,
     recording: &mut RecordingSettings,
     block: Option<&SampleBlock>,
     // Elapsed recording wall-clock seconds (None when not recording).
@@ -332,31 +330,21 @@ pub fn draw_left_panel(
     // Set to true by the panel when the user clicks "dismiss error".
     dismiss_error: &mut bool,
 ) {
-    ui.set_min_width(220.0);
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        // Primary actions first: connect → acquire → record.
-        draw_device_section(ui, acquiring, device, block);
-        ui.add_space(4.0);
-        draw_acquisition_controls(ui, acquiring, start_clicked, stop_clicked);
-        ui.add_space(4.0);
-        draw_recording_section(
-            ui,
-            recording,
-            acquiring,
-            toggle_rec,
-            rec_elapsed_secs,
-            buffer_occupancy,
-            recording_error,
-            dismiss_error,
-        );
-        ui.add_space(4.0);
-        // Then view / processing controls.
-        draw_display_settings(ui, display);
-        ui.add_space(4.0);
-        draw_filter_settings(ui, filters);
-        ui.add_space(4.0);
-        draw_channel_list(ui, display, block);
-    });
+    // Primary actions first: connect → acquire → record.
+    draw_device_section(ui, acquiring, device, block);
+    ui.add_space(4.0);
+    draw_acquisition_controls(ui, acquiring, start_clicked, stop_clicked);
+    ui.add_space(4.0);
+    draw_recording_section(
+        ui,
+        recording,
+        acquiring,
+        toggle_rec,
+        rec_elapsed_secs,
+        buffer_occupancy,
+        recording_error,
+        dismiss_error,
+    );
 }
 
 // ── Device info ─────────────────────────────────────────────────────
@@ -507,7 +495,7 @@ fn draw_acquisition_controls(
 
 // ── Display settings ────────────────────────────────────────────────
 
-fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
+pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
     egui::CollapsingHeader::new(
         egui::RichText::new("DISPLAY").size(11.0).strong().color(theme::TEXT_SECONDARY),
     )
@@ -673,7 +661,7 @@ fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
 
 // ── Filter / signal-processing settings UI ──────────────────────────
 
-fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
+pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
     egui::CollapsingHeader::new(
         egui::RichText::new("FILTERS")
             .size(11.0)
@@ -761,7 +749,7 @@ fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
 
 // ── Channel list with enable/disable ────────────────────────────────
 
-fn draw_channel_list(
+pub fn draw_channel_list(
     ui: &mut egui::Ui,
     display: &mut DisplaySettings,
     block: Option<&SampleBlock>,

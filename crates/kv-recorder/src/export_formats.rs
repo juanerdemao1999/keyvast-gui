@@ -341,6 +341,10 @@ mod tests {
                 samples_per_channel: samples_per_ch,
                 ttl_bits: 0,
                 data,
+                aux_data: None,
+                board_adc_data: None,
+                ttl_in_per_sample: None,
+                ttl_out_per_sample: None,
             }
         }).collect()
     }

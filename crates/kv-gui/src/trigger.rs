@@ -351,6 +351,10 @@ mod tests {
             samples_per_channel: 64,
             ttl_bits,
             data: vec![0i16; 256],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
         }
     }
 

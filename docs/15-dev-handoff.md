@@ -20,7 +20,51 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (merged all phases: Phase 1–4 into v2.0)
+Last updated: 2026-06-12 (P0: wire unfinished features end-to-end)
+
+### Session 23: P0 — Wire unfinished features (impedance / export / selective save / demo errors)
+
+A full v2.0 audit found four features with UI but no backing implementation.
+This session wires them up (branch `devin/1781275384-p0-wire-features` → `v2.0`):
+
+1. **Impedance measurement wired** — `RhdHardwareBackend::run_impedance_test()`
+   public delegate added in `kv-rhd/src/backend.rs`. In the GUI, the Run button
+   now calls `KvApp::start_impedance_test()`: validates RHD source + bitfile,
+   stops acquisition (test needs exclusive SPI access), spawns a worker thread
+   that opens the device and runs the test, streaming `ImpedanceMsg`
+   (Progress/Done/Failed) over an mpsc channel polled each frame
+   (`poll_impedance`). Button gating changed from `acquiring` to
+   "RHD source + bitfile selected".
+2. **Export formats wired** — new "Export .kvraw…" button in the EXPORT FORMAT
+   section. `export_kvraw()` (app.rs) reads a .kvraw via `KvrawReader` in 1 s
+   chunks, rebuilds `SampleBlock`s, and calls `export_intan_rhd` (writes
+   `<stem>.rhd` next to the source) or `export_flat_binary` (writes
+   `<stem>.export/recording.bin` + meta). Runs on a worker thread; result
+   surfaced in the panel via `poll_export`.
+3. **Selective channel save wired** — `ChannelSelectState::recording_selection()`
+   returns the channel subset (None = save all) and is captured at recording
+   start (so mid-recording changes can't corrupt the file layout). Device mode:
+   `RecorderCmd::Start { path, channels }` carries it to the recorder thread.
+   Demo mode: `KvApp::record_channels`. Both paths filter via the new
+   `channel_select::filter_block_channels()` before `write_block`.
+4. **Demo recording errors surfaced** — demo-mode `write_block` and auto-stop
+   `finish` failures now set `recording_error` (red banner) instead of
+   eprintln-only. Also deduplicated `toggle_recording` to call
+   `begin_recording`/`stop_recording`.
+
+**Verification:** `cargo test --workspace --exclude kv-gui` (92 tests pass),
+`cargo check -p kv-gui --target x86_64-pc-windows-msvc` clean (pre-existing
+dead-code warnings only), kv-gui test code compiles (link step impossible on
+Linux — GUI smoke test and on-hardware impedance run still pending on the
+Windows machine).
+
+**Next:** P1 performance (lazy LFP/AP rings, dedup filtered_history, refilter
+debounce, release LTO), then P2 engineering (CI workflow, clippy cleanup,
+logging). Each as its own PR.
+
+---
+
+Previous state (2026-06-12, merged all phases: Phase 1–4 into v2.0):
 
 The project has progressed through 7 PRs on `v2.0`:
 - PR #2: Signal quality fixes (chip ID validation, FIFO MSB)

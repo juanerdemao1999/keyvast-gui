@@ -23,6 +23,8 @@ use kv_rhd::{RhdHardwareBackend, RhdHardwareOptions};
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::SampleBlock;
 
+use crate::channel_select;
+
 /// Recorder buffer: ~5 s at 64ch × 30 kHz / 64 spp = 2344 blocks/s.
 const RECORDER_CAPACITY: usize = 12_000;
 
@@ -46,8 +48,12 @@ pub enum PipelineSource {
 // ── Commands GUI → recorder thread ──────────────────────────────────
 
 pub enum RecorderCmd {
-    /// Open a new recording at the given directory.
-    Start(PathBuf),
+    /// Open a new recording at the given directory. When `channels` is
+    /// `Some`, only those channel indices are written (selective save).
+    Start {
+        path: PathBuf,
+        channels: Option<Vec<usize>>,
+    },
     /// Finalize and close the current recording.
     Stop,
     /// Stop recording (if active) and terminate the thread.
@@ -275,6 +281,9 @@ fn recorder_loop(
     event_tx: mpsc::Sender<RecorderEvent>,
 ) {
     let mut recorder: Option<StreamingRecorder> = None;
+    // Channel subset for selective save — captured at recording start so a
+    // selection change mid-recording cannot change the file's channel count.
+    let mut record_channels: Option<Vec<usize>> = None;
     // Rate-limit BufferStatus events to ~5 per second.
     let mut last_status_report = Instant::now();
     const STATUS_INTERVAL: Duration = Duration::from_millis(200);
@@ -284,9 +293,10 @@ fn recorder_loop(
     loop {
         // Handle any pending commands.
         match cmd_rx.try_recv() {
-            Ok(RecorderCmd::Start(path)) => match StreamingRecorder::new(&path) {
+            Ok(RecorderCmd::Start { path, channels }) => match StreamingRecorder::new(&path) {
                 Ok(rec) => {
                     recorder = Some(rec);
+                    record_channels = channels;
                     let _ = event_tx.send(RecorderEvent::Started);
                 }
                 Err(e) => {
@@ -319,7 +329,14 @@ fn recorder_loop(
             drained_any = true;
 
             if let Some(ref mut rec) = recorder {
-                if let Err(e) = rec.write_block(&block) {
+                let result = match record_channels {
+                    Some(ref indices) => {
+                        let filtered = channel_select::filter_block_channels(&block, indices);
+                        rec.write_block(&filtered)
+                    }
+                    None => rec.write_block(&block),
+                };
+                if let Err(e) = result {
                     let _ = event_tx.send(RecorderEvent::Error(format!("write failed: {e}")));
                 }
             }

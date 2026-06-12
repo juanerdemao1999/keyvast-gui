@@ -6,6 +6,7 @@
 //! recording pipeline when writing blocks.
 
 use eframe::egui;
+use kv_types::SampleBlock;
 
 use crate::theme;
 
@@ -90,6 +91,20 @@ impl ChannelSelectState {
         }
     }
 
+    /// Channel indices to write while recording, or `None` when every
+    /// channel should be saved (selection disabled, empty, or complete).
+    pub fn recording_selection(&self) -> Option<Vec<usize>> {
+        if !self.enabled {
+            return None;
+        }
+        let indices = self.selected_indices();
+        if indices.is_empty() || indices.len() == self.channel_count {
+            None
+        } else {
+            Some(indices)
+        }
+    }
+
     /// Filter a block's data to only include selected channels.
     /// Returns (filtered_data, filtered_channel_count).
     pub fn filter_block_data(&self, data: &[i16], channel_count: usize, samples_per_channel: usize) -> (Vec<i16>, usize) {
@@ -110,6 +125,25 @@ impl ChannelSelectState {
             }
         }
         (out, out_ch)
+    }
+}
+
+/// Build a copy of `block` containing only the given channels, preserving
+/// sample order. Indices outside the block's channel range are skipped.
+pub fn filter_block_channels(block: &SampleBlock, indices: &[usize]) -> SampleBlock {
+    let ch = block.channel_count;
+    let spc = block.samples_per_channel;
+    let valid: Vec<usize> = indices.iter().copied().filter(|&c| c < ch).collect();
+    let mut data = Vec::with_capacity(valid.len() * spc);
+    for s in 0..spc {
+        for &c in &valid {
+            data.push(block.data[s * ch + c]);
+        }
+    }
+    SampleBlock {
+        data,
+        channel_count: valid.len(),
+        ..block.clone()
     }
 }
 

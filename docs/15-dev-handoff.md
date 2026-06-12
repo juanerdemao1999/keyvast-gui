@@ -20,11 +20,81 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-10 (session 22 — Phase 1: impedance measurement + offline playback)
+Last updated: 2026-06-12 (merged all phases: Phase 1–4 into v2.0)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+The project has progressed through 7 PRs on `v2.0`:
+- PR #2: Signal quality fixes (chip ID validation, FIFO MSB)
+- PR #3: Open Ephys alignment (11 fixes)
+- PR #4: Code audit bug fixes + architecture improvements
+- PR #5: Phase 1 — impedance measurement + offline .kvraw playback
+- PR #6: Phase 2 — Roll mode, channel colors, FFT spectrum, channel mapping
+- PR #7: Phase 3 — Recording format export, Gate/Trigger, Audio monitor, Remote API
+- PR #8: Phase 4 — Probe Map, selective channel save, config persistence
 
-Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+None of the PRs have been merged yet (v2.0 still has only the initial commit).
+
+### Phase 4: Advanced Features
+
+**New modules added:**
+
+1. **`kv-gui/src/probe_map.rs`** — 2D probe layout visualization. Presets: LinearSingle, LinearDual, Tetrode, Grid4x8, Custom. Per-channel RMS → color mapping (blue→cyan→yellow→red). Floating window with zoom/pan, color bar legend, hover tooltips. Tests: 5.
+
+2. **`kv-gui/src/channel_select.rs`** — Selective channel recording. Per-channel checkboxes, quick actions (All/None/Even/Odd), range selection. `filter_block_data()` extracts only selected channels from interleaved data. Tests: 6.
+
+3. **`kv-gui/src/config_persist.rs`** — JSON config file (keyvast_config.json next to exe). Saves/loads: display settings, filter config, recording paths, audio monitor, remote API port, probe geometry. Manual JSON serialization (no serde). Auto-save option. Tests: 4.
+
+**Integration in `app.rs`:**
+- ProbeMapState, ChannelSelectState, ConfigPersistState fields added to KvApp
+- Probe map activity updated from display ring each frame
+- Channel select syncs to acquisition channel count
+- Config save/load buttons trigger capture_from/apply_to
+- Probe map drawn as floating egui::Window when visible
+
+**Build verification:**
+- `cargo check -p kv-rhd` ✓
+- `cargo check -p kv-gui --target x86_64-pc-windows-msvc` ✓ (warnings only)
+- `cargo test --workspace --exclude kv-gui` ✓ (92 tests pass)
+
+**All planned phases complete.** Future enhancements could include:
+- Spike sorting (online clustering)
+- LFP spectral decomposition (theta/gamma bands)
+- Multi-probe support
+- Network streaming (LSL integration)
+- Plugin system for custom analysis
+
+---
+
+### Phase 3: Recording & Integration Features
+
+**New modules added:**
+
+1. **`kv-recorder/src/export_formats.rs`** — Export to Intan .rhd (magic 0xC6912702, v2.0 header with Qt QStrings, 128-sample data blocks) and flat binary (.bin + .meta.json). Tests: roundtrip, empty-blocks error, file creation.
+
+2. **`kv-gui/src/trigger.rs`** — Gate/Trigger recording control. TriggerEdge (Rising/Falling), TriggerMode (Level/EdgeToggle/EdgeTimed), TriggerState (Disabled/Armed/Triggered). `process_block()` returns TriggerAction (None/StartRecording/StopRecording). Tests: 5 scenarios.
+
+3. **`kv-gui/src/audio_monitor.rs`** — Audio buffer-only interface (ready for cpal integration). Decimates 30kHz → configurable output rate, volume control, ring buffer with overflow handling. Tests: 5 scenarios.
+
+4. **`kv-gui/src/remote_api.rs`** — TCP server + JSON-RPC 2.0 (newline-delimited). Commands: Ping, GetStatus, GetChannelCount, StartAcquisition, StopAcquisition, StartRecording, StopRecording, SetDisplayMode. Default port 4444. Tests: 6 parse/format tests.
+
+**Integration in `app.rs`:**
+- TriggerConfig, AudioMonitorState, RemoteApiState, RemoteApiHandle fields added to KvApp
+- Trigger actions processed in ingest_block → calls begin_recording/stop_recording
+- Audio monitor fed from block data each ingest
+- Remote command queue polled each frame, responses sent back
+- Export format selector UI in sidebar (CollapsingHeader)
+- Remote API start/stop logic tied to enabled toggle
+
+**Build verification:**
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-recorder` ✓
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-gui --target x86_64-pc-windows-msvc` ✓ (warnings only)
+- `RUSTUP_TOOLCHAIN=nightly cargo test --workspace --exclude kv-gui` ✓ (92 tests pass)
+
+**Next (Phase 4):**
+- Probe Map visualization
+- Selective channel save
+- Config persistence (save/load session settings)
+
+---
 
 ### Session 22: Phase 1 — Impedance measurement + offline .kvraw playback
 
@@ -877,6 +947,34 @@ These do not block the next core step:
 3. Whether TTL should remain `SampleBlock.ttl_bits` plus timestamped events.
 4. Recorder buffer defaults: 5 seconds for recorder, 1 second for GUI preview.
 5. Recording folder format: `run-YYYYMMDD-HHMMSS`.
+
+### Session: Phase 2 — display features (Roll mode, channel colors, FFT, channel mapping)
+
+**Date**: 2026-06-10
+**Branch**: `devin/1781113191-phase2-display-features` (base: `v2.0`)
+
+**What changed**:
+
+1. **Roll mode display** (`panels.rs`, `app.rs`) — `DisplayMode::Sweep | Roll` enum. In Roll mode, `sweep_start_ms = (latest_ms - window_ms).max(0.0)` every frame. Sweep cursor only drawn in Sweep mode. UI toggle in DISPLAY panel.
+
+2. **Channel colors/grouping** (`panels.rs`, `waveform.rs`) — `CHANNEL_GROUP_COLORS` 8-color palette. `channel_color()` cycles colors based on `channels_per_group`. Waveform renderer uses group color when `color_by_group` enabled.
+
+3. **FFT spectrum analysis** (`fft_panel.rs` — new) — `FftState` with configurable FFT size (256–4096), frequency range, log scale. Hand-written radix-2 Cooley-Tukey FFT. PSD computed from `DisplayRing::last_n_samples()`. Plot with 50/60 Hz markers. Available as sidebar section + tile view.
+
+4. **Channel mapping/sorting** (`channel_map.rs` — new) — `ChannelMapPreset::Natural|Reverse|EvenOdd|Custom`. `display_to_physical()` mapping. Custom comma-separated input with validation. Sidebar UI.
+
+5. **Tile system extended** (`multiview.rs`) — `TileKind::FftSpectrum` variant. FFT tile in "+ Add View" menu. `KvTileBehavior` carries `fft: &FftState`.
+
+6. **DisplayRing extension** (`disp_ring.rs`) — `last_n_samples(ch, n)` extracts recent samples as i16 for FFT.
+
+**Verification**:
+- `cargo check -p kv-rhd` — pass
+- `cargo check -p kv-gui --target x86_64-pc-windows-msvc` — pass (24 warnings, all pre-existing dead-code)
+- `cargo test --workspace --exclude kv-gui` — 85 tests pass (includes 2 FFT tests + 6 channel map tests)
+
+**Next steps**:
+- Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
+- Hardware testing of all Phase 2 features on Windows with XEM7310
 
 ## Notes For Future Agents
 

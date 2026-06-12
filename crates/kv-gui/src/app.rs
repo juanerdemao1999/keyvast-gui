@@ -30,8 +30,16 @@ use kv_recorder::StreamingRecorder;
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
+use crate::audio_monitor::{self, AudioMonitorState};
+use crate::channel_map::{self, ChannelMapState};
+use crate::channel_select::{self, ChannelSelectState};
+use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
+use crate::fft_panel::{self, FftState};
 use crate::impedance_panel::{self, ImpedanceState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
+use crate::probe_map::{self, ProbeMapState};
+use crate::remote_api::{self, RemoteApiState, RemoteApiHandle, RemoteCommand, RemoteResponse, AppStatus};
+use crate::trigger::{self, TriggerConfig, TriggerAction};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
 use crate::spike_overlay::SpikeSnippetStore;
 use crate::panels::{
@@ -130,6 +138,20 @@ pub struct KvApp {
     // Phase 1 features
     impedance: ImpedanceState,
     playback_mgr: PlaybackManager,
+    // Phase 2 features
+    fft: FftState,
+    channel_map: ChannelMapState,
+    // Phase 3 features
+    trigger: TriggerConfig,
+    audio_monitor: AudioMonitorState,
+    remote_api_state: RemoteApiState,
+    remote_api_handle: Option<RemoteApiHandle>,
+    /// Export format (for recording panel UI)
+    export_format: kv_recorder::export_formats::ExportFormat,
+    // Phase 4 features
+    probe_map: ProbeMapState,
+    channel_select: ChannelSelectState,
+    config_persist: ConfigPersistState,
 }
 
 impl KvApp {
@@ -178,6 +200,16 @@ impl KvApp {
             render_ms_ema: 0.0,
             impedance: ImpedanceState::default(),
             playback_mgr: PlaybackManager::default(),
+            fft: FftState::default(),
+            channel_map: ChannelMapState::default(),
+            trigger: TriggerConfig::default(),
+            audio_monitor: AudioMonitorState::default(),
+            remote_api_state: RemoteApiState::default(),
+            remote_api_handle: None,
+            export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            probe_map: ProbeMapState::default(),
+            channel_select: ChannelSelectState::default(),
+            config_persist: ConfigPersistState::default(),
         }
     }
 
@@ -471,6 +503,35 @@ impl KvApp {
         }
         self.snippet_store.process_block(&ap_block);
 
+        // Phase 3: Process trigger/gate logic
+        let trigger_action = self.trigger.process_block(&block);
+        match trigger_action {
+            TriggerAction::StartRecording => {
+                if self.recording.state != RecordingState::Recording {
+                    self.begin_recording();
+                }
+            }
+            TriggerAction::StopRecording => {
+                if self.recording.state == RecordingState::Recording {
+                    self.stop_recording();
+                }
+            }
+            TriggerAction::None => {}
+        }
+
+        // Phase 3: Feed audio monitor
+        if self.audio_monitor.enabled {
+            let ach = self.audio_monitor.channel;
+            if ach < ch_count {
+                let spc = block.samples_per_channel;
+                let ch_samples: Vec<i16> = (0..spc)
+                    .map(|s| block.data[s * ch_count + ach])
+                    .collect();
+                self.audio_monitor.update_sample_rate(sample_rate);
+                self.audio_monitor.feed_samples(&ch_samples);
+            }
+        }
+
         // Feed raw block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
         if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording {
@@ -607,6 +668,141 @@ impl KvApp {
         }
     }
 
+    /// Start recording (trigger-callable shortcut for toggle logic).
+    fn begin_recording(&mut self) {
+        // Same logic as Armed → Recording transition
+        match self.mode {
+            AcqMode::Device => {
+                if let Some(ref pipeline) = self.live_pipeline {
+                    let path: std::path::PathBuf = self.recording.output_dir.clone().into();
+                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start(path));
+                    self.recording.state = RecordingState::Recording;
+                    self.recording.recorded_blocks = 0;
+                    self.recording.recorded_bytes = 0;
+                    self.recording_start_time = Some(Instant::now());
+                    self.recording_error = None;
+                }
+            }
+            AcqMode::Demo => {
+                match StreamingRecorder::new(&self.recording.output_dir) {
+                    Ok(rec) => {
+                        self.active_recorder = Some(rec);
+                        self.recording.state = RecordingState::Recording;
+                        self.recording.recorded_blocks = 0;
+                        self.recording.recorded_bytes = 0;
+                        self.recording_start_time = Some(Instant::now());
+                        self.recording_error = None;
+                    }
+                    Err(e) => {
+                        self.recording_error = Some(format!("Trigger start error: {e}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop recording (trigger-callable shortcut).
+    fn stop_recording(&mut self) {
+        match self.mode {
+            AcqMode::Device => {
+                if let Some(ref pipeline) = self.live_pipeline {
+                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
+                    self.recording_start_time = None;
+                    self.recorder_buffer_occupancy = 0.0;
+                }
+            }
+            AcqMode::Demo => {
+                if let Some(rec) = self.active_recorder.take() {
+                    match rec.finish() {
+                        Ok(summary) => {
+                            eprintln!(
+                                "[recorder/trigger] Saved {} blocks → {}",
+                                summary.recording.block_count,
+                                summary.recording.raw_path.display()
+                            );
+                        }
+                        Err(e) => {
+                            self.recording_error = Some(format!("Finish error: {e}"));
+                        }
+                    }
+                }
+                self.recording.state = RecordingState::Idle;
+                self.recording_start_time = None;
+                self.recorder_buffer_occupancy = 0.0;
+            }
+        }
+    }
+
+    /// Handle a remote API command and return a JSON result or error.
+    fn handle_remote_command(&mut self, cmd: &RemoteCommand) -> Result<String, String> {
+        match cmd {
+            RemoteCommand::Ping => Ok("\"pong\"".to_string()),
+            RemoteCommand::GetStatus => {
+                let status = AppStatus {
+                    is_running: self.is_running(),
+                    is_recording: self.recording.state == RecordingState::Recording,
+                    elapsed_seconds: self.elapsed_seconds(),
+                    channel_count: self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(0),
+                    sample_rate: self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(0.0),
+                    display_mode: match self.display.display_mode {
+                        crate::panels::DisplayMode::Sweep => "sweep".to_string(),
+                        crate::panels::DisplayMode::Roll => "roll".to_string(),
+                    },
+                    recorded_blocks: self.recording.recorded_blocks,
+                };
+                Ok(remote_api::format_status_json(&status))
+            }
+            RemoteCommand::GetChannelCount => {
+                let ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(0);
+                Ok(ch.to_string())
+            }
+            RemoteCommand::StartAcquisition { mode } => {
+                if self.is_running() {
+                    return Err("already running".to_string());
+                }
+                match mode.as_str() {
+                    "demo" => { self.start_demo(); Ok("true".to_string()) }
+                    "device" => { self.start_device(); Ok("true".to_string()) }
+                    _ => Err(format!("unknown mode: {mode}"))
+                }
+            }
+            RemoteCommand::StopAcquisition => {
+                self.stop_all();
+                Ok("true".to_string())
+            }
+            RemoteCommand::StartRecording { output_dir } => {
+                if !self.is_running() {
+                    return Err("acquisition not running".to_string());
+                }
+                if let Some(dir) = output_dir {
+                    self.recording.output_dir = dir.clone();
+                }
+                self.begin_recording();
+                Ok("true".to_string())
+            }
+            RemoteCommand::StopRecording => {
+                if self.recording.state != RecordingState::Recording {
+                    return Err("not recording".to_string());
+                }
+                self.stop_recording();
+                Ok("true".to_string())
+            }
+            RemoteCommand::SetDisplayMode { mode } => {
+                match mode.as_str() {
+                    "sweep" => {
+                        self.display.display_mode = crate::panels::DisplayMode::Sweep;
+                        Ok("true".to_string())
+                    }
+                    "roll" => {
+                        self.display.display_mode = crate::panels::DisplayMode::Roll;
+                        Ok("true".to_string())
+                    }
+                    _ => Err(format!("unknown display mode: {mode}"))
+                }
+            }
+        }
+    }
+
     /// Elapsed time since acquisition started.
     fn elapsed_seconds(&self) -> f64 {
         if self.is_running() {
@@ -723,6 +919,26 @@ impl KvApp {
                         self.recording_start_time = None;
                     }
                     self.recorder_buffer_occupancy = 0.0;
+                }
+            }
+        }
+
+        // ── Process remote API commands ──────────────────────────────────────
+        let remote_cmds: Vec<(u64, RemoteCommand)> = self
+            .remote_api_handle
+            .as_ref()
+            .map(|h| h.commands.lock().unwrap().drain(..).collect())
+            .unwrap_or_default();
+        if !remote_cmds.is_empty() {
+            let mut responses: Vec<RemoteResponse> = Vec::new();
+            for (id, cmd) in remote_cmds {
+                let result = self.handle_remote_command(&cmd);
+                responses.push(RemoteResponse { id, result });
+            }
+            if let Some(ref handle) = self.remote_api_handle {
+                let mut resp_q = handle.responses.lock().unwrap();
+                for r in responses {
+                    resp_q.push_back(r);
                 }
             }
         }
@@ -865,19 +1081,23 @@ impl eframe::App for KvApp {
             elapsed_live
         };
 
-        // ── Sweep-mode window management ─────────────────────────
-        // Advance sweep_start_ms when new data has filled the current window.
-        // This keeps x_left / x_right FIXED within a sweep — the entire display
-        // is stationary and only the cursor moves right, matching the SpikeGLX /
-        // Intan RHX default display mode.  When the window fills, the display
-        // resets to a new window (brief flash, once per window duration).
+        // ── Display-mode window management ─────────────────────────
         if !self.display_paused && self.disp_ring.ready {
             let latest_ms = self.disp_ring.latest_time_ms();
             let window_ms = self.display.time_window_ms();
-            if latest_ms >= self.sweep_start_ms + window_ms {
-                // Snap to the most recent complete window boundary
-                self.sweep_start_ms =
-                    (latest_ms / window_ms).floor() * window_ms;
+            match self.display.display_mode {
+                panels::DisplayMode::Sweep => {
+                    // Fixed window, cursor sweeps right.  When the window fills,
+                    // snap to the next window boundary (brief flash, once per window).
+                    if latest_ms >= self.sweep_start_ms + window_ms {
+                        self.sweep_start_ms =
+                            (latest_ms / window_ms).floor() * window_ms;
+                    }
+                }
+                panels::DisplayMode::Roll => {
+                    // Continuous scrolling: x_right = latest, x_left = latest - window.
+                    self.sweep_start_ms = (latest_ms - window_ms).max(0.0);
+                }
             }
         }
 
@@ -1181,7 +1401,171 @@ impl eframe::App for KvApp {
                         self.playback_mgr.load_file(path);
                     }
                 }
+
+                // FFT spectrum panel
+                ui.add_space(4.0);
+                let total_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+                fft_panel::draw_fft_section(
+                    ui,
+                    &mut self.fft,
+                    &self.disp_ring,
+                    sr,
+                    total_ch,
+                );
+
+                // Channel mapping panel
+                ui.add_space(4.0);
+                channel_map::draw_channel_map_section(
+                    ui,
+                    &mut self.channel_map,
+                    &mut self.display,
+                    total_ch,
+                );
+
+                // Phase 3: Trigger/Gate
+                ui.add_space(4.0);
+                trigger::draw_trigger_section(ui, &mut self.trigger);
+
+                // Phase 3: Audio monitor
+                ui.add_space(4.0);
+                audio_monitor::draw_audio_monitor_section(
+                    ui,
+                    &mut self.audio_monitor,
+                    total_ch,
+                );
+
+                // Phase 3: Remote API
+                ui.add_space(4.0);
+                let prev_enabled = self.remote_api_state.enabled;
+                remote_api::draw_remote_api_section(ui, &mut self.remote_api_state);
+                // Start/stop server based on enabled toggle
+                if self.remote_api_state.enabled && !prev_enabled {
+                    match remote_api::start_server(self.remote_api_state.port) {
+                        Ok(handle) => {
+                            self.remote_api_handle = Some(handle);
+                            self.remote_api_state.running = true;
+                            self.remote_api_state.error = None;
+                        }
+                        Err(e) => {
+                            self.remote_api_state.error = Some(e);
+                            self.remote_api_state.enabled = false;
+                        }
+                    }
+                } else if !self.remote_api_state.enabled && prev_enabled {
+                    if let Some(mut handle) = self.remote_api_handle.take() {
+                        handle.stop();
+                    }
+                    self.remote_api_state.running = false;
+                }
+                // Update client count
+                if let Some(ref handle) = self.remote_api_handle {
+                    self.remote_api_state.client_count =
+                        *handle.client_count.lock().unwrap();
+                }
+
+                // Phase 3: Export format selector (below recording)
+                ui.add_space(4.0);
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("EXPORT FORMAT")
+                        .size(11.0)
+                        .strong()
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .default_open(false)
+                .show(ui, |ui| {
+                    use kv_recorder::export_formats::ExportFormat;
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(
+                            &mut self.export_format,
+                            ExportFormat::IntanRhd,
+                            egui::RichText::new("Intan .rhd").size(10.0),
+                        );
+                        ui.selectable_value(
+                            &mut self.export_format,
+                            ExportFormat::FlatBinary,
+                            egui::RichText::new("Flat binary").size(10.0),
+                        );
+                    });
+                    ui.label(
+                        egui::RichText::new(self.export_format.label())
+                            .size(9.0)
+                            .italics()
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+
+                // Phase 4: Probe Map config
+                ui.add_space(4.0);
+                probe_map::draw_probe_map_section(ui, &mut self.probe_map, total_ch);
+
+                // Phase 4: Selective channel save
+                ui.add_space(4.0);
+                self.channel_select.sync_channel_count(total_ch);
+                channel_select::draw_channel_select_section(
+                    ui,
+                    &mut self.channel_select,
+                );
+
+                // Phase 4: Config persistence
+                ui.add_space(4.0);
+                let mut save_clicked = false;
+                let mut load_clicked = false;
+                config_persist::draw_config_section(
+                    ui,
+                    &mut self.config_persist,
+                    &mut save_clicked,
+                    &mut load_clicked,
+                );
+                if save_clicked {
+                    let cfg = PersistentConfig::capture_from(
+                        &self.display,
+                        &self.filters,
+                        &self.recording.output_dir,
+                        &self.recording.file_prefix,
+                        self.audio_monitor.channel,
+                        self.audio_monitor.volume,
+                        self.remote_api_state.port,
+                        self.probe_map.geometry.label(),
+                        self.probe_map.site_radius,
+                    );
+                    match config_persist::save_config(&self.config_persist.config_path, &cfg) {
+                        Ok(()) => {
+                            self.config_persist.status_message = Some("Saved".to_string());
+                        }
+                        Err(e) => {
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
+                }
+                if load_clicked {
+                    match config_persist::load_config(&self.config_persist.config_path) {
+                        Ok(cfg) => {
+                            cfg.apply_to(
+                                &mut self.display,
+                                &mut self.filters,
+                                &mut self.recording.output_dir,
+                                &mut self.recording.file_prefix,
+                                &mut self.audio_monitor.channel,
+                                &mut self.audio_monitor.volume,
+                                &mut self.remote_api_state.port,
+                            );
+                            self.config_persist.status_message = Some("Loaded".to_string());
+                            self.config_persist.loaded = true;
+                        }
+                        Err(e) => {
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
+                }
             });
+
+        // ── Probe Map window (floating) ─────────────────────────
+        if self.probe_map.visible {
+            let map_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+            self.probe_map.update_activity(&self.disp_ring, map_ch);
+            probe_map::draw_probe_map_window(ctx, &self.probe_map, map_ch);
+        }
 
         // ── Multi-view tile canvas ──────────────────────────────
         //
@@ -1217,6 +1601,7 @@ impl eframe::App for KvApp {
                         render_ms_ema:     &mut self.render_ms_ema,
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
+                        fft:           &self.fft,
                         pending_add:   &mut pending_add,
                     };
                     tree.ui(&mut behavior, ui);
@@ -1229,6 +1614,7 @@ impl eframe::App for KvApp {
                         AddViewRequest::Lfp => TileKind::new_lfp(visible),
                         AddViewRequest::Ap  => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
+                        AddViewRequest::Fft => TileKind::new_fft(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }

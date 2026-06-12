@@ -9,7 +9,6 @@ use std::time::Instant;
 use eframe::egui;
 use kv_recorder::{KvrawMetadata, KvrawReader};
 use kv_types::SampleBlock;
-use rfd;
 
 use crate::theme;
 
@@ -176,7 +175,7 @@ impl PlaybackManager {
         };
 
         let start = self.cursor_frame.saturating_sub(block_frames as u64);
-        let actual_start = start.max(0);
+        let actual_start = start;
         let frames_to_read = (self.cursor_frame - actual_start) as usize;
         let frames_to_read = frames_to_read.max(block_frames).min(MAX_DISPLAY_FRAMES);
 
@@ -208,6 +207,7 @@ impl PlaybackManager {
     }
 
     /// Read a specific range of frames as a SampleBlock (for seek/scrub).
+    #[allow(dead_code)] // pending scrub-bar integration
     pub fn read_block_at(&mut self, start_frame: u64, num_frames: usize) -> Option<SampleBlock> {
         let meta = self.metadata.as_ref()?;
         let reader = self.reader.as_mut()?;

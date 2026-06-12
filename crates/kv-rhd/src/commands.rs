@@ -523,8 +523,8 @@ impl Rhd2000Registers {
         } else {
             let mut best = 1_u8;
             let mut min_log_diff = f64::MAX;
-            for n in 1..16 {
-                let diff = f64::abs(log_new - log_f_cutoff[n]);
+            for (n, &log_f) in log_f_cutoff.iter().enumerate().skip(1) {
+                let diff = f64::abs(log_new - log_f);
                 if diff < min_log_diff {
                     min_log_diff = diff;
                     best = n as u8;
@@ -721,7 +721,7 @@ impl Rhd2000Registers {
         // Compute how many samples make up one complete period of the
         // test waveform.  Clamp to at most MAX_COMMAND_LENGTH.
         let period_samples = (self.sample_rate / frequency).round() as usize;
-        let period_samples = period_samples.max(1).min(MAX_COMMAND_LENGTH);
+        let period_samples = period_samples.clamp(1, MAX_COMMAND_LENGTH);
 
         let two_pi = 2.0 * std::f64::consts::PI;
         for i in 0..period_samples {

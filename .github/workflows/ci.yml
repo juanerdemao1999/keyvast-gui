@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main, v2.0]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (workspace, excl. kv-gui)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --exclude kv-gui
+
+  lint:
+    name: Clippy + Windows check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # kv-gui only builds for Windows (winit/eframe); clippy/check it
+          # against the MSVC target without linking.
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --exclude kv-gui --all-targets -- -D warnings
+      - run: cargo clippy -p kv-gui --target x86_64-pc-windows-msvc -- -D warnings

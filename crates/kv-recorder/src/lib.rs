@@ -1172,12 +1172,9 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
                 let after = &json[pos + key.len() + 2..];
                 let colon = after.find(':')?;
                 let rest = after[colon + 1..].trim_start();
-                if rest.starts_with('"') {
-                    let end = rest[1..].find('"')?;
-                    Some(rest[1..1 + end].to_string())
-                } else {
-                    None
-                }
+                let value = rest.strip_prefix('"')?;
+                let end = value.find('"')?;
+                Some(value[..end].to_string())
             })
             .unwrap_or_default()
     };

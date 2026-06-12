@@ -121,7 +121,7 @@ impl DisplayRing {
         // Initialize the expected pointer on first block
         if !self.ready {
             // Align next_expected to the ring stride boundary at or after block_start
-            self.next_expected = if block_start % dwnsp == 0 {
+            self.next_expected = if block_start.is_multiple_of(dwnsp) {
                 block_start
             } else {
                 block_start + dwnsp - (block_start % dwnsp)
@@ -183,13 +183,11 @@ impl DisplayRing {
         let ring = &self.y[ch];
         let avail = ring.len().min(n);
         let start = ring.len() - avail;
-        let mut out = Vec::with_capacity(avail);
-        for i in start..ring.len() {
-            // Ring stores normalized f32 in [-1, 1]. Convert back to i16.
-            let val = (ring[i] as f64 * 32767.0).round() as i16;
-            out.push(val);
-        }
-        out
+        // Ring stores normalized f32 in [-1, 1]. Convert back to i16.
+        ring.iter()
+            .skip(start)
+            .map(|&v| (v as f64 * 32767.0).round() as i16)
+            .collect()
     }
 
     /// Collect display points for `ch` in the time window [t_left_ms, t_right_ms].
@@ -235,7 +233,7 @@ impl DisplayRing {
         let stride_denom = window_ring_entries.max(ri_end - ri_start);
         let stride2 = (stride_denom / max_points).max(1);
         let visible = ri_end - ri_start;
-        let pts_cap = (visible + stride2 - 1) / stride2;
+        let pts_cap = visible.div_ceil(stride2);
         let mut pts = Vec::with_capacity(pts_cap);
 
         let deque = &self.y[ch];

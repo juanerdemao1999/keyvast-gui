@@ -18,17 +18,21 @@ pub const AUX_CHANNELS_PER_STREAM: usize = 3;
 pub const BOARD_ADC_CHANNELS: usize = 8;
 
 /// Open Ephys scale factor for VDD supply voltage: 0.0000748 V/count.
+#[allow(dead_code)] // hardware bring-up reference
 pub const RHD_VDD_VOLTS_PER_COUNT: f64 = 0.0000748;
 
 /// Open Ephys scale factor for auxiliary ADC inputs: 0.0000374 V/count.
+#[allow(dead_code)] // hardware bring-up reference
 pub const RHD_AUX_ADC_VOLTS_PER_COUNT: f64 = 0.0000374;
 
 /// RHD2132 16-channel headstage: amplifier channels are offset by this
 /// many channels from channel 0. The chip only populates the upper 16
 /// of its 32 logical amplifier channels.
+#[allow(dead_code)] // hardware bring-up reference
 pub const RHD2132_16CH_OFFSET: usize = 16;
 
 /// Supported RHD amplifier chip types.
+#[allow(dead_code)] // hardware bring-up reference
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RhdChipType {
     /// RHD2132 — 32 channels, single MISO.
@@ -41,6 +45,7 @@ pub enum RhdChipType {
     Rhd2164,
 }
 
+#[allow(dead_code)] // hardware bring-up reference
 impl RhdChipType {
     /// Identify the chip type from the register-63 (Company ID) readback.
     /// Register 63 bits `[5:0]` encode the die revision, `[7:6]` encode

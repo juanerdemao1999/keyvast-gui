@@ -102,7 +102,7 @@ struct ChannelBuf {
 impl ChannelBuf {
     fn new(pre_samples: usize) -> Self {
         let mut pre_ring = VecDeque::with_capacity(pre_samples + 1);
-        pre_ring.extend(std::iter::repeat(0.0_f32).take(pre_samples));
+        pre_ring.extend(std::iter::repeat_n(0.0_f32, pre_samples));
         Self {
             pre_ring,
             pending: None,
@@ -244,7 +244,7 @@ impl SpikeSnippetStore {
             for buf in &mut self.bufs {
                 buf.pre_ring = {
                     let mut r = VecDeque::with_capacity(new_pre + 1);
-                    r.extend(std::iter::repeat(0.0_f32).take(new_pre));
+                    r.extend(std::iter::repeat_n(0.0_f32, new_pre));
                     r
                 };
                 buf.pending = None;

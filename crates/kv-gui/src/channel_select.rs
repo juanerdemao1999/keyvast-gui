@@ -61,6 +61,7 @@ impl ChannelSelectState {
     }
 
     /// Check if a specific channel is selected for recording.
+    #[allow(dead_code)] // selection API kept for upcoming probe-map integration
     pub fn is_selected(&self, ch: usize) -> bool {
         if !self.enabled {
             return true;
@@ -83,6 +84,7 @@ impl ChannelSelectState {
     }
 
     /// Select a range of channels [start, end) inclusive start.
+    #[allow(dead_code)] // selection API kept for upcoming probe-map integration
     pub fn select_range(&mut self, start: usize, end: usize) {
         for ch in start..end.min(self.channel_count) {
             if let Some(s) = self.selected.get_mut(ch) {
@@ -103,28 +105,6 @@ impl ChannelSelectState {
         } else {
             Some(indices)
         }
-    }
-
-    /// Filter a block's data to only include selected channels.
-    /// Returns (filtered_data, filtered_channel_count).
-    pub fn filter_block_data(&self, data: &[i16], channel_count: usize, samples_per_channel: usize) -> (Vec<i16>, usize) {
-        if !self.enabled {
-            return (data.to_vec(), channel_count);
-        }
-
-        let indices = self.selected_indices();
-        let out_ch = indices.len();
-        if out_ch == 0 || out_ch == channel_count {
-            return (data.to_vec(), channel_count);
-        }
-
-        let mut out = Vec::with_capacity(out_ch * samples_per_channel);
-        for s in 0..samples_per_channel {
-            for &ch in &indices {
-                out.push(data[s * channel_count + ch]);
-            }
-        }
-        (out, out_ch)
     }
 }
 
@@ -268,17 +248,27 @@ mod tests {
     }
 
     #[test]
-    fn filter_block_data_extracts_channels() {
-        let mut s = ChannelSelectState::default();
-        s.enabled = true;
-        s.channel_count = 4;
-        s.selected = vec![true, false, true, false];
+    fn filter_block_channels_extracts_channels() {
         // 2 samples × 4 channels: [s0c0, s0c1, s0c2, s0c3, s1c0, s1c1, s1c2, s1c3]
-        let data: Vec<i16> = vec![10, 20, 30, 40, 50, 60, 70, 80];
-        let (filtered, ch_count) = s.filter_block_data(&data, 4, 2);
-        assert_eq!(ch_count, 2);
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 4,
+            samples_per_channel: 2,
+            ttl_bits: 0,
+            data: vec![10, 20, 30, 40, 50, 60, 70, 80],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        let filtered = filter_block_channels(&block, &[0, 2]);
+        assert_eq!(filtered.channel_count, 2);
         // Should have: [s0c0, s0c2, s1c0, s1c2]
-        assert_eq!(filtered, vec![10, 30, 50, 70]);
+        assert_eq!(filtered.data, vec![10, 30, 50, 70]);
     }
 
     #[test]

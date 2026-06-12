@@ -134,7 +134,7 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
 
         for channel in 0..32 {
             for stream in 0..config.enabled_streams {
-                let signed = (sample as i32) * 100 + (stream as i32) * 1000 + channel as i32;
+                let signed = (sample as i32) * 100 + (stream as i32) * 1000 + channel;
                 let word = (signed + 32_768) as u16;
                 raw.extend_from_slice(&word.to_le_bytes());
             }

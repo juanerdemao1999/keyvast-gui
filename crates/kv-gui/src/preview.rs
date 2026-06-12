@@ -12,7 +12,9 @@ use kv_types::SampleBlock;
 /// Per-channel real-time statistics derived from the most recent block.
 #[derive(Debug, Clone)]
 pub struct ChannelStats {
+    #[allow(dead_code)] // pending per-channel stats panel
     pub rms: f64,
+    #[allow(dead_code)] // pending per-channel stats panel
     pub peak_to_peak: i16,
     #[allow(dead_code)]
     pub min: i16,

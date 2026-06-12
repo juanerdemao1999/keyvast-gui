@@ -11,7 +11,6 @@ use kv_cli::{
     run_directory_name_utc, run_rhd_smoke, run_simulator_pipeline, run_simulator_recording,
     run_simulator_stream,
 };
-use kv_recorder::KVRAW_DATA_OFFSET;
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET};
 
 #[test]

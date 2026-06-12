@@ -46,10 +46,10 @@ mod imp {
     impl FrontPanelLibrary {
         pub fn load(path: Option<PathBuf>) -> Result<Self, FrontPanelError> {
             let path = path.unwrap_or_else(default_frontpanel_dll_path);
-            eprintln!("[kv-rhd] loading FrontPanel DLL: {}", path.display());
+            log::info!("loading FrontPanel DLL: {}", path.display());
             let library = unsafe {
                 Library::new(&path).map_err(|source| {
-                    eprintln!("[kv-rhd] FrontPanel DLL load FAILED: {source}");
+                    log::error!("FrontPanel DLL load FAILED: {source}");
                     FrontPanelError::DllLoad {
                         path: path.clone(),
                         message: source.to_string(),
@@ -90,7 +90,7 @@ mod imp {
                 }
             };
 
-            eprintln!("[kv-rhd] FrontPanel DLL loaded OK");
+            log::info!("FrontPanel DLL loaded OK");
             Ok(Self { api: Arc::new(api) })
         }
 
@@ -113,7 +113,7 @@ mod imp {
             let serial = CString::new(serial).map_err(|_| FrontPanelError::InvalidCString {
                 field: "serial",
             })?;
-            eprintln!("[kv-rhd] opening device by serial: {serial_display}");
+            log::info!("opening device by serial: {serial_display}");
             device.check_error(
                 "okFrontPanel_OpenBySerial",
                 unsafe { (device.api.open_by_serial)(device.handle, serial.as_ptr()) },
@@ -121,11 +121,11 @@ mod imp {
 
             let is_open = unsafe { (device.api.is_open)(device.handle) != 0 };
             if !is_open {
-                eprintln!("[kv-rhd] device reported NOT open after OpenBySerial");
+                log::error!("device reported NOT open after OpenBySerial");
                 return Err(FrontPanelError::DeviceNotOpen);
             }
 
-            eprintln!("[kv-rhd] device opened OK (serial={serial_display})");
+            log::info!("device opened OK (serial={serial_display})");
             Ok(device)
         }
     }
@@ -138,10 +138,10 @@ mod imp {
     impl FrontPanelDevice {
         pub fn configure_fpga(&self, bitfile: &Path) -> Result<(), FrontPanelError> {
             let size = std::fs::metadata(bitfile).map(|m| m.len()).unwrap_or(0);
-            eprintln!("[kv-rhd] ConfigureFPGA: {} ({size} bytes)", bitfile.display());
+            log::info!("ConfigureFPGA: {} ({size} bytes)", bitfile.display());
             if size == 0 {
-                eprintln!(
-                    "[kv-rhd] WARNING: bitfile is missing or empty at this path — \
+                log::warn!(
+                    "bitfile is missing or empty at this path — \
                      ConfigureFPGA will program nothing"
                 );
             }
@@ -155,7 +155,7 @@ mod imp {
             )?;
 
             let enabled = unsafe { (self.api.is_frontpanel_enabled)(self.handle) } != 0;
-            eprintln!("[kv-rhd] ConfigureFPGA returned OK; FrontPanel enabled = {enabled}");
+            log::info!("ConfigureFPGA returned OK; FrontPanel enabled = {enabled}");
             if !enabled {
                 return Err(FrontPanelError::FrontPanelNotEnabled);
             }
@@ -191,7 +191,7 @@ mod imp {
         }
 
         pub fn get_wire_out_value(&self, endpoint: i32) -> u32 {
-            unsafe { (self.api.get_wire_out_value)(self.handle, endpoint) as u32 }
+            unsafe { (self.api.get_wire_out_value)(self.handle, endpoint) }
         }
 
         pub fn activate_trigger_in(
@@ -224,7 +224,7 @@ mod imp {
             if read < 0 {
                 return Err(FrontPanelError::TransferFailed {
                     function: "okFrontPanel_ReadFromBlockPipeOut",
-                    code: read as i32,
+                    code: read,
                 });
             }
 
@@ -233,10 +233,10 @@ mod imp {
 
         fn first_serial(&self) -> Result<String, FrontPanelError> {
             let count = unsafe { (self.api.get_device_count)(self.handle) };
-            eprintln!("[kv-rhd] FrontPanel device count: {count}");
+            log::info!("FrontPanel device count: {count}");
             if count <= 0 {
-                eprintln!(
-                    "[kv-rhd] no Opal Kelly device found — check the USB3 cable, the \
+                log::info!(
+                    "no Opal Kelly device found — check the USB3 cable, the \
                      FrontPanel/USB driver, and that no other program (e.g. Open Ephys) \
                      still holds the board open"
                 );
@@ -251,8 +251,8 @@ mod imp {
                 let serial =
                     c_buffer_to_string(&buffer).unwrap_or_else(|_| "<invalid>".to_string());
                 let model = unsafe { (self.api.get_device_list_model)(self.handle, index) };
-                eprintln!(
-                    "[kv-rhd]   device[{index}]: serial={serial} model={model} ({})",
+                log::info!(
+                    "  device[{index}]: serial={serial} model={model} ({})",
                     model_name(model)
                 );
             }
@@ -322,8 +322,8 @@ mod imp {
             .join(dll_name);
 
         // 1. Next to the executable (deployed builds).
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(exe_dir) = exe.parent() {
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent() {
                 let candidate = exe_dir.join(dll_name);
                 if candidate.exists() {
                     return candidate;
@@ -334,7 +334,6 @@ mod imp {
                     return candidate;
                 }
             }
-        }
 
         // 2. Current working directory.
         if let Ok(cwd) = std::env::current_dir() {

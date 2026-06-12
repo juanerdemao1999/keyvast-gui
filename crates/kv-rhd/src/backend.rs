@@ -1,4 +1,9 @@
-use std::{fmt, path::PathBuf, thread, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    thread,
+    time::Duration,
+};
 
 use kv_types::SampleBlock;
 
@@ -81,8 +86,8 @@ pub struct RhdHardwareBackend {
 
 impl RhdHardwareBackend {
     pub fn open(options: RhdHardwareOptions) -> Result<Self, RhdReadError> {
-        eprintln!(
-            "[kv-rhd] opening RHD backend: bitfile={}, streams={}",
+        log::info!(
+            "opening RHD backend: bitfile={}, streams={}",
             options.bitfile_path.display(),
             options.data.enabled_streams
         );
@@ -103,7 +108,7 @@ impl RhdHardwareBackend {
             options.cable_length_meters,
         )?;
 
-        eprintln!("[kv-rhd] RHD backend ready");
+        log::info!("RHD backend ready");
         Ok(Self {
             board,
             config: options.data,
@@ -117,7 +122,7 @@ impl RhdHardwareBackend {
         if !self.acquisition_started {
             self.board.start_continuous_acquisition()?;
             self.acquisition_started = true;
-            eprintln!("[kv-rhd] continuous acquisition started; reading first block...");
+            log::info!("continuous acquisition started; reading first block...");
         }
 
         let raw = self.board.read_raw_block(&self.config)?;
@@ -141,8 +146,8 @@ impl RhdHardwareBackend {
             } else {
                 ""
             };
-            eprintln!(
-                "[kv-rhd] first block OK: {} channels x {} samples, raw amplifier i16 min={min} max={max}{note}",
+            log::info!(
+                "first block OK: {} channels x {} samples, raw amplifier i16 min={min} max={max}{note}",
                 block.channel_count, block.samples_per_channel
             );
         }
@@ -174,7 +179,7 @@ struct RhythmFrontPanelBoard {
 impl RhythmFrontPanelBoard {
     fn configure(
         device: FrontPanelDevice,
-        bitfile_path: &PathBuf,
+        bitfile_path: &Path,
         enabled_streams: usize,
         cable_length_meters: f64,
     ) -> Result<Self, RhdReadError> {
@@ -185,12 +190,12 @@ impl RhythmFrontPanelBoard {
         device.update_wire_outs();
         let board_id = device.get_wire_out_value(WIRE_OUT_BOARD_ID);
         let board_version = device.get_wire_out_value(WIRE_OUT_BOARD_VERSION);
-        eprintln!(
-            "[kv-rhd] board_id={board_id} board_version={board_version} (expected board_id={RHYTHM_BOARD_ID})"
+        log::info!(
+            "board_id={board_id} board_version={board_version} (expected board_id={RHYTHM_BOARD_ID})"
         );
         if board_id != RHYTHM_BOARD_ID {
-            eprintln!(
-                "[kv-rhd] board_id mismatch: the FPGA is not running the expected Rhythm data \
+            log::error!(
+                "board_id mismatch: the FPGA is not running the expected Rhythm data \
                  plane — either ConfigureFPGA did not actually program this bitfile, or this \
                  bitfile is not the Rhythm/Keyvast data-plane design"
             );
@@ -215,12 +220,12 @@ impl RhythmFrontPanelBoard {
         board.enable_streams(enabled_streams)?;
         board.set_default_data_sources()?;
         board.clear_ttl_out()?;
-        eprintln!("[kv-rhd] data plane configured; initializing RHD chips (ADC calibration)...");
+        log::info!("data plane configured; initializing RHD chips (ADC calibration)...");
         board.initialize_rhd_chips(enabled_streams)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
         board.flush_fifo();
-        eprintln!("[kv-rhd] board configured and armed for continuous acquisition");
+        log::info!("board configured and armed for continuous acquisition");
 
         Ok(board)
     }
@@ -472,8 +477,8 @@ impl RhythmFrontPanelBoard {
         // primary stream pair over all 16 delays and enable whichever port actually
         // has a responding chip. AuxCmd3 bank 0 (register config + ADC calibrate) is
         // selected, so each probe run also configures/calibrates the chip found.
-        eprintln!(
-            "[kv-rhd] scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage..."
+        log::info!(
+            "scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage..."
         );
         let (stream_mask, delay) = self.scan_ports_for_headstage(enabled_streams)?;
         self.enable_stream_mask(stream_mask)?;
@@ -735,7 +740,7 @@ impl RhythmFrontPanelBoard {
         // (port index, chosen delay, has_chip_id)
         let mut best: Option<(usize, u32, bool)> = None;
 
-        for port in 0..8_usize {
+        for (port, &port_letter) in PORT_LETTERS.iter().enumerate() {
             let first_stream = (port * 4) as u32;
             self.enable_stream_mask(stream_bits << first_stream)?;
 
@@ -780,9 +785,9 @@ impl RhythmFrontPanelBoard {
             };
 
             let method = if validated_by_id { "chip ID" } else { "railed fraction" };
-            eprintln!(
-                "[kv-rhd] port {} ({}): {} good delays ({} verified) @ chosen delay {}  <- responding",
-                PORT_LETTERS[port],
+            log::info!(
+                "port {} ({}): {} good delays ({} verified) @ chosen delay {}  <- responding",
+                port_letter,
                 stream_range_label(first_stream, enabled_streams),
                 good_delays.len(),
                 method,
@@ -791,7 +796,7 @@ impl RhythmFrontPanelBoard {
 
             // Prefer chip-ID-verified ports over railed-fraction-only ports.
             let dominated = best.as_ref().is_some_and(|&(_, _, prev_id)| prev_id && !validated_by_id);
-            if !dominated && best.as_ref().map_or(true, |&(_, _, prev_id)| validated_by_id >= prev_id) {
+            if !dominated && best.as_ref().is_none_or(|&(_, _, prev_id)| validated_by_id >= prev_id) {
                 best = Some((port, chosen_delay, validated_by_id));
             }
         }
@@ -799,8 +804,8 @@ impl RhythmFrontPanelBoard {
         match best {
             Some((port, delay, _)) => {
                 let first_stream = (port * 4) as u32;
-                eprintln!(
-                    "[kv-rhd] FOUND headstage on port {} ({}) at MISO delay {}",
+                log::info!(
+                    "FOUND headstage on port {} ({}) at MISO delay {}",
                     PORT_LETTERS[port],
                     stream_range_label(first_stream, enabled_streams),
                     delay,
@@ -810,8 +815,8 @@ impl RhythmFrontPanelBoard {
                 Ok((stream_bits << first_stream, delay))
             }
             None => {
-                eprintln!(
-                    "[kv-rhd] WARNING: no responding RHD chip found on any of the 8 SPI ports. \
+                log::warn!(
+                    "no responding RHD chip found on any of the 8 SPI ports. \
                      Defaulting to Port A at delay 0; expect flat data. Check that the headstage \
                      is connected and powered, and that this is a KeyVast bitstream (the stock \
                      Intan bit cannot drive the KeyVast headstage SPI pins)."
@@ -865,7 +870,7 @@ impl RhythmFrontPanelBoard {
             }
             let byte_count = (available_words as usize).saturating_mul(2);
             // Round up to USB3_BLOCK_SIZE_BYTES boundary.
-            let aligned = ((byte_count + USB3_BLOCK_SIZE_BYTES - 1) / USB3_BLOCK_SIZE_BYTES)
+            let aligned = byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES)
                 .max(1)
                 * USB3_BLOCK_SIZE_BYTES;
             let mut buffer = vec![0_u8; aligned];
@@ -881,7 +886,7 @@ impl RhythmFrontPanelBoard {
         self.device.update_wire_ins();
 
         if self.num_words_in_fifo() > 0 {
-            eprintln!("[kv-rhd] WARNING: flush_fifo did not fully drain");
+            log::warn!("flush_fifo did not fully drain");
         }
     }
 
@@ -983,8 +988,8 @@ impl RhythmFrontPanelBoard {
     ) -> Result<impedance::ImpedanceResult, RhdReadError> {
         use crate::commands::ZcheckScale;
 
-        eprintln!(
-            "[kv-rhd] starting impedance test: freq={:.0} Hz, {} channels, {} periods",
+        log::info!(
+            "starting impedance test: freq={:.0} Hz, {} channels, {} periods",
             config.frequency_hz, config.channel_count, config.num_periods
         );
 
@@ -1175,8 +1180,8 @@ impl RhythmFrontPanelBoard {
 
         self.flush_fifo();
 
-        eprintln!(
-            "[kv-rhd] impedance test complete: {} channels measured",
+        log::info!(
+            "impedance test complete: {} channels measured",
             results.len()
         );
 

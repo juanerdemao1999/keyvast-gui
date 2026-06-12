@@ -224,7 +224,7 @@ fn generate_sample(
         let offset = global_s.saturating_sub(spike_start);
         let spike_val = match offset {
             0 => -0.3 * cg.spike_amplitude,  // onset
-            1 => -1.0 * cg.spike_amplitude,  // negative trough
+            1 => -cg.spike_amplitude,  // negative trough
             2 =>  0.5 * cg.spike_amplitude,  // positive overshoot
             3 => -0.15 * cg.spike_amplitude, // AHP
             4 =>  0.0,                        // recovery

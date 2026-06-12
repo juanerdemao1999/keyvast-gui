@@ -20,7 +20,38 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (P0: wire unfinished features end-to-end)
+Last updated: 2026-06-12 (P1: ingest/display performance)
+
+### Session 24: P1 — Performance (lazy band filters, history dedup, refilter debounce, LTO)
+
+Branch `devin/1781280000-p1-perf` (stacked on the P0 branch → `v2.0`):
+
+1. **Lazy LFP/AP band filtering** — `ingest_block` previously ran three full
+   filter passes per block regardless of layout. Now the fixed LFP band is only
+   computed when an `LfpView` tile exists (`lfp_tile_open()`), and the AP band
+   only when an `ApView` or `SpikeOverlay` tile exists (`ap_band_needed()`,
+   since the snippet detector consumes the AP block). Default single-tile
+   layout: 3 passes → 1.
+2. **filtered_history dedup** — when no user filter/CAR is active,
+   `filtered_history` was a full clone of `block_history` (~80 MB at capacity).
+   It now stays empty in that case; `refilter_history` already falls back to
+   `block_history` as the display-ring source.
+3. **Refilter debounce** — filter-settings changes now wait
+   `REFILTER_DEBOUNCE_MS` (150 ms) of stability before `rebuild_filter_chains`
+   re-filters the full 10k-block history, so dragging a cutoff slider no
+   longer re-filters everything every frame. `ingest_block` only rebuilds
+   chains on channel-count change; a repaint is requested while a change is
+   pending so the debounce expires without user input.
+4. **Release LTO** — workspace `[profile.release]` now sets `lto = "thin"`,
+   `codegen-units = 1` for cross-crate inlining of filter/ring hot paths.
+
+**Verification:** `cargo test --workspace --exclude kv-gui` all pass,
+`cargo check -p kv-gui --target x86_64-pc-windows-msvc` clean (pre-existing
+warnings only). GUI smoke test still pending on Windows.
+
+**Next:** P2 engineering — CI workflow, clippy cleanup, eprintln→log.
+
+---
 
 ### Session 23: P0 — Wire unfinished features (impedance / export / selective save / demo errors)
 

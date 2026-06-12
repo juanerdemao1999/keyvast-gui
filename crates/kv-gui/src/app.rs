@@ -61,7 +61,16 @@ pub enum AcqMode {
 
 // ── Application state ───────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Acquire,
+    Display,
+    Tools,
+}
+
 pub struct KvApp {
+    // Sidebar
+    sidebar_tab: SidebarTab,
     // Mode
     mode: AcqMode,
     // Demo
@@ -159,6 +168,7 @@ impl KvApp {
         let now = Instant::now();
         let filters = FilterSettings::default();
         Self {
+            sidebar_tab: SidebarTab::Acquire,
             mode: AcqMode::Demo,
             demo: DemoPreview::default_neural(),
             demo_started: false,
@@ -1335,53 +1345,176 @@ impl eframe::App for KvApp {
                 let mut start = false;
                 let mut stop = false;
                 let mut toggle_rec = false;
+                let mut dismiss_error = false;
+                let mut start_impedance = false;
+                let mut open_playback_file = false;
+                let mut save_clicked = false;
+                let mut load_clicked = false;
 
                 // Compute elapsed recording seconds for the clock display.
                 let rec_elapsed_secs = self
                     .recording_start_time
                     .map(|t| t.elapsed().as_secs_f64());
+                let acq_running = self.is_running();
+                let total_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+                let prev_remote_enabled = self.remote_api_state.enabled;
 
-                let mut dismiss_error = false;
-                panels::draw_left_panel(
-                    ui,
-                    self.is_running(),
-                    &mut self.device,
-                    &mut start,
-                    &mut stop,
-                    &mut toggle_rec,
-                    &mut self.display,
-                    &mut self.filters,
-                    &mut self.recording,
-                    self.latest_block.as_ref(),
-                    rec_elapsed_secs,
-                    self.recorder_buffer_occupancy,
-                    self.recording_error.as_deref(),
-                    &mut dismiss_error,
-                );
+                ui.set_min_width(220.0);
+
+                // Tab strip grouping the sidebar sections by purpose.
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (SidebarTab::Acquire, "ACQUIRE"),
+                        (SidebarTab::Display, "DISPLAY"),
+                        (SidebarTab::Tools, "TOOLS"),
+                    ] {
+                        ui.selectable_value(
+                            &mut self.sidebar_tab,
+                            tab,
+                            egui::RichText::new(label).size(10.0).strong(),
+                        );
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    match self.sidebar_tab {
+                        SidebarTab::Acquire => {
+                            panels::draw_acquire_core(
+                                ui,
+                                acq_running,
+                                &mut self.device,
+                                &mut start,
+                                &mut stop,
+                                &mut toggle_rec,
+                                &mut self.recording,
+                                self.latest_block.as_ref(),
+                                rec_elapsed_secs,
+                                self.recorder_buffer_occupancy,
+                                self.recording_error.as_deref(),
+                                &mut dismiss_error,
+                            );
+
+                            ui.add_space(4.0);
+                            trigger::draw_trigger_section(ui, &mut self.trigger);
+
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("EXPORT FORMAT")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(theme::TEXT_SECONDARY),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                use kv_recorder::export_formats::ExportFormat;
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::IntanRhd,
+                                        egui::RichText::new("Intan .rhd").size(10.0),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::FlatBinary,
+                                        egui::RichText::new("Flat binary").size(10.0),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(self.export_format.label())
+                                        .size(9.0)
+                                        .italics()
+                                        .color(theme::TEXT_DIM),
+                                );
+                            });
+
+                            ui.add_space(4.0);
+                            self.channel_select.sync_channel_count(total_ch);
+                            channel_select::draw_channel_select_section(
+                                ui,
+                                &mut self.channel_select,
+                            );
+                        }
+                        SidebarTab::Display => {
+                            panels::draw_display_settings(ui, &mut self.display);
+
+                            ui.add_space(4.0);
+                            panels::draw_filter_settings(ui, &mut self.filters);
+
+                            ui.add_space(4.0);
+                            panels::draw_channel_list(
+                                ui,
+                                &mut self.display,
+                                self.latest_block.as_ref(),
+                            );
+
+                            ui.add_space(4.0);
+                            channel_map::draw_channel_map_section(
+                                ui,
+                                &mut self.channel_map,
+                                &mut self.display,
+                                total_ch,
+                            );
+
+                            ui.add_space(4.0);
+                            fft_panel::draw_fft_section(
+                                ui,
+                                &mut self.fft,
+                                &self.disp_ring,
+                                sr,
+                                total_ch,
+                            );
+
+                            ui.add_space(4.0);
+                            probe_map::draw_probe_map_section(
+                                ui,
+                                &mut self.probe_map,
+                                total_ch,
+                            );
+                        }
+                        SidebarTab::Tools => {
+                            impedance_panel::draw_impedance_section(
+                                ui,
+                                &mut self.impedance,
+                                acq_running,
+                                &mut start_impedance,
+                            );
+
+                            ui.add_space(4.0);
+                            playback::draw_playback_section(
+                                ui,
+                                &mut self.playback_mgr,
+                                &mut open_playback_file,
+                            );
+
+                            ui.add_space(4.0);
+                            audio_monitor::draw_audio_monitor_section(
+                                ui,
+                                &mut self.audio_monitor,
+                                total_ch,
+                            );
+
+                            ui.add_space(4.0);
+                            remote_api::draw_remote_api_section(
+                                ui,
+                                &mut self.remote_api_state,
+                            );
+
+                            ui.add_space(4.0);
+                            config_persist::draw_config_section(
+                                ui,
+                                &mut self.config_persist,
+                                &mut save_clicked,
+                                &mut load_clicked,
+                            );
+                        }
+                    }
+                });
+
                 if dismiss_error {
                     self.recording_error = None;
                 }
-
-                // Impedance panel
-                ui.add_space(4.0);
-                let mut start_impedance = false;
-                let acq_running = self.is_running();
-                impedance_panel::draw_impedance_section(
-                    ui,
-                    &mut self.impedance,
-                    acq_running,
-                    &mut start_impedance,
-                );
-
-                // Playback panel
-                ui.add_space(4.0);
-                let mut open_playback_file = false;
-                playback::draw_playback_section(
-                    ui,
-                    &mut self.playback_mgr,
-                    &mut open_playback_file,
-                );
-
                 if start {
                     match self.mode {
                         AcqMode::Demo => self.start_demo(),
@@ -1402,44 +1535,8 @@ impl eframe::App for KvApp {
                     }
                 }
 
-                // FFT spectrum panel
-                ui.add_space(4.0);
-                let total_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
-                fft_panel::draw_fft_section(
-                    ui,
-                    &mut self.fft,
-                    &self.disp_ring,
-                    sr,
-                    total_ch,
-                );
-
-                // Channel mapping panel
-                ui.add_space(4.0);
-                channel_map::draw_channel_map_section(
-                    ui,
-                    &mut self.channel_map,
-                    &mut self.display,
-                    total_ch,
-                );
-
-                // Phase 3: Trigger/Gate
-                ui.add_space(4.0);
-                trigger::draw_trigger_section(ui, &mut self.trigger);
-
-                // Phase 3: Audio monitor
-                ui.add_space(4.0);
-                audio_monitor::draw_audio_monitor_section(
-                    ui,
-                    &mut self.audio_monitor,
-                    total_ch,
-                );
-
-                // Phase 3: Remote API
-                ui.add_space(4.0);
-                let prev_enabled = self.remote_api_state.enabled;
-                remote_api::draw_remote_api_section(ui, &mut self.remote_api_state);
-                // Start/stop server based on enabled toggle
+                // Start/stop remote API server based on enabled toggle
+                let prev_enabled = prev_remote_enabled;
                 if self.remote_api_state.enabled && !prev_enabled {
                     match remote_api::start_server(self.remote_api_state.port) {
                         Ok(handle) => {
@@ -1464,59 +1561,6 @@ impl eframe::App for KvApp {
                         *handle.client_count.lock().unwrap();
                 }
 
-                // Phase 3: Export format selector (below recording)
-                ui.add_space(4.0);
-                egui::CollapsingHeader::new(
-                    egui::RichText::new("EXPORT FORMAT")
-                        .size(11.0)
-                        .strong()
-                        .color(theme::TEXT_SECONDARY),
-                )
-                .default_open(false)
-                .show(ui, |ui| {
-                    use kv_recorder::export_formats::ExportFormat;
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(
-                            &mut self.export_format,
-                            ExportFormat::IntanRhd,
-                            egui::RichText::new("Intan .rhd").size(10.0),
-                        );
-                        ui.selectable_value(
-                            &mut self.export_format,
-                            ExportFormat::FlatBinary,
-                            egui::RichText::new("Flat binary").size(10.0),
-                        );
-                    });
-                    ui.label(
-                        egui::RichText::new(self.export_format.label())
-                            .size(9.0)
-                            .italics()
-                            .color(theme::TEXT_DIM),
-                    );
-                });
-
-                // Phase 4: Probe Map config
-                ui.add_space(4.0);
-                probe_map::draw_probe_map_section(ui, &mut self.probe_map, total_ch);
-
-                // Phase 4: Selective channel save
-                ui.add_space(4.0);
-                self.channel_select.sync_channel_count(total_ch);
-                channel_select::draw_channel_select_section(
-                    ui,
-                    &mut self.channel_select,
-                );
-
-                // Phase 4: Config persistence
-                ui.add_space(4.0);
-                let mut save_clicked = false;
-                let mut load_clicked = false;
-                config_persist::draw_config_section(
-                    ui,
-                    &mut self.config_persist,
-                    &mut save_clicked,
-                    &mut load_clicked,
-                );
                 if save_clicked {
                     let cfg = PersistentConfig::capture_from(
                         &self.display,

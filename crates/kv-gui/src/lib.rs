@@ -19,7 +19,6 @@ mod live_pipeline;
 mod multiview;
 mod panels;
 mod playback;
-mod probe_map;
 mod remote_api;
 mod spike_overlay;
 mod preview;

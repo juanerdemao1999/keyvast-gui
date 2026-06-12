@@ -36,7 +36,6 @@ use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
 use crate::fft_panel::{self, FftState};
 use crate::impedance_panel::{self, ImpedanceMsg, ImpedanceState};
 use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
-use crate::probe_map::{self, ProbeMapState};
 use crate::remote_api::{self, RemoteApiState, RemoteApiHandle, RemoteCommand, RemoteResponse, AppStatus};
 use crate::trigger::{self, TriggerConfig, TriggerAction};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
@@ -176,7 +175,6 @@ pub struct KvApp {
     /// Channel subset captured when a Demo-mode recording starts.
     record_channels: Option<Vec<usize>>,
     // Phase 4 features
-    probe_map: ProbeMapState,
     channel_select: ChannelSelectState,
     config_persist: ConfigPersistState,
 }
@@ -240,7 +238,6 @@ impl KvApp {
             export_rx: None,
             export_status: None,
             record_channels: None,
-            probe_map: ProbeMapState::default(),
             channel_select: ChannelSelectState::default(),
             config_persist: ConfigPersistState::default(),
         }
@@ -1661,13 +1658,6 @@ impl eframe::App for KvApp {
                                 sr,
                                 total_ch,
                             );
-
-                            ui.add_space(4.0);
-                            probe_map::draw_probe_map_section(
-                                ui,
-                                &mut self.probe_map,
-                                total_ch,
-                            );
                         }
                         SidebarTab::Tools => {
                             let can_measure = self.device.kind == DeviceKind::Rhd
@@ -1761,8 +1751,6 @@ impl eframe::App for KvApp {
                         &self.recording.output_dir,
                         &self.recording.file_prefix,
                         self.remote_api_state.port,
-                        self.probe_map.geometry.label(),
-                        self.probe_map.site_radius,
                     );
                     match config_persist::save_config(&self.config_persist.config_path, &cfg) {
                         Ok(()) => {
@@ -1792,13 +1780,6 @@ impl eframe::App for KvApp {
                     }
                 }
             });
-
-        // ── Probe Map window (floating) ─────────────────────────
-        if self.probe_map.visible {
-            let map_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-            self.probe_map.update_activity(&self.disp_ring, map_ch);
-            probe_map::draw_probe_map_window(ctx, &self.probe_map, map_ch);
-        }
 
         // ── Multi-view tile canvas ──────────────────────────────
         //

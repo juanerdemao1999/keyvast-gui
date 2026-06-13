@@ -25,14 +25,14 @@ pub enum DisplayMode {
 
 /// 8-color palette for channel group coloring.
 pub const CHANNEL_GROUP_COLORS: &[egui::Color32] = &[
-    egui::Color32::from_rgb(100, 180, 255),  // blue
-    egui::Color32::from_rgb(120, 220, 120),  // green
-    egui::Color32::from_rgb(255, 160, 80),   // orange
-    egui::Color32::from_rgb(200, 120, 255),  // purple
-    egui::Color32::from_rgb(255, 100, 100),  // red
-    egui::Color32::from_rgb(80, 220, 200),   // teal
-    egui::Color32::from_rgb(255, 220, 80),   // yellow
-    egui::Color32::from_rgb(200, 200, 200),  // gray
+    egui::Color32::from_rgb(100, 180, 255), // blue
+    egui::Color32::from_rgb(120, 220, 120), // green
+    egui::Color32::from_rgb(255, 160, 80),  // orange
+    egui::Color32::from_rgb(200, 120, 255), // purple
+    egui::Color32::from_rgb(255, 100, 100), // red
+    egui::Color32::from_rgb(80, 220, 200),  // teal
+    egui::Color32::from_rgb(255, 220, 80),  // yellow
+    egui::Color32::from_rgb(200, 200, 200), // gray
 ];
 
 /// Time-window presets in seconds (total visible window width).
@@ -141,7 +141,10 @@ impl DisplaySettings {
         if self.channel_order.is_empty() {
             display_pos
         } else {
-            self.channel_order.get(display_pos).copied().unwrap_or(display_pos)
+            self.channel_order
+                .get(display_pos)
+                .copied()
+                .unwrap_or(display_pos)
         }
     }
 }
@@ -173,7 +176,7 @@ impl Default for FilterSettings {
             lp_enabled: false,
             lp_cutoff_hz: 250.0, // standard for LFP-band view
             notch_enabled: false,
-            notch_idx: 0,        // default 50 Hz (CN/EU mains)
+            notch_idx: 0, // default 50 Hz (CN/EU mains)
             car_enabled: false,
             spike_threshold_enabled: false,
             spike_threshold_sigma: 4.0,
@@ -276,14 +279,15 @@ fn default_bitfile_path() -> Option<PathBuf> {
 
     // 1. Search relative to the executable (works in deployed builds).
     if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent() {
-            for name in &bitfile_names {
-                let candidate = exe_dir.join(name);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
+        && let Some(exe_dir) = exe.parent()
+    {
+        for name in &bitfile_names {
+            let candidate = exe_dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
             }
         }
+    }
 
     // 2. Search current working directory.
     if let Ok(cwd) = std::env::current_dir() {
@@ -356,7 +360,10 @@ fn draw_device_section(
     block: Option<&SampleBlock>,
 ) {
     egui::CollapsingHeader::new(
-        egui::RichText::new("DEVICE").size(11.0).strong().color(theme::TEXT_SECONDARY),
+        egui::RichText::new("DEVICE")
+            .size(11.0)
+            .strong()
+            .color(theme::TEXT_SECONDARY),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -384,7 +391,11 @@ fn draw_device_section(
         // backend cannot change mid-run.
         ui.add_enabled_ui(!connected, |ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Source").size(10.0).color(theme::TEXT_DIM));
+                ui.label(
+                    egui::RichText::new("Source")
+                        .size(10.0)
+                        .color(theme::TEXT_DIM),
+                );
                 ui.selectable_value(&mut device.kind, DeviceKind::Simulator, "Simulator");
                 ui.selectable_value(&mut device.kind, DeviceKind::Rhd, "RHD");
             });
@@ -421,7 +432,9 @@ fn draw_device_section(
                 });
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Headstages").size(10.0).color(theme::TEXT_DIM),
+                        egui::RichText::new("Headstages")
+                            .size(10.0)
+                            .color(theme::TEXT_DIM),
                     );
                     ui.selectable_value(&mut device.rhd_streams, 1, "1 (32ch)");
                     ui.selectable_value(&mut device.rhd_streams, 2, "2 (64ch)");
@@ -458,7 +471,10 @@ fn draw_acquisition_controls(
     stop_clicked: &mut bool,
 ) {
     egui::CollapsingHeader::new(
-        egui::RichText::new("ACQUISITION").size(11.0).strong().color(theme::TEXT_SECONDARY),
+        egui::RichText::new("ACQUISITION")
+            .size(11.0)
+            .strong()
+            .color(theme::TEXT_SECONDARY),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -497,7 +513,10 @@ fn draw_acquisition_controls(
 
 pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
     egui::CollapsingHeader::new(
-        egui::RichText::new("DISPLAY").size(11.0).strong().color(theme::TEXT_SECONDARY),
+        egui::RichText::new("DISPLAY")
+            .size(11.0)
+            .strong()
+            .color(theme::TEXT_SECONDARY),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -546,11 +565,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
 
         // Amplitude scale — dropdown
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Amp")
-                    .size(10.0)
-                    .color(theme::TEXT_DIM),
-            );
+            ui.label(egui::RichText::new("Amp").size(10.0).color(theme::TEXT_DIM));
             egui::ComboBox::from_id_salt("amp_scale")
                 .width(ui.available_width() - 4.0)
                 .selected_text(
@@ -611,12 +626,14 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 &mut display.display_mode,
                 DisplayMode::Sweep,
                 egui::RichText::new("Sweep").size(10.0),
-            ).on_hover_text("Fixed window, cursor sweeps right (SpikeGLX/Intan RHX style)");
+            )
+            .on_hover_text("Fixed window, cursor sweeps right (SpikeGLX/Intan RHX style)");
             ui.selectable_value(
                 &mut display.display_mode,
                 DisplayMode::Roll,
                 egui::RichText::new("Roll").size(10.0),
-            ).on_hover_text("Continuous scrolling, latest data on the right");
+            )
+            .on_hover_text("Continuous scrolling, latest data on the right");
         });
 
         // Channel colors
@@ -625,16 +642,20 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
             ui.checkbox(
                 &mut display.color_by_group,
                 egui::RichText::new("Group colors").size(10.0),
-            ).on_hover_text("Color channels by group (cycling 8-color palette)");
+            )
+            .on_hover_text("Color channels by group (cycling 8-color palette)");
             if display.color_by_group {
                 let mut g = display.channels_per_group as i32;
-                if ui.add(
-                    egui::DragValue::new(&mut g)
-                        .range(1..=64)
-                        .speed(0.5)
-                        .prefix("per ")
-                        .suffix(" ch"),
-                ).changed() {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut g)
+                            .range(1..=64)
+                            .speed(0.5)
+                            .prefix("per ")
+                            .suffix(" ch"),
+                    )
+                    .changed()
+                {
                     display.channels_per_group = g.max(1) as usize;
                 }
             }
@@ -747,92 +768,6 @@ pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
     });
 }
 
-// ── Channel list with enable/disable ────────────────────────────────
-
-pub fn draw_channel_list(
-    ui: &mut egui::Ui,
-    display: &mut DisplaySettings,
-    block: Option<&SampleBlock>,
-) {
-    let ch_count = block.map(|b| b.channel_count).unwrap_or(0);
-    let visible = display.visible_channels.min(ch_count);
-
-    egui::CollapsingHeader::new(
-        egui::RichText::new(format!("CHANNELS ({visible})"))
-            .size(11.0)
-            .strong()
-            .color(theme::TEXT_SECONDARY),
-    )
-    .default_open(false)
-    .show(ui, |ui| {
-        if visible == 0 {
-            ui.label(
-                egui::RichText::new("No channels")
-                    .size(10.0)
-                    .color(theme::TEXT_DIM),
-            );
-            return;
-        }
-
-        // All / None buttons
-        ui.horizontal(|ui| {
-            if ui
-                .small_button(egui::RichText::new("All").size(9.0))
-                .clicked()
-            {
-                for i in 0..visible {
-                    if let Some(e) = display.channel_enabled.get_mut(i) {
-                        *e = true;
-                    }
-                }
-            }
-            if ui
-                .small_button(egui::RichText::new("None").size(9.0))
-                .clicked()
-            {
-                for i in 0..visible {
-                    if let Some(e) = display.channel_enabled.get_mut(i) {
-                        *e = false;
-                    }
-                }
-            }
-        });
-
-        // Scrollable channel checkboxes
-        // min_scrolled_width reserves enough room so the scrollbar never
-        // overlaps the channel name / checkbox content.
-        egui::ScrollArea::vertical()
-            .max_height(200.0)
-            .min_scrolled_width(160.0)
-            .show(ui, |ui| {
-                ui.set_min_width(160.0);
-                for ch in 0..visible {
-                    // Ensure vector is big enough
-                    while display.channel_enabled.len() <= ch {
-                        display.channel_enabled.push(true);
-                    }
-                    let color = theme::channel_color(ch);
-                    let enabled = display.channel_enabled[ch];
-                    let label_color = if enabled { color } else { theme::TEXT_DIM };
-                    ui.horizontal(|ui| {
-                        // Colored bar
-                        let (bar_rect, _) =
-                            ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
-                        ui.painter().rect_filled(bar_rect, 0.0, color);
-
-                        ui.checkbox(
-                            &mut display.channel_enabled[ch],
-                            egui::RichText::new(format!("CH{ch}"))
-                                .size(10.0)
-                                .monospace()
-                                .color(label_color),
-                        );
-                    });
-                }
-            });
-    });
-}
-
 // ── Recording section ───────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -847,7 +782,10 @@ fn draw_recording_section(
     dismiss_error: &mut bool,
 ) {
     egui::CollapsingHeader::new(
-        egui::RichText::new("RECORDING").size(11.0).strong().color(theme::TEXT_SECONDARY),
+        egui::RichText::new("RECORDING")
+            .size(11.0)
+            .strong()
+            .color(theme::TEXT_SECONDARY),
     )
     .default_open(true)
     .show(ui, |ui| {
@@ -866,29 +804,41 @@ fn draw_recording_section(
             ui.label(egui::RichText::new(label).size(11.0).color(label_color));
         });
 
-        // Output directory — text field + folder picker button
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Dir:")
-                    .size(10.0)
-                    .color(theme::TEXT_DIM),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut recording.output_dir)
-                    .desired_width(110.0)
-                    .font(egui::FontId::monospace(10.0)),
-            );
-            if ui
-                .button(egui::RichText::new("📁").size(13.0))
-                .on_hover_text("Browse for output folder")
-                .clicked()
-                && let Some(path) = rfd::FileDialog::new()
-                    .set_title("Select recording output folder")
-                    .pick_folder()
+        // Output directory — text field + folder picker button.
+        // Locked while recording so the write target cannot change mid-run
+        // (the file layout is fixed the moment recording starts — B2).
+        let recording_active = recording.state == RecordingState::Recording;
+        ui.add_enabled_ui(!recording_active, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Dir:")
+                        .size(theme::FONT_BODY)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut recording.output_dir)
+                        .desired_width(110.0)
+                        .font(egui::FontId::monospace(theme::FONT_BODY)),
+                );
+                if ui
+                    .button(egui::RichText::new("📁").size(13.0))
+                    .on_hover_text("Browse for output folder")
+                    .clicked()
+                    && let Some(path) = rfd::FileDialog::new()
+                        .set_title("Select recording output folder")
+                        .pick_folder()
                 {
                     recording.output_dir = path.to_string_lossy().into_owned();
                 }
+            });
         });
+        if recording_active {
+            ui.label(
+                egui::RichText::new("\u{1F512} Output locked while recording")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
+        }
 
         // Arm / Record / Stop buttons — all go through toggle_rec so that
         // app.rs::toggle_recording() handles the actual state transitions
@@ -927,11 +877,7 @@ fn draw_recording_section(
                 let h = secs as u64 / 3600;
                 let m = (secs as u64 % 3600) / 60;
                 let s = secs as u64 % 60;
-                theme::kv_label(
-                    ui,
-                    "Duration",
-                    &format!("{h:02}:{m:02}:{s:02}"),
-                );
+                theme::kv_label(ui, "Duration", &format!("{h:02}:{m:02}:{s:02}"));
             }
 
             // ── Buffer occupancy water-mark ──────────────────────
@@ -983,11 +929,7 @@ fn draw_recording_section(
                 .corner_radius(egui::CornerRadius::same(4))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new("⚠")
-                                .size(11.0)
-                                .color(theme::ACCENT_RED),
-                        );
+                        ui.label(egui::RichText::new("⚠").size(11.0).color(theme::ACCENT_RED));
                         ui.add_space(2.0);
                         ui.label(
                             egui::RichText::new(err)
@@ -996,9 +938,7 @@ fn draw_recording_section(
                         );
                     });
                     if ui
-                        .small_button(
-                            egui::RichText::new("Dismiss").size(9.0),
-                        )
+                        .small_button(egui::RichText::new("Dismiss").size(9.0))
                         .clicked()
                     {
                         *dismiss_error = true;
@@ -1042,13 +982,19 @@ pub fn draw_status_bar(
         // Recording state
         match recording.state {
             RecordingState::Recording => {
-                theme::status_dot(ui, theme::STATUS_RECORDING);
-                ui.label(
-                    egui::RichText::new("REC")
-                        .size(10.0)
-                        .strong()
-                        .color(theme::STATUS_RECORDING),
-                );
+                // Filled red badge so an active recording is unmistakable (A5).
+                egui::Frame::new()
+                    .fill(theme::STATUS_RECORDING)
+                    .corner_radius(egui::CornerRadius::same(3))
+                    .inner_margin(egui::Margin::symmetric(5, 1))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("\u{25CF} REC")
+                                .size(theme::FONT_BODY)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
             }
             RecordingState::Armed => {
                 theme::status_dot(ui, theme::STATUS_ARMED);
@@ -1086,13 +1032,10 @@ pub fn draw_status_bar(
         // Device info
         if let Some(b) = block {
             ui.label(
-                egui::RichText::new(format!(
-                    "{}ch @ {:.0}Hz",
-                    b.channel_count, b.sample_rate
-                ))
-                .size(10.0)
-                .monospace()
-                .color(theme::TEXT_SECONDARY),
+                egui::RichText::new(format!("{}ch @ {:.0}Hz", b.channel_count, b.sample_rate))
+                    .size(10.0)
+                    .monospace()
+                    .color(theme::TEXT_SECONDARY),
             );
             ui.separator();
         }
@@ -1114,19 +1057,29 @@ pub fn draw_status_bar(
             );
             ui.separator();
 
-            // Buffer health
+            // Buffer health — dropped blocks are emphasized (warning glyph +
+            // bold) the moment any are detected (A5).
             let dropped = s.dropped_blocks;
-            let health_color = if dropped == 0 {
+            let healthy = dropped == 0;
+            let health_color = if healthy {
                 theme::ACCENT_GREEN
             } else {
                 theme::ACCENT_RED
             };
-            ui.label(
-                egui::RichText::new(format!("Drop: {dropped}"))
-                    .size(10.0)
+            let drop_text = if healthy {
+                egui::RichText::new("Drop: 0")
+                    .size(theme::FONT_BODY)
                     .monospace()
-                    .color(health_color),
-            );
+                    .color(health_color)
+            } else {
+                egui::RichText::new(format!("\u{26A0} Drop: {dropped}"))
+                    .size(theme::FONT_BODY)
+                    .monospace()
+                    .strong()
+                    .color(health_color)
+            };
+            ui.label(drop_text)
+                .on_hover_text("Blocks lost to packet-ID gaps (disk or CPU can't keep up)");
         }
 
         // Right-aligned: total blocks and samples
@@ -1161,17 +1114,7 @@ fn format_uv(uv: f64) -> String {
     }
 }
 
-fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_000_000_000 {
-        format!("{:.2} GB", bytes as f64 / 1_000_000_000.0)
-    } else if bytes >= 1_000_000 {
-        format!("{:.1} MB", bytes as f64 / 1_000_000.0)
-    } else if bytes >= 1_000 {
-        format!("{:.1} KB", bytes as f64 / 1_000.0)
-    } else {
-        format!("{bytes} B")
-    }
-}
+use crate::theme::format_bytes;
 
 fn format_large_number(n: u64) -> String {
     if n >= 1_000_000 {

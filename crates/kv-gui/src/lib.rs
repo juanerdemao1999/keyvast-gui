@@ -19,10 +19,11 @@ mod live_pipeline;
 mod multiview;
 mod panels;
 mod playback;
+mod preview;
 mod remote_api;
 mod spike_overlay;
-mod preview;
 mod theme;
+mod toast;
 mod trigger;
 mod waveform;
 

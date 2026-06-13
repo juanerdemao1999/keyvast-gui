@@ -47,7 +47,11 @@ impl ChannelSelectState {
         if !self.enabled {
             return self.channel_count;
         }
-        self.selected.iter().take(self.channel_count).filter(|&&s| s).count()
+        self.selected
+            .iter()
+            .take(self.channel_count)
+            .filter(|&&s| s)
+            .count()
     }
 
     /// Get ordered list of selected channel indices.
@@ -129,84 +133,199 @@ pub fn filter_block_channels(block: &SampleBlock, indices: &[usize]) -> SampleBl
 
 // ── GUI drawing ─────────────────────────────────────────────────────
 
-/// Draw the channel selection section in the sidebar.
-pub fn draw_channel_select_section(
+/// Unified channel panel (B3).
+///
+/// Merges the former display-channel list and recording-channel selector into
+/// a single place, with one row per channel exposing both a **Disp** toggle
+/// (whether the channel is drawn) and a **Rec** toggle (whether it is written
+/// to disk).  The Rec column is only interactive when "Record subset only" is
+/// enabled, and is locked entirely while a recording is in progress (`rec_locked`,
+/// B2) since the on-disk channel set is fixed when recording starts.
+pub fn draw_unified_channels(
     ui: &mut egui::Ui,
-    state: &mut ChannelSelectState,
+    display: &mut crate::panels::DisplaySettings,
+    select: &mut ChannelSelectState,
+    block: Option<&SampleBlock>,
+    rec_locked: bool,
 ) {
+    let ch_count = block.map(|b| b.channel_count).unwrap_or(0);
+    let visible = display.visible_channels.min(ch_count);
+    select.sync_channel_count(ch_count);
+
     egui::CollapsingHeader::new(
-        egui::RichText::new("CHANNEL SELECTION (REC)")
-            .size(11.0)
+        egui::RichText::new(format!("CHANNELS ({visible})"))
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
     .default_open(false)
     .show(ui, |ui| {
-        ui.checkbox(
-            &mut state.enabled,
-            egui::RichText::new("Save selected channels only").size(10.0),
-        );
-
-        if !state.enabled {
+        if visible == 0 {
             ui.label(
-                egui::RichText::new("All channels will be recorded")
-                    .size(9.0)
-                    .italics()
+                egui::RichText::new("No channels")
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             return;
         }
 
-        // Summary
-        let count = state.selected_count();
-        let total = state.channel_count;
+        // Ensure the display-enable vector covers every visible channel.
+        while display.channel_enabled.len() < visible {
+            display.channel_enabled.push(true);
+        }
+
+        // Recording-subset master toggle.
+        ui.add_enabled_ui(!rec_locked, |ui| {
+            ui.checkbox(
+                &mut select.enabled,
+                egui::RichText::new("Record subset only").size(theme::FONT_BODY),
+            )
+            .on_hover_text("When off, every channel is recorded regardless of the Rec column");
+        });
+
+        // Counts summary.
+        let disp_on = (0..visible)
+            .filter(|&i| display.channel_enabled.get(i).copied().unwrap_or(true))
+            .count();
+        let rec_on = select.selected_count().min(visible);
         ui.label(
-            egui::RichText::new(format!("{count}/{total} channels selected"))
-                .size(10.0)
-                .color(if count == 0 { theme::ACCENT_RED } else { theme::ACCENT_GREEN }),
+            egui::RichText::new(format!(
+                "Display {disp_on}/{visible}  \u{00B7}  Record {rec_on}/{visible}"
+            ))
+            .size(theme::FONT_CAPTION)
+            .color(theme::TEXT_DIM),
         );
 
-        // Quick actions
+        // Bulk actions — Display row.
         ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Disp")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
             if ui.small_button("All").clicked() {
-                state.select_all();
-            }
-            if ui.small_button("None").clicked() {
-                state.deselect_all();
-            }
-            if ui.small_button("Even").clicked() {
-                for ch in 0..state.channel_count {
-                    if let Some(s) = state.selected.get_mut(ch) {
-                        *s = ch % 2 == 0;
-                    }
+                for i in 0..visible {
+                    display.channel_enabled[i] = true;
                 }
             }
-            if ui.small_button("Odd").clicked() {
-                for ch in 0..state.channel_count {
-                    if let Some(s) = state.selected.get_mut(ch) {
-                        *s = ch % 2 == 1;
-                    }
+            if ui.small_button("None").clicked() {
+                for i in 0..visible {
+                    display.channel_enabled[i] = false;
+                }
+            }
+            if ui.small_button("Invert").clicked() {
+                for i in 0..visible {
+                    display.channel_enabled[i] = !display.channel_enabled[i];
                 }
             }
         });
 
-        // Channel grid (compact checkboxes)
-        ui.add_space(2.0);
-        let cols = 4;
-        egui::Grid::new("ch_select_grid")
-            .num_columns(cols)
-            .spacing(egui::vec2(2.0, 1.0))
-            .show(ui, |ui| {
-                for ch in 0..state.channel_count {
-                    let label = format!("{ch:2}");
-                    ui.checkbox(
-                        &mut state.selected[ch],
-                        egui::RichText::new(label).size(9.0).monospace(),
-                    );
-                    if (ch + 1) % cols == 0 {
-                        ui.end_row();
+        // Bulk actions — Record row (only when selecting a subset, unlocked).
+        ui.add_enabled_ui(select.enabled && !rec_locked, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Rec ")
+                        .size(theme::FONT_CAPTION)
+                        .color(theme::TEXT_DIM),
+                );
+                if ui.small_button("All").clicked() {
+                    select.select_all();
+                }
+                if ui.small_button("None").clicked() {
+                    select.deselect_all();
+                }
+                if ui.small_button("Invert").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = !*s;
+                        }
                     }
                 }
+                if ui.small_button("Even").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = ch % 2 == 0;
+                        }
+                    }
+                }
+                if ui.small_button("Odd").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = ch % 2 == 1;
+                        }
+                    }
+                }
+            });
+        });
+
+        if rec_locked {
+            ui.label(
+                egui::RichText::new("\u{1F512} Record selection locked while recording")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+
+        ui.add_space(2.0);
+
+        // Per-channel rows: [color · CHn] [Disp] [Rec].
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .min_scrolled_width(170.0)
+            .show(ui, |ui| {
+                ui.set_min_width(170.0);
+                egui::Grid::new("kv_unified_chan_grid")
+                    .num_columns(3)
+                    .spacing(egui::vec2(10.0, 2.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new("Channel")
+                                .size(theme::FONT_CAPTION)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.label(
+                            egui::RichText::new("Disp")
+                                .size(theme::FONT_CAPTION)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.label(
+                            egui::RichText::new("Rec")
+                                .size(theme::FONT_CAPTION)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.end_row();
+
+                        for ch in 0..visible {
+                            let color = theme::channel_color(ch);
+                            let disp_on = display.channel_enabled[ch];
+                            let label_color = if disp_on { color } else { theme::TEXT_DIM };
+
+                            ui.horizontal(|ui| {
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(3.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(bar_rect, 0.0, color);
+                                ui.label(
+                                    egui::RichText::new(format!("CH{ch}"))
+                                        .size(theme::FONT_BODY)
+                                        .monospace()
+                                        .color(label_color),
+                                );
+                            });
+
+                            ui.checkbox(&mut display.channel_enabled[ch], "");
+
+                            ui.add_enabled_ui(select.enabled && !rec_locked, |ui| {
+                                if select.selected.len() <= ch {
+                                    select.selected.resize(ch + 1, true);
+                                }
+                                ui.checkbox(&mut select.selected[ch], "");
+                            });
+
+                            ui.end_row();
+                        }
+                    });
             });
     });
 }

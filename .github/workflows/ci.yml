@@ -1,9 +1,9 @@
 name: CI
 
+# CI auto-execution is disabled per request: the workflow no longer runs on
+# push or pull_request and can only be triggered manually from the Actions tab.
 on:
-  push:
-    branches: [main, v2.0]
-  pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always

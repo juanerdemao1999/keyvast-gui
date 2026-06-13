@@ -1561,7 +1561,7 @@ impl eframe::App for KvApp {
                     if self.data_source == DataSource::Playback {
                         let loaded = self.playback_mgr.is_loaded();
                         let playing = self.playback_mgr.state == playback::PlaybackState::Playing;
-                        if theme::transport_button_tip(
+                        if theme::transport_button_sized(
                             ui,
                             if playing { " Pause " } else { "  Play  " },
                             if playing {
@@ -1571,6 +1571,7 @@ impl eframe::App for KvApp {
                             },
                             loaded,
                             "Play / pause the recording (Space)",
+                            88.0,
                         ) {
                             self.playback_mgr.toggle_play_pause();
                         }
@@ -1604,7 +1605,7 @@ impl eframe::App for KvApp {
                             open_playback = true;
                         }
                     } else {
-                        if theme::transport_button_tip(
+                        if theme::transport_button_sized(
                             ui,
                             if running { "  Stop  " } else { "  Start  " },
                             if running {
@@ -1614,6 +1615,7 @@ impl eframe::App for KvApp {
                             },
                             true,
                             "Start / stop acquisition (Space)",
+                            88.0,
                         ) {
                             self.toggle_acquisition();
                         }
@@ -1635,12 +1637,15 @@ impl eframe::App for KvApp {
                             RecordingState::Armed => "Begin recording (R)",
                             RecordingState::Recording => "Stop recording (R)",
                         };
-                        if theme::transport_button_tip(
+                        // Fixed width fits the widest label ("STOP REC") so
+                        // arming / recording never shoves the toolbar sideways.
+                        if theme::transport_button_sized(
                             ui,
                             rec_label,
                             rec_color,
                             rec_enabled,
                             rec_tip,
+                            104.0,
                         ) {
                             self.toggle_recording();
                         }
@@ -1657,12 +1662,13 @@ impl eframe::App for KvApp {
                             } else {
                                 theme::TEXT_SECONDARY
                             };
-                            if theme::transport_button_tip(
+                            if theme::transport_button_sized(
                                 ui,
                                 pause_label,
                                 pause_color,
                                 true,
                                 "Freeze / resume the display; acquisition continues (P)",
+                                88.0,
                             ) {
                                 self.toggle_pause_display();
                             }
@@ -1689,31 +1695,48 @@ impl eframe::App for KvApp {
                             "Live acquisition \u{2014} RHD hardware (set bitfile in DEVICE panel)"
                         }
                     };
-                    for (src, label, tip) in [
-                        (
-                            DataSource::Demo,
-                            "Demo",
-                            "Synthetic neural data \u{2014} no hardware",
-                        ),
-                        (DataSource::Device, "Device", device_tip),
-                        (
-                            DataSource::Playback,
-                            "Playback",
-                            "Replay a saved .kvraw recording",
-                        ),
-                    ] {
-                        let selected = self.data_source == src;
-                        if ui
-                            .selectable_label(
-                                selected,
-                                egui::RichText::new(label).size(theme::FONT_HEADING),
-                            )
-                            .on_hover_text(tip)
-                            .clicked()
-                            && !selected
-                        {
-                            self.select_source(src);
-                        }
+                    // Segmented control: the three sources sit flush inside one
+                    // recessed frame so they read as a single "pick one" switch
+                    // rather than three independent buttons.
+                    let mut pick: Option<DataSource> = None;
+                    egui::Frame::new()
+                        .fill(theme::BG_DARKEST)
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::same(2))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (src, label, tip) in [
+                                (
+                                    DataSource::Demo,
+                                    "Demo",
+                                    "Synthetic neural data \u{2014} no hardware",
+                                ),
+                                (DataSource::Device, "Device", device_tip),
+                                (
+                                    DataSource::Playback,
+                                    "Playback",
+                                    "Replay a saved .kvraw recording",
+                                ),
+                            ] {
+                                let selected = self.data_source == src;
+                                if ui
+                                    .add_sized(
+                                        [66.0, 22.0],
+                                        egui::SelectableLabel::new(
+                                            selected,
+                                            egui::RichText::new(label).size(theme::FONT_HEADING),
+                                        ),
+                                    )
+                                    .on_hover_text(tip)
+                                    .clicked()
+                                    && !selected
+                                {
+                                    pick = Some(src);
+                                }
+                            }
+                        });
+                    if let Some(src) = pick {
+                        self.select_source(src);
                     }
 
                     ui.add_space(8.0);
@@ -1775,7 +1798,14 @@ impl eframe::App for KvApp {
                         };
                         // In a right-to-left layout, add the label first so the
                         // status dot lands to its left, reading "● LABEL".
-                        ui.label(egui::RichText::new(label).size(12.0).strong().color(color));
+                        // Fixed-width label keeps the dot from hopping as the
+                        // state text (REC / ARMED / LIVE / IDLE) changes width.
+                        ui.add_sized(
+                            [44.0, 16.0],
+                            egui::Label::new(
+                                egui::RichText::new(label).size(12.0).strong().color(color),
+                            ),
+                        );
                         ui.add_space(5.0);
                         theme::status_dot(ui, dot);
                     });

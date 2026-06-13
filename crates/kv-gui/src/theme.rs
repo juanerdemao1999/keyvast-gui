@@ -416,6 +416,9 @@ pub fn transport_button(
     enabled && clicked
 }
 
+/// Default minimum width for a transport button.
+pub const TRANSPORT_BTN_W: f32 = 76.0;
+
 /// Like [`transport_button`] but with a hover tooltip (used to surface the
 /// keyboard shortcut for each transport action — B4).
 pub fn transport_button_tip(
@@ -424,6 +427,24 @@ pub fn transport_button_tip(
     fill: egui::Color32,
     enabled: bool,
     tip: &str,
+) -> bool {
+    transport_button_sized(ui, label, fill, enabled, tip, TRANSPORT_BTN_W)
+}
+
+/// Tooltip transport button with an explicit minimum width.
+///
+/// A single logical control whose label changes with state (e.g.
+/// `Record` → `ARMED` → `STOP REC`) would otherwise resize on every state
+/// change and shove the rest of the toolbar sideways.  Passing a `min_width`
+/// wide enough for the control's widest label pins the width so neighbouring
+/// controls never reflow.
+pub fn transport_button_sized(
+    ui: &mut egui::Ui,
+    label: &str,
+    fill: egui::Color32,
+    enabled: bool,
+    tip: &str,
+    min_width: f32,
 ) -> bool {
     let (bg, text_color) = if enabled {
         (fill, egui::Color32::WHITE)
@@ -442,7 +463,7 @@ pub fn transport_button_tip(
     )
     .fill(bg)
     .stroke(egui::Stroke::new(1.0, bg))
-    .min_size(egui::vec2(76.0, 30.0))
+    .min_size(egui::vec2(min_width, 30.0))
     .corner_radius(egui::CornerRadius::same(5));
 
     let clicked = ui.add(btn).on_hover_text(tip).clicked();

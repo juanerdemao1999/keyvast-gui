@@ -208,16 +208,31 @@ pub struct KvApp {
     // Phase 4 features
     channel_select: ChannelSelectState,
     config_persist: ConfigPersistState,
+    /// Global UI scale (pixels-per-point multiplier), persisted (#17).
+    ui_scale: f32,
+    /// Set once after the first frame restores the saved window size (#15).
+    window_restored: bool,
 }
 
 impl KvApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let now = Instant::now();
         let filters = FilterSettings::default();
-        Self {
+
+        // Restore persisted settings at startup (#15/#17).  Missing or invalid
+        // files fall back to defaults, so this never blocks launch.
+        let saved = config_persist::load_or_default();
+        let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let start_source = match saved.last_source.as_str() {
+            "device" => DataSource::Device,
+            "playback" => DataSource::Playback,
+            _ => DataSource::Demo,
+        };
+
+        let mut app = Self {
             sidebar_tab: SidebarTab::Acquire,
             mode: AcqMode::Demo,
-            data_source: DataSource::Demo,
+            data_source: start_source,
             show_help: false,
             toasts: Toasts::default(),
             welcomed: false,
@@ -275,7 +290,46 @@ impl KvApp {
             record_channels: None,
             channel_select: ChannelSelectState::default(),
             config_persist: ConfigPersistState::default(),
+            ui_scale,
+            window_restored: false,
+        };
+
+        // Apply the persisted display/filter/recording settings to live state.
+        saved.apply_to(
+            &mut app.display,
+            &mut app.filters,
+            &mut app.recording.output_dir,
+            &mut app.recording.file_prefix,
+            &mut app.remote_api_state.port,
+        );
+        app.filter_settings_snapshot = app.filters;
+        app.filters_last_frame = app.filters;
+        app.config_persist.loaded = true;
+
+        app
+    }
+
+    /// Snapshot the current settings (including UI scale, window size and the
+    /// active source) into a [`PersistentConfig`] for saving (#15/#17).
+    fn capture_persistent(&self, ctx: &egui::Context) -> PersistentConfig {
+        let mut cfg = PersistentConfig::capture_from(
+            &self.display,
+            &self.filters,
+            &self.recording.output_dir,
+            &self.recording.file_prefix,
+            self.remote_api_state.port,
+        );
+        cfg.ui_scale = self.ui_scale;
+        let size = ctx.screen_rect().size();
+        cfg.window_width = size.x;
+        cfg.window_height = size.y;
+        cfg.last_source = match self.data_source {
+            DataSource::Demo => "demo",
+            DataSource::Device => "device",
+            DataSource::Playback => "playback",
         }
+        .to_string();
+        cfg
     }
 
     /// Switch to Demo mode and start generating.
@@ -1424,6 +1478,27 @@ impl eframe::App for KvApp {
             self.theme_applied = true;
         }
 
+        // Apply the persisted UI scale every frame so slider changes take
+        // effect live (#17).
+        ctx.set_pixels_per_point(self.ui_scale);
+
+        // Restore the saved window size on the first frame (#15).  Done here
+        // rather than in NativeOptions so it stays in sync with the same
+        // config the rest of the settings come from.
+        if !self.window_restored {
+            self.window_restored = true;
+            let saved = config_persist::load_or_default();
+            let w = saved.window_width.clamp(640.0, 7680.0);
+            let h = saved.window_height.clamp(480.0, 4320.0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        }
+
+        // Auto-save the full config when the window is closing (#15).
+        if ctx.input(|i| i.viewport().close_requested()) && self.config_persist.auto_save {
+            let cfg = self.capture_persistent(ctx);
+            let _ = config_persist::save_config(&self.config_persist.config_path, &cfg);
+        }
+
         // Auto-start demo on first frame
         if !self.demo_started
             && self.data_source == DataSource::Demo
@@ -2053,6 +2128,7 @@ impl eframe::App for KvApp {
                             config_persist::draw_config_section(
                                 ui,
                                 &mut self.config_persist,
+                                &mut self.ui_scale,
                                 &mut save_clicked,
                                 &mut load_clicked,
                             );
@@ -2113,13 +2189,7 @@ impl eframe::App for KvApp {
                 }
 
                 if save_clicked {
-                    let cfg = PersistentConfig::capture_from(
-                        &self.display,
-                        &self.filters,
-                        &self.recording.output_dir,
-                        &self.recording.file_prefix,
-                        self.remote_api_state.port,
-                    );
+                    let cfg = self.capture_persistent(ctx);
                     match config_persist::save_config(&self.config_persist.config_path, &cfg) {
                         Ok(()) => {
                             self.config_persist.status_message = Some("Saved".to_string());
@@ -2141,6 +2211,7 @@ impl eframe::App for KvApp {
                                 &mut self.recording.file_prefix,
                                 &mut self.remote_api_state.port,
                             );
+                            self.ui_scale = cfg.ui_scale.clamp(0.8, 1.6);
                             self.config_persist.status_message = Some("Loaded".to_string());
                             self.config_persist.loaded = true;
                             self.toasts.success("Configuration loaded");
@@ -2175,9 +2246,9 @@ impl eframe::App for KvApp {
                 // user loads a file (no Start button), so "Press Start" would be
                 // misleading.
                 let empty_hint: &str = match self.data_source {
-                    DataSource::Playback => {
-                        "Click Open\u{2026} in the toolbar to load a .kvraw recording"
-                    }
+                    // Playback shows an actionable Open button below (#18), so
+                    // the subtitle just sets context rather than pointing away.
+                    DataSource::Playback => "No recording loaded yet",
                     _ => "Press Start to begin acquisition",
                 };
 
@@ -2218,6 +2289,32 @@ impl eframe::App for KvApp {
 
                 self.tile_tree = Some(tree);
             });
+
+        // ── Actionable empty-state for Playback (#18) ───────────
+        // When no recording is loaded yet, drop an Open button (with an icon)
+        // right on the canvas so the user doesn't have to hunt the toolbar.
+        if self.data_source == DataSource::Playback && !self.playback_mgr.is_loaded() {
+            let mut open_clicked = false;
+            egui::Area::new(egui::Id::new("kv_playback_empty_cta"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 44.0))
+                .interactable(true)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{1F4C1}")
+                                .size(34.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        if theme::primary_button(ui, "Open .kvraw\u{2026}", true) {
+                            open_clicked = true;
+                        }
+                    });
+                });
+            if open_clicked {
+                self.open_playback_file_dialog();
+            }
+        }
 
         // ── Shortcut help overlay (B4) ──────────────────────────
         self.draw_help_overlay(ctx);

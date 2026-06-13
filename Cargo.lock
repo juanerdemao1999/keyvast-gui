@@ -1550,6 +1550,7 @@ dependencies = [
  "kv-types",
  "log",
  "rfd",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

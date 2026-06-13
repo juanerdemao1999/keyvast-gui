@@ -212,6 +212,10 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.active.bg_fill = ACCENT_BLUE;
     v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
     v.widgets.active.corner_radius = egui::CornerRadius::same(3);
+    // egui uses the `active` visuals for the keyboard-focused widget, so a
+    // bright, slightly expanded border doubles as a visible focus ring (#16).
+    v.widgets.active.bg_stroke = egui::Stroke::new(2.0, ACCENT_CYAN);
+    v.widgets.active.expansion = 1.0;
 
     v.selection.bg_fill = egui::Color32::from_rgba_premultiplied(70, 140, 255, 60);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT_BLUE);

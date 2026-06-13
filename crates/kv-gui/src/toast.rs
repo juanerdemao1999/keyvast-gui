@@ -129,9 +129,9 @@ impl Toasts {
             return;
         }
 
-        // Keep animating so timed toasts disappear even if nothing else
-        // requests a repaint.
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // Keep animating smoothly so timed toasts disappear and the slide-in
+        // plays even if nothing else requests a repaint.
+        ctx.request_repaint_after(Duration::from_millis(33));
 
         let mut dismissed: Option<usize> = None;
 
@@ -142,16 +142,25 @@ impl Toasts {
                 ui.set_max_width(300.0);
                 for (idx, toast) in self.items.iter().enumerate() {
                     let accent = toast.level.accent();
-                    egui::Frame::new()
+
+                    // Slide-in + fade from the right edge over ~160 ms (#14).
+                    let age = now.duration_since(toast.created).as_secs_f32();
+                    let t = (age / 0.16).clamp(0.0, 1.0);
+                    let eased = 1.0 - (1.0 - t) * (1.0 - t); // ease-out quad
+                    let off = ((1.0 - eased) * 40.0).round() as i8;
+
+                    let frame_resp = egui::Frame::new()
                         .fill(theme::BG_PANEL)
                         .stroke(egui::Stroke::new(1.0, accent))
                         .corner_radius(egui::CornerRadius::same(5))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .outer_margin(egui::Margin {
                             bottom: 6,
+                            right: -off, // negative pushes the card off the right edge, then settles
                             ..egui::Margin::ZERO
                         })
                         .show(ui, |ui| {
+                            ui.set_opacity(eased.max(0.05));
                             ui.horizontal(|ui| {
                                 ui.label(
                                     egui::RichText::new(toast.level.icon())
@@ -184,6 +193,15 @@ impl Toasts {
                                 );
                             });
                         });
+
+                    // Click anywhere on the card (not just the ✕) to dismiss.
+                    let click = frame_resp
+                        .response
+                        .interact(egui::Sense::click())
+                        .on_hover_text("Click to dismiss");
+                    if click.clicked() {
+                        dismissed = Some(idx);
+                    }
                 }
             });
 

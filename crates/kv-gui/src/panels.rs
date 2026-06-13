@@ -348,6 +348,7 @@ pub fn draw_acquire_core(
         buffer_occupancy,
         recording_error,
         dismiss_error,
+        block,
     );
 }
 
@@ -780,6 +781,7 @@ fn draw_recording_section(
     buffer_occupancy: f64,
     recording_error: Option<&str>,
     dismiss_error: &mut bool,
+    block: Option<&SampleBlock>,
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("RECORDING")
@@ -867,6 +869,67 @@ fn draw_recording_section(
                 }
             }
         });
+
+        // ── Disk headroom + estimated record time (#13) ──────────
+        // While recording we use the measured byte rate; otherwise we estimate
+        // from the live block geometry (kvraw is raw i16 interleaved → 2 B/sample).
+        let est_rate_bps: Option<f64> = if recording.state == RecordingState::Recording
+            && let Some(secs) = rec_elapsed_secs
+            && secs > 0.5
+            && recording.recorded_bytes > 0
+        {
+            Some(recording.recorded_bytes as f64 / secs)
+        } else {
+            block
+                .filter(|b| b.channel_count > 0 && b.sample_rate > 0.0)
+                .map(|b| b.channel_count as f64 * b.sample_rate * 2.0)
+        };
+
+        if let Some(free) = crate::diskspace::free_bytes(&recording.output_dir) {
+            ui.add_space(2.0);
+            let free_gb = free as f64 / 1_000_000_000.0;
+            let disk_color = if free_gb < 2.0 {
+                theme::ACCENT_RED
+            } else if free_gb < 10.0 {
+                theme::ACCENT_YELLOW
+            } else {
+                theme::ACCENT_GREEN
+            };
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("Disk")
+                        .size(10.0)
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{free_gb:.1} GB free"))
+                        .size(10.0)
+                        .monospace()
+                        .color(disk_color),
+                );
+            });
+            if let Some(rate) = est_rate_bps
+                && rate > 0.0
+            {
+                let secs_left = free as f64 / rate;
+                let prefix = if recording.state == RecordingState::Recording {
+                    ""
+                } else {
+                    "~"
+                };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{prefix}{} left @ {}/s",
+                        theme::format_clock(secs_left),
+                        format_bytes(rate as u64)
+                    ))
+                    .size(9.0)
+                    .color(theme::TEXT_DIM),
+                )
+                .on_hover_text("Estimated recording time remaining on this volume");
+            }
+        }
 
         if recording.state == RecordingState::Recording {
             theme::kv_label(ui, "Blocks", &recording.recorded_blocks.to_string());
@@ -1057,29 +1120,39 @@ pub fn draw_status_bar(
             );
             ui.separator();
 
-            // Buffer health — dropped blocks are emphasized (warning glyph +
-            // bold) the moment any are detected (A5).
+            // Buffer health — three-tier green→amber→red on the drop count (#12).
+            // Green = none lost; amber = a small fraction (transient hiccup);
+            // red = a sustained loss rate that warrants attention.
             let dropped = s.dropped_blocks;
-            let healthy = dropped == 0;
-            let health_color = if healthy {
-                theme::ACCENT_GREEN
+            let ratio = if s.total_blocks > 0 {
+                dropped as f64 / s.total_blocks as f64
             } else {
-                theme::ACCENT_RED
+                0.0
             };
-            let drop_text = if healthy {
-                egui::RichText::new("Drop: 0")
-                    .size(theme::FONT_BODY)
-                    .monospace()
-                    .color(health_color)
+            let (health_color, warn) = if dropped == 0 {
+                (theme::ACCENT_GREEN, false)
+            } else if ratio < 0.01 {
+                (theme::ACCENT_YELLOW, true)
             } else {
+                (theme::ACCENT_RED, true)
+            };
+            let drop_text = if warn {
                 egui::RichText::new(format!("\u{26A0} Drop: {dropped}"))
                     .size(theme::FONT_BODY)
                     .monospace()
                     .strong()
                     .color(health_color)
+            } else {
+                egui::RichText::new("Drop: 0")
+                    .size(theme::FONT_BODY)
+                    .monospace()
+                    .color(health_color)
             };
-            ui.label(drop_text)
-                .on_hover_text("Blocks lost to packet-ID gaps (disk or CPU can't keep up)");
+            ui.label(drop_text).on_hover_text(format!(
+                "Blocks lost to packet-ID gaps (disk or CPU can't keep up)\n{dropped} of {} blocks ({:.3}%)",
+                s.total_blocks,
+                ratio * 100.0
+            ));
         }
 
         // Right-aligned: total blocks and samples

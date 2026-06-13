@@ -12,6 +12,7 @@ mod channel_select;
 mod config_persist;
 mod demo;
 mod disp_ring;
+mod diskspace;
 mod dsp;
 mod fft_panel;
 mod impedance_panel;

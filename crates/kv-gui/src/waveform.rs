@@ -303,19 +303,53 @@ pub fn draw_waveform_area(
             }
         }
 
+        // Emphasize whole-second gridlines so the time axis has a clear sense
+        // of scale.  Only when the window is wide enough (>= 2 s) that integer
+        // seconds aren't packed together; brighter than the default grid.
+        if settings.show_grid && (x_right - x_left) >= 2000.0 {
+            let first_sec = (x_left / 1000.0).ceil() as i64;
+            let last_sec = (x_right / 1000.0).floor() as i64;
+            for sec in first_sec..=last_sec {
+                let x = sec as f64 * 1000.0;
+                plot_ui.line(
+                    Line::new(PlotPoints::from(vec![[x, y_min], [x, y_max]]))
+                        .color(egui::Color32::from_rgb(70, 70, 86))
+                        .width(1.0)
+                        .name(""),
+                );
+            }
+        }
+
         // Sweep cursor — vertical line at the latest data position.
         // Only drawn in Sweep mode (SpikeGLX-style "write cursor").
         // In Roll mode the right edge IS the latest data, no cursor needed.
+        //
+        // A short translucent "trail" behind the cursor (the just-written
+        // region) plus a brighter cursor line make the wrap read as a moving
+        // write-head instead of a momentary blank.
         if matches!(settings.display_mode, crate::panels::DisplayMode::Sweep)
             && cursor_ms > x_left && cursor_ms < x_right
         {
+            let trail = (x_right - x_left) * 0.04;
+            let trail_left = (cursor_ms - trail).max(x_left);
+            plot_ui.polygon(
+                egui_plot::Polygon::new(PlotPoints::from(vec![
+                    [trail_left, y_min],
+                    [cursor_ms, y_min],
+                    [cursor_ms, y_max],
+                    [trail_left, y_max],
+                ]))
+                .fill_color(egui::Color32::from_rgba_unmultiplied(200, 210, 230, 22))
+                .stroke(egui::Stroke::NONE)
+                .name(""),
+            );
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![
                     [cursor_ms, y_min],
                     [cursor_ms, y_max],
                 ]))
-                .color(egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80))
-                .width(1.0)
+                .color(egui::Color32::from_rgba_unmultiplied(220, 225, 235, 200))
+                .width(1.5)
                 .name(""),
             );
         }
@@ -373,6 +407,38 @@ pub fn draw_waveform_area(
         }
     }
 
+    // Colored lane tabs (#4): a small chip in each channel's trace color at
+    // the left edge of its lane, tying the grey "CHn" axis label to its
+    // colored waveform.  Only on labeled lanes so it tracks the visible ticks.
+    {
+        let painter = ui.painter();
+        let frame = *response.transform.frame();
+        for disp_pos in (0..visible).step_by(label_stride) {
+            let phys_ch = start_ch + disp_pos;
+            if !settings.is_channel_enabled(phys_ch) {
+                continue;
+            }
+            let base = if settings.color_by_group {
+                settings.channel_color(phys_ch)
+            } else {
+                theme::channel_color(phys_ch)
+            };
+            let y_lane = -(disp_pos as f64) * ch_spacing;
+            let screen = response
+                .transform
+                .position_from_point(&egui_plot::PlotPoint::new(x_left, y_lane));
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(frame.left() + 2.0, screen.y - 3.0),
+                egui::vec2(5.0, 6.0),
+            );
+            painter.rect_filled(
+                chip,
+                egui::CornerRadius::same(1),
+                brighten_color(base, 1.3),
+            );
+        }
+    }
+
     // Hover info overlay — drawn in the top-left corner of the plot so it
     // never covers the waveform under the cursor.
     if response.response.hovered()
@@ -403,6 +469,28 @@ pub fn draw_waveform_area(
             amp_str);
         let plot_rect = response.response.rect;
         let painter = ui.painter();
+
+        // Thin crosshair at the cursor (#8) — pairs with the readout pill so
+        // the exact sample being inspected is unambiguous.
+        let cross = egui::Stroke::new(
+            0.75,
+            egui::Color32::from_rgba_unmultiplied(200, 200, 215, 90),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(ptr_pos.x, plot_rect.top()),
+                egui::pos2(ptr_pos.x, plot_rect.bottom()),
+            ],
+            cross,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), ptr_pos.y),
+                egui::pos2(plot_rect.right(), ptr_pos.y),
+            ],
+            cross,
+        );
+
         let text_pos = plot_rect.left_top() + egui::vec2(10.0, 8.0);
         // Background pill
         let font = egui::FontId::monospace(11.0);
@@ -465,9 +553,20 @@ fn draw_scale_bar(
     let bar_top = bar_bottom - bar_height_px;
 
     // Draw the vertical bar with small horizontal ticks at top and bottom
-    let bar_color = theme::TEXT_SECONDARY;
+    let bar_color = theme::TEXT_PRIMARY;
     let stroke = egui::Stroke::new(1.5, bar_color);
     let tick_w = 4.0;
+
+    // Dark backing panel so the bar + label stay readable over busy waveforms.
+    let backing = egui::Rect::from_min_max(
+        egui::pos2(bar_x - 58.0, bar_top - 4.0),
+        egui::pos2(plot_rect.right() - 4.0, bar_bottom + 18.0),
+    );
+    painter.rect_filled(
+        backing,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgba_premultiplied(18, 18, 24, 190),
+    );
 
     // Vertical line
     painter.line_segment(
@@ -491,9 +590,12 @@ fn draw_scale_bar(
     } else {
         format!("{:.0} µV", bar_voltage_uv)
     };
+    // Right-align the label to the bar's right tick so it grows leftward and
+    // never clips against the plot's right edge (previously centered on bar_x,
+    // which cut off the "µV"/"mV" suffix).
     painter.text(
-        egui::pos2(bar_x, bar_bottom + 4.0),
-        egui::Align2::CENTER_TOP,
+        egui::pos2(bar_x + tick_w, bar_bottom + 4.0),
+        egui::Align2::RIGHT_TOP,
         label,
         egui::FontId::monospace(10.0),
         bar_color,

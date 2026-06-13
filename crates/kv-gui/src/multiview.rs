@@ -149,6 +149,9 @@ pub struct KvTileBehavior<'a> {
     pub fft: &'a crate::fft_panel::FftState,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
+    // Source-aware subtitle for the "No Data" placeholder (e.g. "Press Start…"
+    // vs. "Open a .kvraw recording…") so the empty view matches the active source.
+    pub empty_hint: &'a str,
 }
 
 impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
@@ -465,6 +468,7 @@ impl<'a> KvTileBehavior<'a> {
             self.display,
             self.filters,
             sweep_left_ms,
+            self.empty_hint,
         );
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         *self.render_ms_ema = *self.render_ms_ema * 0.9 + render_ms * 0.1;
@@ -540,6 +544,7 @@ impl<'a> KvTileBehavior<'a> {
             &tile_display,
             self.filters,
             sweep_left_ms,
+            self.empty_hint,
         );
 
         // Tile type badge (top-left corner)

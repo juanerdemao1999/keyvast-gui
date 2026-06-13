@@ -1340,58 +1340,71 @@ impl KvApp {
     }
 
     /// Draw the keyboard-shortcut cheat-sheet overlay (B4).  Shown on demand
-    /// via the toolbar `?` button or the `?` / F1 key; dismissed with Esc or
-    /// the window close button.
+    /// via the toolbar `?` button or the `?` / F1 key; dismissed with Esc, a
+    /// click outside, or the close button.
+    ///
+    /// Rendered as an [`egui::Modal`] so it sits on a dimmed backdrop — the busy
+    /// running waveform behind it is darkened, keeping the shortcut list legible
+    /// instead of competing with the moving traces.
     fn draw_help_overlay(&mut self, ctx: &egui::Context) {
         if !self.show_help {
             return;
         }
-        let mut open = true;
-        egui::Window::new(
-            egui::RichText::new("Keyboard shortcuts")
-                .size(theme::FONT_HEADING)
-                .strong(),
-        )
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .open(&mut open)
-        .show(ctx, |ui| {
-            let rows = [
-                (
-                    "Space",
-                    "Start / stop acquisition (play / pause in Playback)",
-                ),
-                ("R", "Arm \u{2192} record \u{2192} stop recording"),
-                ("P", "Pause / resume the display (acquisition continues)"),
-                ("G", "Toggle the waveform grid"),
-                ("F", "Toggle the performance overlay"),
-                ("[  ]", "Decrease / increase the time window"),
-                (
-                    "1 \u{2013} 9",
-                    "Quick-set visible channel count (\u{00D7}4)",
-                ),
-                ("+  \u{2212}", "Increase / decrease channel spacing"),
-                ("?  /  F1", "Toggle this help (Esc to close)"),
-            ];
-            egui::Grid::new("kv_help_grid")
-                .num_columns(2)
-                .spacing([16.0, 6.0])
-                .show(ui, |ui| {
-                    for (key, desc) in rows {
-                        ui.label(
-                            egui::RichText::new(key)
-                                .size(theme::FONT_BODY)
-                                .strong()
-                                .monospace()
-                                .color(theme::ACCENT_BLUE),
-                        );
-                        ui.label(theme::body(desc));
-                        ui.end_row();
-                    }
+        let modal = egui::Modal::new(egui::Id::new("kv_help_modal"))
+            // Darken the running waveform clearly so the dialog reads as modal.
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Keyboard shortcuts")
+                            .size(theme::FONT_HEADING)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(egui::RichText::new("\u{2715}").size(theme::FONT_BODY))
+                            .on_hover_text("Close (Esc)")
+                            .clicked()
+                        {
+                            self.show_help = false;
+                        }
+                    });
                 });
-        });
-        if !open {
+                ui.separator();
+                ui.add_space(2.0);
+                let rows = [
+                    (
+                        "Space",
+                        "Start / stop acquisition (play / pause in Playback)",
+                    ),
+                    ("R", "Arm \u{2192} record \u{2192} stop recording"),
+                    ("P", "Pause / resume the display (acquisition continues)"),
+                    ("G", "Toggle the waveform grid"),
+                    ("F", "Toggle the performance overlay"),
+                    ("[  ]", "Decrease / increase the time window"),
+                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    ("+  \u{2212}", "Increase / decrease channel spacing"),
+                    ("?  /  F1", "Toggle this help (Esc to close)"),
+                ];
+                egui::Grid::new("kv_help_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        for (key, desc) in rows {
+                            ui.label(
+                                egui::RichText::new(key)
+                                    .size(theme::FONT_BODY)
+                                    .strong()
+                                    .monospace()
+                                    .color(theme::ACCENT_BLUE),
+                            );
+                            ui.label(theme::body(desc));
+                            ui.end_row();
+                        }
+                    });
+            });
+        if modal.should_close() {
             self.show_help = false;
         }
     }
@@ -1608,7 +1621,7 @@ impl eframe::App for KvApp {
                         // Record button — always clickable when running.
                         let rec_label = match self.recording.state {
                             RecordingState::Idle => " Record ",
-                            RecordingState::Armed => "  ARM  ",
+                            RecordingState::Armed => " ARMED ",
                             RecordingState::Recording => " STOP REC ",
                         };
                         let rec_color = match self.recording.state {
@@ -2128,6 +2141,16 @@ impl eframe::App for KvApp {
                 let elapsed_secs = self.elapsed_seconds();
                 let mut pending_add: Option<AddViewRequest> = None;
 
+                // Placeholder copy that matches the active source: in Playback the
+                // user loads a file (no Start button), so "Press Start" would be
+                // misleading.
+                let empty_hint: &str = match self.data_source {
+                    DataSource::Playback => {
+                        "Click Open\u{2026} in the toolbar to load a .kvraw recording"
+                    }
+                    _ => "Press Start to begin acquisition",
+                };
+
                 {
                     let mut behavior = KvTileBehavior {
                         disp_ring: &self.disp_ring,
@@ -2146,6 +2169,7 @@ impl eframe::App for KvApp {
                         snippet_store: &mut self.snippet_store,
                         fft: &self.fft,
                         pending_add: &mut pending_add,
+                        empty_hint,
                     };
                     tree.ui(&mut behavior, ui);
                 }

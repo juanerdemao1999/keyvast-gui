@@ -140,9 +140,49 @@ pub fn channel_color(channel: usize) -> egui::Color32 {
     CHANNEL_PALETTE[channel % CHANNEL_PALETTE.len()]
 }
 
+// ── Fonts ───────────────────────────────────────────────────────────
+
+/// Append a Windows symbol font as a glyph *fallback* so the geometric shapes,
+/// arrows, and dingbats used across the UI (disclosure carets `\u{25B8}` /
+/// `\u{25BE}`, `\u{25CF} REC`, `\u{2192}`, `\u{26A0}`, toast icons, …) render
+/// instead of showing as missing-glyph boxes.  egui's bundled fonts cover the
+/// Latin text but not these symbols.
+///
+/// The font is added at the *end* of each family so normal text keeps using the
+/// bundled Ubuntu/Hack faces and only otherwise-missing glyphs fall through to
+/// it.  Best-effort: if no symbol font is present the UI still works, just with
+/// a few boxes, so a missing file is silently ignored.
+fn install_symbol_font(ctx: &egui::Context) {
+    // Segoe UI Symbol ships with every supported Windows release and covers the
+    // arrows / geometric-shape / dingbat blocks we use.
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\seguisym.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "kv_symbols".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("kv_symbols".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 // ── Apply theme to egui context ─────────────────────────────────────
 
 pub fn apply(ctx: &egui::Context) {
+    install_symbol_font(ctx);
+
     let mut style = (*ctx.style()).clone();
 
     // Visuals

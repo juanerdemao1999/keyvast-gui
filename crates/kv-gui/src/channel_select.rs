@@ -221,8 +221,10 @@ pub fn draw_unified_channels(
         });
 
         // Bulk actions — Record row (only when selecting a subset, unlocked).
+        // Wrapped so the full set (All/None/Invert/Even/Odd) flows onto a second
+        // line in the narrow side panel instead of clipping the last button.
         ui.add_enabled_ui(select.enabled && !rec_locked, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(
                     egui::RichText::new("Rec ")
                         .size(theme::FONT_CAPTION)

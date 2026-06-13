@@ -78,6 +78,7 @@ struct SpikeMeta {
 ///
 /// Data is read from `ring` (pre-computed at ingestion time) — no per-frame
 /// block history iteration.
+#[allow(clippy::too_many_arguments)] // cohesive per-frame render inputs; a struct would not aid clarity
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     ring: &DisplayRing,
@@ -86,17 +87,18 @@ pub fn draw_waveform_area(
     settings: &DisplaySettings,
     filters: &FilterSettings,
     sweep_left_ms: f64,
+    empty_hint: &str, // source-aware subtitle shown when there is nothing to draw
 ) {
     let block = match latest {
         Some(b) => b,
         None => {
-            draw_empty_state(ui);
+            draw_empty_state(ui, empty_hint);
             return;
         }
     };
 
     if !ring.ready {
-        draw_empty_state(ui);
+        draw_empty_state(ui, empty_hint);
         return;
     }
 
@@ -105,7 +107,7 @@ pub fn draw_waveform_area(
     let start_ch = start_ch.min(total_channels.saturating_sub(1));
     let visible = settings.visible_channels.min(total_channels.saturating_sub(start_ch));
     if visible == 0 {
-        draw_empty_state(ui);
+        draw_empty_state(ui, empty_hint);
         return;
     }
 
@@ -149,6 +151,27 @@ pub fn draw_waveform_area(
     let ch_count_for_fmt = visible;
     let spacing_for_fmt = ch_spacing;
     let start_ch_for_fmt = start_ch;
+
+    // Label stride: one tick per channel when the stack is short, thinning out
+    // as more channels are shown so the axis never turns into a solid column of
+    // text.  egui_plot's default spacer only lands on "nice" Y values and so
+    // labels just CH0 / CH9 — this places a tick on every Nth lane center
+    // instead, which both labels and draws a baseline grid line there.
+    let label_stride: usize = match visible {
+        0..=16 => 1,
+        17..=32 => 2,
+        _ => 4,
+    };
+    let y_grid_spacer = move |_input: egui_plot::GridInput| -> Vec<egui_plot::GridMark> {
+        (0..ch_count_for_fmt)
+            .step_by(label_stride)
+            .map(|i| egui_plot::GridMark {
+                value: -(i as f64) * spacing_for_fmt,
+                step_size: spacing_for_fmt * label_stride as f64,
+            })
+            .collect()
+    };
+
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
         let pos = -mark.value / spacing_for_fmt;
         let disp_pos = pos.round();
@@ -198,6 +221,7 @@ pub fn draw_waveform_area(
         .show_y(false)
         .x_axis_formatter(x_formatter)
         .y_axis_formatter(y_formatter)
+        .y_grid_spacer(y_grid_spacer)
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
     // Extract spike metadata BEFORE consuming traces (points will be moved into Lines).
@@ -603,7 +627,7 @@ fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64)
 
 // ── Empty state ─────────────────────────────────────────────────────
 
-fn draw_empty_state(ui: &mut egui::Ui) {
+fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
     let available = ui.available_size();
     let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
 
@@ -619,7 +643,7 @@ fn draw_empty_state(ui: &mut egui::Ui) {
     ui.painter().text(
         rect.center() + egui::vec2(0.0, 12.0),
         egui::Align2::CENTER_CENTER,
-        "Press Start or switch to Demo mode",
+        hint,
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );

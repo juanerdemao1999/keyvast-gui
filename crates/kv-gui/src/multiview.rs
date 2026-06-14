@@ -730,10 +730,10 @@ impl<'a> KvTileBehavior<'a> {
         ui.separator();
 
         // ── Snippet plot ─────────────────────────────────────────────
-        // Reborrow &mut as & for the read-only renderer.
+        // Renderer needs &mut to refresh each snippet's cached geometry.
         spike_overlay::draw_spike_overlay(
             ui,
-            &*self.snippet_store,
+            self.snippet_store,
             channels,
             *show_grid,
             tile_salt,

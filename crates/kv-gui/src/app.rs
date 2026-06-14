@@ -222,7 +222,9 @@ impl KvApp {
         // Restore persisted settings at startup (#15/#17).  Missing or invalid
         // files fall back to defaults, so this never blocks launch.
         let saved = config_persist::load_or_default();
-        let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let ui_scale = saved
+            .ui_scale
+            .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
         let start_source = match saved.last_source.as_str() {
             "device" => DataSource::Device,
             "playback" => DataSource::Playback,
@@ -284,7 +286,7 @@ impl KvApp {
             trigger: TriggerConfig::default(),
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
-            export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            export_format: kv_recorder::export_formats::ExportFormat::KeyvastNative,
             export_rx: None,
             export_status: None,
             record_channels: None,
@@ -2002,7 +2004,7 @@ impl eframe::App for KvApp {
 
                             ui.add_space(4.0);
                             egui::CollapsingHeader::new(
-                                egui::RichText::new("EXPORT FORMAT")
+                                egui::RichText::new("DATA FORMAT")
                                     .size(11.0)
                                     .strong()
                                     .color(theme::TEXT_SECONDARY),
@@ -2010,7 +2012,21 @@ impl eframe::App for KvApp {
                             .default_open(false)
                             .show(ui, |ui| {
                                 use kv_recorder::export_formats::ExportFormat;
-                                ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Recordings are saved in the native Keyvast .kvraw format. \
+                                         Optionally convert a recording to another format below.",
+                                    )
+                                    .size(9.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::KeyvastNative,
+                                        egui::RichText::new("Keyvast .kvraw").size(10.0),
+                                    );
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::IntanRhd,
@@ -2030,30 +2046,43 @@ impl eframe::App for KvApp {
                                 );
                                 ui.add_space(2.0);
                                 let exporting = self.export_rx.is_some();
-                                if ui
-                                    .add_enabled(
-                                        !exporting,
-                                        egui::Button::new(
-                                            egui::RichText::new("Export .kvraw…").size(10.0),
-                                        ),
-                                    )
-                                    .on_hover_text("Convert a .kvraw recording to the selected format")
-                                    .clicked()
-                                    && let Some(path) = playback::pick_kvraw_file() {
-                                        self.start_export(path);
+                                if self.export_format.is_native() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Native format — recordings are already saved as .kvraw. \
+                                             Pick a third-party format above to convert.",
+                                        )
+                                        .size(9.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                } else {
+                                    if ui
+                                        .add_enabled(
+                                            !exporting,
+                                            egui::Button::new(
+                                                egui::RichText::new("Convert .kvraw…").size(10.0),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "Convert a .kvraw recording to the selected format",
+                                        )
+                                        .clicked()
+                                        && let Some(path) = playback::pick_kvraw_file() {
+                                            self.start_export(path);
+                                        }
+                                    if exporting {
+                                        ui.label(
+                                            egui::RichText::new("Converting…")
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                    } else if let Some(ref status) = self.export_status {
+                                        ui.label(
+                                            egui::RichText::new(status)
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
                                     }
-                                if exporting {
-                                    ui.label(
-                                        egui::RichText::new("Exporting…")
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
-                                } else if let Some(ref status) = self.export_status {
-                                    ui.label(
-                                        egui::RichText::new(status)
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
                                 }
                             });
 
@@ -2211,7 +2240,9 @@ impl eframe::App for KvApp {
                                 &mut self.recording.file_prefix,
                                 &mut self.remote_api_state.port,
                             );
-                            self.ui_scale = cfg.ui_scale.clamp(0.8, 1.6);
+                            self.ui_scale = cfg
+                                .ui_scale
+                                .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
                             self.config_persist.status_message = Some("Loaded".to_string());
                             self.config_persist.loaded = true;
                             self.toasts.success("Configuration loaded");
@@ -2344,6 +2375,13 @@ fn export_kvraw(
     use kv_recorder::KvrawReader;
     use kv_recorder::export_formats::{self, ExportFormat};
 
+    // Native format needs no conversion — just copy the .kvraw alongside.
+    if format.is_native() {
+        let output = source.with_extension("copy.kvraw");
+        std::fs::copy(source, &output).map_err(|e| e.to_string())?;
+        return Ok(output);
+    }
+
     let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
     let meta = reader.metadata().clone();
     if meta.channel_count == 0 {
@@ -2387,6 +2425,8 @@ fn export_kvraw(
 
     let notes = format!("exported from {}", source.display());
     match format {
+        // Native is short-circuited above before any frames are read.
+        ExportFormat::KeyvastNative => unreachable!("native format handled before frame read"),
         ExportFormat::IntanRhd => {
             let output = source.with_extension(format.extension());
             export_formats::export_intan_rhd(&output, &blocks, &notes)

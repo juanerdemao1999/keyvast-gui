@@ -1,0 +1,12 @@
+[package]
+name = "kv-rhd"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+kv-types = { path = "../kv-types" }
+log = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8.9"
+

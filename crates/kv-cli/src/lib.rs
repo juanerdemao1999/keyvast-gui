@@ -1,6 +1,7 @@
 //! Developer command helpers for exercising the Keyvast acquisition stack.
 
 use std::{
+    fs,
     fmt,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -15,7 +16,11 @@ use kv_core::{AcquisitionRunError, AcquisitionRunSummary, run_fixed_blocks};
 use kv_integrity::IntegrityReport;
 use kv_recorder::{
     BenchmarkSummary, RecorderError, RecordingSummary, write_benchmark_summary, write_events_csv,
-    write_integrity_summary, write_log_file, write_recording,
+    write_integrity_summary, write_log_file, write_recording, write_recording_with_backend,
+};
+use kv_rhd::{
+    DEFAULT_RHD_SAMPLE_RATE, RhdHardwareBackend, RhdHardwareOptions, RhdReadError,
+    RhythmDataConfig, SAMPLES_PER_USB_BLOCK, bytes_per_block, parse_rhythm_data_block,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError, SimulatorError};
 use kv_types::{
@@ -119,12 +124,32 @@ pub struct SimulatorStreamResult {
     pub max_write_latency_us: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RhdSmokeOptions {
+    pub output_dir: PathBuf,
+    pub blocks: usize,
+    pub enabled_streams: usize,
+    pub raw_input: Option<PathBuf>,
+    pub bitfile_path: PathBuf,
+    pub frontpanel_dll_path: Option<PathBuf>,
+    pub serial: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RhdSmokeResult {
+    pub acquisition: AcquisitionRunSummary,
+    pub recording: RecordingSummary,
+    pub integrity: IntegrityReport,
+    pub hardware: bool,
+}
+
 #[derive(Debug)]
 pub enum CommandResult {
     Record(SimulatorRecordingResult),
     Pipeline(SimulatorPipelineResult),
     Stream(SimulatorStreamResult),
     Benchmark(BenchmarkResult),
+    RhdSmoke(RhdSmokeResult),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +158,7 @@ pub enum CliCommand {
     SimulatorPipeline(SimulatorPipelineOptions),
     SimulatorStream(SimulatorPipelineOptions),
     Benchmark(BenchmarkOptions),
+    RhdSmoke(RhdSmokeOptions),
 }
 
 #[derive(Debug)]
@@ -148,9 +174,19 @@ pub enum CliError {
     UnknownPreset { name: String },
     SystemTimeBeforeUnixEpoch,
     SimulatorConfig(SimulatorConfigError),
+    Rhd(RhdReadError),
     Acquisition(Box<AcquisitionRunError>),
     Recording(RecorderError),
     Pipeline(PipelineError),
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    RawInputTooShort {
+        path: PathBuf,
+        expected_bytes: usize,
+        observed_bytes: usize,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -190,9 +226,22 @@ impl fmt::Display for CliError {
             Self::SimulatorConfig(error) => {
                 write!(formatter, "simulator config is invalid: {error}")
             }
+            Self::Rhd(error) => write!(formatter, "RHD hardware read failed: {error}"),
             Self::Acquisition(error) => write!(formatter, "{error}"),
             Self::Recording(error) => write!(formatter, "{error}"),
             Self::Pipeline(error) => write!(formatter, "pipeline failed: {error}"),
+            Self::Io { path, source } => {
+                write!(formatter, "I/O error at {}: {source}", path.display())
+            }
+            Self::RawInputTooShort {
+                path,
+                expected_bytes,
+                observed_bytes,
+            } => write!(
+                formatter,
+                "raw RHD input {} is too short: expected at least {expected_bytes} bytes, observed {observed_bytes}",
+                path.display()
+            ),
         }
     }
 }
@@ -201,9 +250,11 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::SimulatorConfig(error) => Some(error),
+            Self::Rhd(error) => Some(error),
             Self::Acquisition(error) => Some(error.as_ref()),
             Self::Recording(error) => Some(error),
             Self::Pipeline(error) => Some(error),
+            Self::Io { source, .. } => Some(source),
             Self::MissingCommand
             | Self::UnknownCommand { .. }
             | Self::MissingArgumentValue { .. }
@@ -213,7 +264,8 @@ impl std::error::Error for CliError {
             | Self::InvalidNumber { .. }
             | Self::InvalidDuration { .. }
             | Self::UnknownPreset { .. }
-            | Self::SystemTimeBeforeUnixEpoch => None,
+            | Self::SystemTimeBeforeUnixEpoch
+            | Self::RawInputTooShort { .. } => None,
         }
     }
 }
@@ -242,6 +294,12 @@ impl From<PipelineError> for CliError {
     }
 }
 
+impl From<RhdReadError> for CliError {
+    fn from(error: RhdReadError) -> Self {
+        Self::Rhd(error)
+    }
+}
+
 pub fn run_command(command: CliCommand) -> Result<CommandResult, CliError> {
     match command {
         CliCommand::SimulatorRecord(options) => {
@@ -254,6 +312,7 @@ pub fn run_command(command: CliCommand) -> Result<CommandResult, CliError> {
             run_simulator_stream(options).map(CommandResult::Stream)
         }
         CliCommand::Benchmark(options) => run_benchmark(options).map(CommandResult::Benchmark),
+        CliCommand::RhdSmoke(options) => run_rhd_smoke(options).map(CommandResult::RhdSmoke),
     }
 }
 
@@ -478,6 +537,89 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
     })
 }
 
+pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliError> {
+    if options.blocks == 0 {
+        return Err(CliError::InvalidBlockCount { blocks: 0 });
+    }
+
+    let data_config = RhythmDataConfig {
+        device_id: "rhd-xem7310".to_string(),
+        stream_id: 0,
+        enabled_streams: options.enabled_streams,
+        sample_rate: DEFAULT_RHD_SAMPLE_RATE,
+        samples_per_block: SAMPLES_PER_USB_BLOCK,
+    };
+    let device_config = data_config
+        .device_config()
+        .map_err(RhdReadError::InvalidConfig)?;
+
+    let acquisition = if let Some(raw_input) = &options.raw_input {
+        let raw = fs::read(raw_input).map_err(|source| CliError::Io {
+            path: raw_input.clone(),
+            source,
+        })?;
+        let block_bytes = bytes_per_block(data_config.enabled_streams, data_config.samples_per_block)
+            .map_err(RhdReadError::InvalidConfig)?;
+        let expected_bytes = block_bytes.saturating_mul(options.blocks);
+        if raw.len() < expected_bytes {
+            return Err(CliError::RawInputTooShort {
+                path: raw_input.clone(),
+                expected_bytes,
+                observed_bytes: raw.len(),
+            });
+        }
+
+        let mut next_packet_id = 0_u64;
+        run_fixed_blocks(&device_config, options.blocks, &mut || {
+            let start = next_packet_id as usize * block_bytes;
+            let end = start + block_bytes;
+            let block = parse_rhythm_data_block(
+                next_packet_id,
+                &raw[start..end],
+                &data_config,
+            )
+            .map_err(RhdReadError::Parse)?;
+            next_packet_id = next_packet_id.saturating_add(1);
+            Ok::<_, RhdReadError>(block)
+        })?
+    } else {
+        let mut backend = RhdHardwareBackend::open(RhdHardwareOptions {
+            bitfile_path: options.bitfile_path.clone(),
+            frontpanel_dll_path: options.frontpanel_dll_path.clone(),
+            serial: options.serial.clone(),
+            data: data_config.clone(),
+            cable_length_meters: 0.9144,
+        })?;
+
+        run_fixed_blocks(&device_config, options.blocks, &mut || backend.read_block())?
+    };
+
+    let recording =
+        write_recording_with_backend(&options.output_dir, &acquisition.blocks, "rhd-frontpanel")?;
+    write_integrity_summary(&options.output_dir, &acquisition.integrity.summary)?;
+    write_log_file(
+        &options.output_dir,
+        &rhd_smoke_log_lines(&acquisition.integrity, options.raw_input.is_none()),
+    )?;
+    write_events_csv(&options.output_dir, &rhd_smoke_events(&acquisition.integrity))?;
+    write_benchmark_summary(
+        &options.output_dir,
+        &rhd_smoke_benchmark_summary(
+            &acquisition.summary,
+            &recording,
+            &acquisition.integrity,
+            options.raw_input.is_none(),
+        ),
+    )?;
+
+    Ok(RhdSmokeResult {
+        acquisition: acquisition.summary,
+        recording,
+        integrity: acquisition.integrity,
+        hardware: options.raw_input.is_none(),
+    })
+}
+
 fn streaming_benchmark_summary(
     result: &StreamingPipelineResult,
     device: &kv_types::DeviceConfig,
@@ -519,6 +661,44 @@ fn streaming_benchmark_summary(
         ),
         cpu_percent_avg: process_metrics.map(|m| m.cpu_percent_avg),
         memory_mb_max: process_metrics.map(|m| m.memory_mb_max),
+    }
+}
+
+fn rhd_smoke_benchmark_summary(
+    acquisition: &AcquisitionRunSummary,
+    recording: &RecordingSummary,
+    integrity: &IntegrityReport,
+    hardware: bool,
+) -> BenchmarkSummary {
+    let duration_seconds = recorded_duration_seconds(
+        integrity.summary.written_samples,
+        acquisition.status.channel_count,
+        acquisition.status.sample_rate,
+    );
+
+    BenchmarkSummary {
+        measurement_kind: if hardware {
+            "rhd_hardware_smoke".to_string()
+        } else {
+            "rhd_raw_input".to_string()
+        },
+        duration_seconds,
+        channel_count: acquisition.status.channel_count,
+        sample_rate: acquisition.status.sample_rate,
+        expected_samples: integrity.summary.expected_samples,
+        written_samples: integrity.summary.written_samples,
+        missing_packets: integrity.summary.missing_packets,
+        crc_errors: integrity.summary.crc_errors,
+        timestamp_discontinuities: integrity.summary.timestamp_discontinuities,
+        byte_count: recording.byte_count,
+        average_write_mb_s: average_write_mb_s(recording.byte_count, duration_seconds),
+        max_write_latency_ms: None,
+        p50_write_latency_ms: None,
+        p95_write_latency_ms: None,
+        p99_write_latency_ms: None,
+        max_buffer_occupancy: None,
+        cpu_percent_avg: None,
+        memory_mb_max: None,
     }
 }
 
@@ -609,6 +789,59 @@ fn simulator_recording_events(integrity: &IntegrityReport) -> Vec<AcquisitionEve
     events
 }
 
+fn rhd_smoke_log_lines(integrity: &IntegrityReport, hardware: bool) -> Vec<String> {
+    let mut lines = vec![
+        if hardware {
+            "[INFO] rhd hardware smoke started".to_string()
+        } else {
+            "[INFO] rhd raw-input smoke started".to_string()
+        },
+        format!(
+            "[INFO] acquired_blocks={}",
+            integrity.summary.observed_packets
+        ),
+    ];
+
+    for gap in &integrity.packet_gaps {
+        lines.push(format!(
+            "[WARN] missing packet expected={} observed={} missing={}",
+            gap.expected_packet_id, gap.observed_packet_id, gap.missing_count
+        ));
+    }
+
+    for discontinuity in &integrity.timestamp_discontinuities {
+        lines.push(format!(
+            "[WARN] timestamp discontinuity packet={} expected={} observed={}",
+            discontinuity.packet_id,
+            discontinuity.expected_timestamp_start,
+            discontinuity.observed_timestamp_start
+        ));
+    }
+
+    lines.push("[INFO] recorder flushed".to_string());
+    lines.push("[INFO] rhd smoke stopped cleanly".to_string());
+    lines
+}
+
+fn rhd_smoke_events(integrity: &IntegrityReport) -> Vec<AcquisitionEvent> {
+    let mut events = vec![AcquisitionEvent::Started {
+        timestamp_host_ms: 0,
+    }];
+
+    for gap in &integrity.packet_gaps {
+        events.push(AcquisitionEvent::PacketMissing {
+            expected_packet_id: gap.expected_packet_id,
+            observed_packet_id: gap.observed_packet_id,
+            missing_count: gap.missing_count,
+        });
+    }
+
+    events.push(AcquisitionEvent::Stopped {
+        timestamp_host_ms: 0,
+    });
+    events
+}
+
 fn simulator_benchmark_summary(
     acquisition: &AcquisitionRunSummary,
     recording: &RecordingSummary,
@@ -673,6 +906,7 @@ where
         "simulator-pipeline" => parse_simulator_pipeline_args(args),
         "simulator-stream" => parse_simulator_stream_args(args),
         "benchmark" => parse_benchmark_args(args),
+        "rhd-smoke" => parse_rhd_smoke_args(args),
         _ => Err(CliError::UnknownCommand { command }),
     }
 }
@@ -896,6 +1130,74 @@ fn parse_benchmark_args(args: impl Iterator<Item = String>) -> Result<CliCommand
         preview_capacity_blocks: preview_capacity,
         drop_packet_ids,
     }))
+}
+
+fn parse_rhd_smoke_args(args: impl Iterator<Item = String>) -> Result<CliCommand, CliError> {
+    let mut blocks = 1_usize;
+    let mut enabled_streams = 2_usize;
+    let mut raw_input: Option<PathBuf> = None;
+    let mut bitfile_path = default_rhd_bitfile_path();
+    let mut frontpanel_dll_path: Option<PathBuf> = None;
+    let mut serial: Option<String> = None;
+    let mut output_dir: Option<PathBuf> = None;
+    let mut args = args.peekable();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--blocks" => {
+                let value = next_value(&mut args, "--blocks")?;
+                blocks = parse_usize("--blocks", &value)?;
+            }
+            "--streams" | "--enabled-streams" => {
+                let value = next_value(&mut args, "--streams")?;
+                enabled_streams = parse_usize("--streams", &value)?;
+            }
+            "--raw-input" => {
+                let value = next_value(&mut args, "--raw-input")?;
+                raw_input = Some(PathBuf::from(value));
+            }
+            "--bitfile" => {
+                let value = next_value(&mut args, "--bitfile")?;
+                bitfile_path = PathBuf::from(value);
+            }
+            "--frontpanel-dll" => {
+                let value = next_value(&mut args, "--frontpanel-dll")?;
+                frontpanel_dll_path = Some(PathBuf::from(value));
+            }
+            "--serial" => {
+                serial = Some(next_value(&mut args, "--serial")?);
+            }
+            "--output" => {
+                let value = next_value(&mut args, "--output")?;
+                output_dir = Some(PathBuf::from(value));
+            }
+            _ => return Err(CliError::UnknownArgument { argument }),
+        }
+    }
+
+    let output_dir = match output_dir {
+        Some(output_dir) => output_dir,
+        None => default_recording_output_dir()?,
+    };
+
+    Ok(CliCommand::RhdSmoke(RhdSmokeOptions {
+        output_dir,
+        blocks,
+        enabled_streams,
+        raw_input,
+        bitfile_path,
+        frontpanel_dll_path,
+        serial,
+    }))
+}
+
+fn default_rhd_bitfile_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("..")
+        .join("keyvast_260607_with_UART.bit")
 }
 
 fn parse_benchmark_preset(name: &str) -> Result<BenchmarkPreset, CliError> {

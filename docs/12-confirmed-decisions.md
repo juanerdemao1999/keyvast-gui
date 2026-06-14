@@ -30,13 +30,16 @@ TTL lines: 16
 ```text
 Future connector: USB Type-C
 Future transport: USB-based data transfer
-Exact USB protocol: TBD
-FPGA bit file: TBD
-Register map: TBD
-Packet format: TBD
+First hardware module: Opal Kelly XEM7310-A75
+First hardware protocol: Opal Kelly FrontPanel / Intan Rhythm USB3-style endpoints
+First hardware bit file: D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit
+Host program should bundle the required FrontPanel runtime DLL for convenience
+First live hardware channel target: up to two 32-channel RHD headstages
+Register map: use Rhythm USB3 / FrontPanel endpoints unless the Keyvast bitfile changes them
+Packet format: Rhythm USB3 data frames unless the Keyvast bitfile changes them
 CRC algorithm: TBD
-Timestamp clock: TBD
-ADC gain conversion: TBD
+Timestamp clock: Rhythm USB3 32-bit sample timestamp for first hardware bring-up
+ADC gain conversion: follow Open Ephys / Intan RHD convention for display, while preserving raw data
 ```
 
 ## Verification Ladder

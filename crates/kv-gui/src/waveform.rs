@@ -23,6 +23,12 @@ use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
+/// RHD amplifier full-scale range in µV. The 16-bit offset-binary ADC maps
+/// ±32767 counts at 0.195 µV/count → ±6389.6 µV. Display normalization
+/// divides by i16::MAX, so a normalized value of 1.0 corresponds to this
+/// many microvolts.
+const RHD_FULL_SCALE_UV: f64 = 32_767.0 * 0.195;
+
 /// Maximum rendered points per channel.
 /// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.
 /// We use a conservative budget to keep egui_plot tessellation cheap.
@@ -72,6 +78,7 @@ struct SpikeMeta {
 ///
 /// Data is read from `ring` (pre-computed at ingestion time) — no per-frame
 /// block history iteration.
+#[allow(clippy::too_many_arguments)] // cohesive per-frame render inputs; a struct would not aid clarity
 pub fn draw_waveform_area(
     ui: &mut egui::Ui,
     ring: &DisplayRing,
@@ -80,17 +87,18 @@ pub fn draw_waveform_area(
     settings: &DisplaySettings,
     filters: &FilterSettings,
     sweep_left_ms: f64,
+    empty_hint: &str, // source-aware subtitle shown when there is nothing to draw
 ) {
     let block = match latest {
         Some(b) => b,
         None => {
-            draw_empty_state(ui);
+            draw_empty_state(ui, empty_hint);
             return;
         }
     };
 
     if !ring.ready {
-        draw_empty_state(ui);
+        draw_empty_state(ui, empty_hint);
         return;
     }
 
@@ -99,7 +107,7 @@ pub fn draw_waveform_area(
     let start_ch = start_ch.min(total_channels.saturating_sub(1));
     let visible = settings.visible_channels.min(total_channels.saturating_sub(start_ch));
     if visible == 0 {
-        draw_empty_state(ui);
+        draw_empty_state(ui, empty_hint);
         return;
     }
 
@@ -111,7 +119,11 @@ pub fn draw_waveform_area(
     // ch_spacing so that adjusting spacing does NOT change waveform amplitude.
     // Uses the default lane height as the reference (like Intan RHX where
     // amplitude scale and channel spacing are independent controls).
-    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000.0 / amp_scale.max(1.0));
+    //
+    // The ring stores values normalized to [-1, 1] (i16 / 32767).  A norm
+    // value of 1.0 corresponds to RHD_FULL_SCALE_UV microvolts.  We want
+    // amp_scale µV to fill one lane (= 3 * DEFAULT_CHANNEL_SPACING Y-units).
+    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (RHD_FULL_SCALE_UV / amp_scale.max(1.0));
 
     // Sweep-mode window: FIXED bounds for the duration of this sweep.
     // The cursor (ring.latest_time_ms) sweeps from x_left to x_right.
@@ -139,9 +151,37 @@ pub fn draw_waveform_area(
     let ch_count_for_fmt = visible;
     let spacing_for_fmt = ch_spacing;
     let start_ch_for_fmt = start_ch;
+
+    // Label stride: one tick per channel when the stack is short, thinning out
+    // as more channels are shown so the axis never turns into a solid column of
+    // text.  egui_plot's default spacer only lands on "nice" Y values and so
+    // labels just CH0 / CH9 — this places a tick on every Nth lane center
+    // instead, which both labels and draws a baseline grid line there.
+    let label_stride: usize = match visible {
+        0..=16 => 1,
+        17..=32 => 2,
+        _ => 4,
+    };
+    let y_grid_spacer = move |_input: egui_plot::GridInput| -> Vec<egui_plot::GridMark> {
+        (0..ch_count_for_fmt)
+            .step_by(label_stride)
+            .map(|i| egui_plot::GridMark {
+                value: -(i as f64) * spacing_for_fmt,
+                step_size: spacing_for_fmt * label_stride as f64,
+            })
+            .collect()
+    };
+
     let y_formatter = move |mark: egui_plot::GridMark, _range: &std::ops::RangeInclusive<f64>| {
-        let val = mark.value;
-        let disp_pos = (-val / spacing_for_fmt).round() as i64;
+        let pos = -mark.value / spacing_for_fmt;
+        let disp_pos = pos.round();
+        // Only label grid marks that sit on a lane center. egui_plot also emits
+        // minor marks between lanes; without this guard they round to the same
+        // channel and every label prints twice (CH0 CH0 CH1 CH1 ...).
+        if (pos - disp_pos).abs() > 0.1 {
+            return String::new();
+        }
+        let disp_pos = disp_pos as i64;
         if disp_pos >= 0 && (disp_pos as usize) < ch_count_for_fmt {
             format!("CH{}", start_ch_for_fmt + disp_pos as usize)
         } else {
@@ -181,6 +221,7 @@ pub fn draw_waveform_area(
         .show_y(false)
         .x_axis_formatter(x_formatter)
         .y_axis_formatter(y_formatter)
+        .y_grid_spacer(y_grid_spacer)
         .set_margin_fraction(egui::vec2(0.0, 0.01));
 
     // Extract spike metadata BEFORE consuming traces (points will be moved into Lines).
@@ -262,16 +303,53 @@ pub fn draw_waveform_area(
             }
         }
 
+        // Emphasize whole-second gridlines so the time axis has a clear sense
+        // of scale.  Only when the window is wide enough (>= 2 s) that integer
+        // seconds aren't packed together; brighter than the default grid.
+        if settings.show_grid && (x_right - x_left) >= 2000.0 {
+            let first_sec = (x_left / 1000.0).ceil() as i64;
+            let last_sec = (x_right / 1000.0).floor() as i64;
+            for sec in first_sec..=last_sec {
+                let x = sec as f64 * 1000.0;
+                plot_ui.line(
+                    Line::new(PlotPoints::from(vec![[x, y_min], [x, y_max]]))
+                        .color(egui::Color32::from_rgb(70, 70, 86))
+                        .width(1.0)
+                        .name(""),
+                );
+            }
+        }
+
         // Sweep cursor — vertical line at the latest data position.
-        // This is the SpikeGLX-style "write cursor" that sweeps right.
-        if cursor_ms > x_left && cursor_ms < x_right {
+        // Only drawn in Sweep mode (SpikeGLX-style "write cursor").
+        // In Roll mode the right edge IS the latest data, no cursor needed.
+        //
+        // A short translucent "trail" behind the cursor (the just-written
+        // region) plus a brighter cursor line make the wrap read as a moving
+        // write-head instead of a momentary blank.
+        if matches!(settings.display_mode, crate::panels::DisplayMode::Sweep)
+            && cursor_ms > x_left && cursor_ms < x_right
+        {
+            let trail = (x_right - x_left) * 0.04;
+            let trail_left = (cursor_ms - trail).max(x_left);
+            plot_ui.polygon(
+                egui_plot::Polygon::new(PlotPoints::from(vec![
+                    [trail_left, y_min],
+                    [cursor_ms, y_min],
+                    [cursor_ms, y_max],
+                    [trail_left, y_max],
+                ]))
+                .fill_color(egui::Color32::from_rgba_unmultiplied(200, 210, 230, 22))
+                .stroke(egui::Stroke::NONE)
+                .name(""),
+            );
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![
                     [cursor_ms, y_min],
                     [cursor_ms, y_max],
                 ]))
-                .color(egui::Color32::from_rgba_unmultiplied(180, 180, 180, 80))
-                .width(1.0)
+                .color(egui::Color32::from_rgba_unmultiplied(220, 225, 235, 200))
+                .width(1.5)
                 .name(""),
             );
         }
@@ -279,7 +357,11 @@ pub fn draw_waveform_area(
         // Draw waveform traces — highlight hovered channel.
         // Points are MOVED (not cloned) into Line to avoid per-channel alloc.
         for trace in traces {
-            let base_color = theme::channel_color(trace.channel);
+            let base_color = if settings.color_by_group {
+                settings.channel_color(trace.channel)
+            } else {
+                theme::channel_color(trace.channel)
+            };
             let is_hovered = hovered_ch == Some(trace.channel);
             // Default: all channels always at full brightness (1.3× base color).
             // Hover highlight mode (settings.hover_highlight) must be ON for
@@ -325,6 +407,38 @@ pub fn draw_waveform_area(
         }
     }
 
+    // Colored lane tabs (#4): a small chip in each channel's trace color at
+    // the left edge of its lane, tying the grey "CHn" axis label to its
+    // colored waveform.  Only on labeled lanes so it tracks the visible ticks.
+    {
+        let painter = ui.painter();
+        let frame = *response.transform.frame();
+        for disp_pos in (0..visible).step_by(label_stride) {
+            let phys_ch = start_ch + disp_pos;
+            if !settings.is_channel_enabled(phys_ch) {
+                continue;
+            }
+            let base = if settings.color_by_group {
+                settings.channel_color(phys_ch)
+            } else {
+                theme::channel_color(phys_ch)
+            };
+            let y_lane = -(disp_pos as f64) * ch_spacing;
+            let screen = response
+                .transform
+                .position_from_point(&egui_plot::PlotPoint::new(x_left, y_lane));
+            let chip = egui::Rect::from_min_size(
+                egui::pos2(frame.left() + 2.0, screen.y - 3.0),
+                egui::vec2(5.0, 6.0),
+            );
+            painter.rect_filled(
+                chip,
+                egui::CornerRadius::same(1),
+                brighten_color(base, 1.3),
+            );
+        }
+    }
+
     // Hover info overlay — drawn in the top-left corner of the plot so it
     // never covers the waveform under the cursor.
     if response.response.hovered()
@@ -343,7 +457,7 @@ pub fn draw_waveform_area(
         let disp_pos = hovered_ch.saturating_sub(start_ch);
         let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
-        let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
+        let amp_uv = delta_y * RHD_FULL_SCALE_UV / (3.0 * DEFAULT_CHANNEL_SPACING);
         let amp_str = if amp_uv.abs() >= 1000.0 {
             format!("{:+.2} mV", amp_uv / 1000.0)
         } else {
@@ -355,6 +469,28 @@ pub fn draw_waveform_area(
             amp_str);
         let plot_rect = response.response.rect;
         let painter = ui.painter();
+
+        // Thin crosshair at the cursor (#8) — pairs with the readout pill so
+        // the exact sample being inspected is unambiguous.
+        let cross = egui::Stroke::new(
+            0.75,
+            egui::Color32::from_rgba_unmultiplied(200, 200, 215, 90),
+        );
+        painter.line_segment(
+            [
+                egui::pos2(ptr_pos.x, plot_rect.top()),
+                egui::pos2(ptr_pos.x, plot_rect.bottom()),
+            ],
+            cross,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(plot_rect.left(), ptr_pos.y),
+                egui::pos2(plot_rect.right(), ptr_pos.y),
+            ],
+            cross,
+        );
+
         let text_pos = plot_rect.left_top() + egui::vec2(10.0, 8.0);
         // Background pill
         let font = egui::FontId::monospace(11.0);
@@ -393,11 +529,8 @@ fn draw_scale_bar(
     let plot_rect = response.response.rect;
 
     // The scale bar shows the amp_scale setting as a visual reference.
-    // gain = DEFAULT_CHANNEL_SPACING * 3.0 * (1000 / amp_scale).
-    // A normalized amplitude of amp_scale/1000 (the "unit" signal) maps to:
-    //   (amp_scale/1000) * gain = DEFAULT_CHANNEL_SPACING * 3.0 Y-units.
-    // So the bar representing amp_scale µV has height DEFAULT_CHANNEL_SPACING * 3.0.
-    // That's the entire lane (too tall). Instead show amp_scale/3 µV (1/3 lane):
+    // gain maps amp_scale µV to one full lane (3 * DEFAULT_CHANNEL_SPACING Y-units).
+    // Show 1/3 of the lane = amp_scale/3 µV:
     let bar_y_units = DEFAULT_CHANNEL_SPACING;
     let bar_voltage_uv = amp_scale_uv / 3.0;
 
@@ -420,9 +553,20 @@ fn draw_scale_bar(
     let bar_top = bar_bottom - bar_height_px;
 
     // Draw the vertical bar with small horizontal ticks at top and bottom
-    let bar_color = theme::TEXT_SECONDARY;
+    let bar_color = theme::TEXT_PRIMARY;
     let stroke = egui::Stroke::new(1.5, bar_color);
     let tick_w = 4.0;
+
+    // Dark backing panel so the bar + label stay readable over busy waveforms.
+    let backing = egui::Rect::from_min_max(
+        egui::pos2(bar_x - 58.0, bar_top - 4.0),
+        egui::pos2(plot_rect.right() - 4.0, bar_bottom + 18.0),
+    );
+    painter.rect_filled(
+        backing,
+        egui::CornerRadius::same(3),
+        egui::Color32::from_rgba_premultiplied(18, 18, 24, 190),
+    );
 
     // Vertical line
     painter.line_segment(
@@ -446,9 +590,12 @@ fn draw_scale_bar(
     } else {
         format!("{:.0} µV", bar_voltage_uv)
     };
+    // Right-align the label to the bar's right tick so it grows leftward and
+    // never clips against the plot's right edge (previously centered on bar_x,
+    // which cut off the "µV"/"mV" suffix).
     painter.text(
-        egui::pos2(bar_x, bar_bottom + 4.0),
-        egui::Align2::CENTER_TOP,
+        egui::pos2(bar_x + tick_w, bar_bottom + 4.0),
+        egui::Align2::RIGHT_TOP,
         label,
         egui::FontId::monospace(10.0),
         bar_color,
@@ -582,7 +729,7 @@ fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64)
 
 // ── Empty state ─────────────────────────────────────────────────────
 
-fn draw_empty_state(ui: &mut egui::Ui) {
+fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
     let available = ui.available_size();
     let (rect, _) = ui.allocate_exact_size(available, egui::Sense::hover());
 
@@ -598,7 +745,7 @@ fn draw_empty_state(ui: &mut egui::Ui) {
     ui.painter().text(
         rect.center() + egui::vec2(0.0, 12.0),
         egui::Align2::CENTER_CENTER,
-        "Press Start or switch to Demo mode",
+        hint,
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );

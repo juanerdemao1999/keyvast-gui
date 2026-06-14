@@ -20,11 +20,558 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-05-28 (session 15 — multi-view plan documented, Phase 1 starting)
+Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
 
-The project is in the simulator-first foundation phase. The streaming pipeline, incremental integrity, benchmark runner, latency distribution, CPU/memory monitoring, and professional GUI with neural demo mode are now complete. The GUI was refactored following Intan RHX / Open Ephys patterns and now covers Tier-1, Tier-2 and Tier-3 features (visualization polish, interaction, signal-processing).
+### Session 27: Feature triage — remove probe map + per-channel stats
 
-Tier-4 experiments (FFT spectrum, TTL overlay, config persistence) were reverted — the Tier-3 baseline is the stable version on `main`. New work happens on the `dev` branch.
+Product decisions (user): the probe map panel/window and the per-channel
+RMS/peak-to-peak statistics are dropped; development focus moves to GUI
+visual design and interaction-logic polish.
+
+1. **Probe map removed**: `probe_map.rs` deleted, sidebar section + floating
+   window gone, `probe_geometry`/`probe_site_radius` config fields removed
+   (old config files still load — unknown keys are ignored).
+2. **Per-channel stats removed**: `ChannelStats` and `compute_channel_stats`
+   deleted from `preview.rs`; `BlockStats` keeps only the status-bar scalars
+   (data rate, block rate, totals, dropped blocks), saving a per-block
+   O(channels × samples) pass.
+3. Branch admin this session: PRs #10/#14/#12/#13/#15 merged into `v2.0`;
+   `v2.0` and `main` share no git history, so the default branch should be
+   switched to `v2.0` in repo settings (needs admin); stale feature branches
+   deleted — only `main`, `v2.0`, `dev` remain.
+
+Verification: workspace tests pass; clippy zero warnings (workspace and
+kv-gui MSVC target); `cargo check -p kv-gui --target x86_64-pc-windows-msvc`
+clean. Not run: Windows GUI smoke test.
+
+### Session 26: Reliability + cleanup (stacked on P2 branch)
+
+Branch `devin/1781290000-reliability`:
+
+1. **Audio monitor removed** (product decision): `audio_monitor.rs` deleted,
+   sidebar section, per-block feed in `ingest_block`, and the
+   `audio_channel`/`audio_volume` config fields are gone. Old config files
+   still load (unknown keys are ignored by the lenient parser).
+2. **Write-failure auto-stop (B1)**: a failed `write_block` now stops and
+   finalizes the recording immediately in both paths (Demo in `ingest_block`,
+   Device in `recorder_loop`) instead of continuing to write into a possibly
+   corrupt file. The error banner says the file may be incomplete.
+3. **Live recording progress (B2)**: new `RecorderEvent::Progress { blocks,
+   bytes }` sent ~5/s by the recorder thread; `StreamingRecorder` gained a
+   `byte_count()` getter. The status panel now updates during Device
+   recordings instead of only at Stop.
+4. **Poison-safe locks (B3)**: all 7 `lock().unwrap()` (remote-API queues,
+   client_count) replaced with `remote_api::lock_recover` —
+   `unwrap_or_else(PoisonError::into_inner)` so a panicked worker can no
+   longer take down the GUI thread.
+5. **Remote-API input validation (B4)**: `validate_output_dir` rejects
+   empty paths, NUL bytes, and `..` traversal before `StartRecording`
+   accepts a client-supplied output_dir (unit tested).
+6. **Playback scrub (A2)**: `tick()` now emits a block only when the cursor
+   moved (`last_emitted_frame`), so paused frames stop re-ingesting the same
+   data every frame while scrubbing still refreshes instantly; `tick` now
+   routes through `read_block_at` (its dead_code allow removed).
+
+**Verification:** `cargo test --workspace --exclude kv-gui` all pass;
+clippy zero warnings on both halves; Windows-target check clean.
+GUI smoke test still pending on Windows.
+
+**Next:** merge chain #10 → #11 → #12 → this PR. Future: windows-latest CI
+job for kv-gui tests, app.rs split, serde_json, rustfmt decision.
+
+---
+
+### Session 25: P2 — Engineering (CI workflow, clippy zero-warning, eprintln→log)
+
+Branch `devin/1781284000-p2-engineering` (stacked on the P1 branch → `v2.0`):
+
+1. **GitHub Actions CI** — `.github/workflows/ci.yml`, two jobs on every PR
+   and pushes to `main`/`v2.0`:
+   - `test`: `cargo test --workspace --exclude kv-gui`
+   - `lint`: `cargo clippy --workspace --exclude kv-gui --all-targets -- -D warnings`
+     plus `cargo clippy -p kv-gui --target x86_64-pc-windows-msvc -- -D warnings`
+     (kv-gui only builds for Windows; checking against the MSVC target needs
+     no linker). No `cargo fmt --check`: the codebase intentionally is not
+     rustfmt-formatted (242 diff hunks) — decide separately before adding it.
+2. **Clippy zero-warning** — `cargo clippy --fix` plus manual fixes (strip_prefix,
+   needless_range_loop, clamp, `&PathBuf`→`&Path`, collapsed identical trigger
+   branches). Intentionally-unused API (hardware bring-up constants/`RhdChipType`,
+   audio-monitor plumbing, custom probe geometry, scrub-bar `read_block_at`,
+   channel stats) carries targeted `#[allow(dead_code)]` with a reason comment.
+   Removed `ChannelSelectState::filter_block_data` (superseded by
+   `filter_block_channels`; test migrated).
+3. **eprintln → `log` crate** — all `eprintln!` in `kv-rhd` (backend,
+   frontpanel) and `kv-gui` (app) replaced with `log::info!/warn!/error!`;
+   `kv-gui` main initializes `env_logger` (default level `info`, override via
+   `RUST_LOG`). `kv-cli` keeps `println!` (CLI output, not logging).
+
+**Verification:** clippy zero warnings on both halves; `cargo test --workspace
+--exclude kv-gui` all pass; `cargo check -p kv-gui --target
+x86_64-pc-windows-msvc` clean. GUI smoke test still pending on Windows.
+
+**Next:** merge chain #10 → #11 → P2 PR; future: app.rs split, cpal audio
+monitoring, rustfmt decision.
+
+---
+
+### Session 24: P1 — Performance (lazy band filters, history dedup, refilter debounce, LTO)
+
+Branch `devin/1781280000-p1-perf` (stacked on the P0 branch → `v2.0`):
+
+1. **Lazy LFP/AP band filtering** — `ingest_block` previously ran three full
+   filter passes per block regardless of layout. Now the fixed LFP band is only
+   computed when an `LfpView` tile exists (`lfp_tile_open()`), and the AP band
+   only when an `ApView` or `SpikeOverlay` tile exists (`ap_band_needed()`,
+   since the snippet detector consumes the AP block). Default single-tile
+   layout: 3 passes → 1.
+2. **filtered_history dedup** — when no user filter/CAR is active,
+   `filtered_history` was a full clone of `block_history` (~80 MB at capacity).
+   It now stays empty in that case; `refilter_history` already falls back to
+   `block_history` as the display-ring source.
+3. **Refilter debounce** — filter-settings changes now wait
+   `REFILTER_DEBOUNCE_MS` (150 ms) of stability before `rebuild_filter_chains`
+   re-filters the full 10k-block history, so dragging a cutoff slider no
+   longer re-filters everything every frame. `ingest_block` only rebuilds
+   chains on channel-count change; a repaint is requested while a change is
+   pending so the debounce expires without user input.
+4. **Release LTO** — workspace `[profile.release]` now sets `lto = "thin"`,
+   `codegen-units = 1` for cross-crate inlining of filter/ring hot paths.
+
+**Verification:** `cargo test --workspace --exclude kv-gui` all pass,
+`cargo check -p kv-gui --target x86_64-pc-windows-msvc` clean (pre-existing
+warnings only). GUI smoke test still pending on Windows.
+
+**Next:** P2 engineering — CI workflow, clippy cleanup, eprintln→log.
+
+---
+
+### Session 23: P0 — Wire unfinished features (impedance / export / selective save / demo errors)
+
+A full v2.0 audit found four features with UI but no backing implementation.
+This session wires them up (branch `devin/1781275384-p0-wire-features` → `v2.0`):
+
+1. **Impedance measurement wired** — `RhdHardwareBackend::run_impedance_test()`
+   public delegate added in `kv-rhd/src/backend.rs`. In the GUI, the Run button
+   now calls `KvApp::start_impedance_test()`: validates RHD source + bitfile,
+   stops acquisition (test needs exclusive SPI access), spawns a worker thread
+   that opens the device and runs the test, streaming `ImpedanceMsg`
+   (Progress/Done/Failed) over an mpsc channel polled each frame
+   (`poll_impedance`). Button gating changed from `acquiring` to
+   "RHD source + bitfile selected".
+2. **Export formats wired** — new "Export .kvraw…" button in the EXPORT FORMAT
+   section. `export_kvraw()` (app.rs) reads a .kvraw via `KvrawReader` in 1 s
+   chunks, rebuilds `SampleBlock`s, and calls `export_intan_rhd` (writes
+   `<stem>.rhd` next to the source) or `export_flat_binary` (writes
+   `<stem>.export/recording.bin` + meta). Runs on a worker thread; result
+   surfaced in the panel via `poll_export`.
+3. **Selective channel save wired** — `ChannelSelectState::recording_selection()`
+   returns the channel subset (None = save all) and is captured at recording
+   start (so mid-recording changes can't corrupt the file layout). Device mode:
+   `RecorderCmd::Start { path, channels }` carries it to the recorder thread.
+   Demo mode: `KvApp::record_channels`. Both paths filter via the new
+   `channel_select::filter_block_channels()` before `write_block`.
+4. **Demo recording errors surfaced** — demo-mode `write_block` and auto-stop
+   `finish` failures now set `recording_error` (red banner) instead of
+   eprintln-only. Also deduplicated `toggle_recording` to call
+   `begin_recording`/`stop_recording`.
+
+**Verification:** `cargo test --workspace --exclude kv-gui` (92 tests pass),
+`cargo check -p kv-gui --target x86_64-pc-windows-msvc` clean (pre-existing
+dead-code warnings only), kv-gui test code compiles (link step impossible on
+Linux — GUI smoke test and on-hardware impedance run still pending on the
+Windows machine).
+
+**Next:** P1 performance (lazy LFP/AP rings, dedup filtered_history, refilter
+debounce, release LTO), then P2 engineering (CI workflow, clippy cleanup,
+logging). Each as its own PR.
+
+---
+
+Previous state (2026-06-12, merged all phases: Phase 1–4 into v2.0):
+
+The project has progressed through 7 PRs on `v2.0`:
+- PR #2: Signal quality fixes (chip ID validation, FIFO MSB)
+- PR #3: Open Ephys alignment (11 fixes)
+- PR #4: Code audit bug fixes + architecture improvements
+- PR #5: Phase 1 — impedance measurement + offline .kvraw playback
+- PR #6: Phase 2 — Roll mode, channel colors, FFT spectrum, channel mapping
+- PR #7: Phase 3 — Recording format export, Gate/Trigger, Audio monitor, Remote API
+- PR #8: Phase 4 — Probe Map, selective channel save, config persistence
+
+None of the PRs have been merged yet (v2.0 still has only the initial commit).
+
+### Phase 4: Advanced Features
+
+**New modules added:**
+
+1. **`kv-gui/src/probe_map.rs`** — 2D probe layout visualization. Presets: LinearSingle, LinearDual, Tetrode, Grid4x8, Custom. Per-channel RMS → color mapping (blue→cyan→yellow→red). Floating window with zoom/pan, color bar legend, hover tooltips. Tests: 5.
+
+2. **`kv-gui/src/channel_select.rs`** — Selective channel recording. Per-channel checkboxes, quick actions (All/None/Even/Odd), range selection. `filter_block_data()` extracts only selected channels from interleaved data. Tests: 6.
+
+3. **`kv-gui/src/config_persist.rs`** — JSON config file (keyvast_config.json next to exe). Saves/loads: display settings, filter config, recording paths, audio monitor, remote API port, probe geometry. Manual JSON serialization (no serde). Auto-save option. Tests: 4.
+
+**Integration in `app.rs`:**
+- ProbeMapState, ChannelSelectState, ConfigPersistState fields added to KvApp
+- Probe map activity updated from display ring each frame
+- Channel select syncs to acquisition channel count
+- Config save/load buttons trigger capture_from/apply_to
+- Probe map drawn as floating egui::Window when visible
+
+**Build verification:**
+- `cargo check -p kv-rhd` ✓
+- `cargo check -p kv-gui --target x86_64-pc-windows-msvc` ✓ (warnings only)
+- `cargo test --workspace --exclude kv-gui` ✓ (92 tests pass)
+
+**All planned phases complete.** Future enhancements could include:
+- Spike sorting (online clustering)
+- LFP spectral decomposition (theta/gamma bands)
+- Multi-probe support
+- Network streaming (LSL integration)
+- Plugin system for custom analysis
+
+---
+
+### Phase 3: Recording & Integration Features
+
+**New modules added:**
+
+1. **`kv-recorder/src/export_formats.rs`** — Export to Intan .rhd (magic 0xC6912702, v2.0 header with Qt QStrings, 128-sample data blocks) and flat binary (.bin + .meta.json). Tests: roundtrip, empty-blocks error, file creation.
+
+2. **`kv-gui/src/trigger.rs`** — Gate/Trigger recording control. TriggerEdge (Rising/Falling), TriggerMode (Level/EdgeToggle/EdgeTimed), TriggerState (Disabled/Armed/Triggered). `process_block()` returns TriggerAction (None/StartRecording/StopRecording). Tests: 5 scenarios.
+
+3. **`kv-gui/src/audio_monitor.rs`** — Audio buffer-only interface (ready for cpal integration). Decimates 30kHz → configurable output rate, volume control, ring buffer with overflow handling. Tests: 5 scenarios.
+
+4. **`kv-gui/src/remote_api.rs`** — TCP server + JSON-RPC 2.0 (newline-delimited). Commands: Ping, GetStatus, GetChannelCount, StartAcquisition, StopAcquisition, StartRecording, StopRecording, SetDisplayMode. Default port 4444. Tests: 6 parse/format tests.
+
+**Integration in `app.rs`:**
+- TriggerConfig, AudioMonitorState, RemoteApiState, RemoteApiHandle fields added to KvApp
+- Trigger actions processed in ingest_block → calls begin_recording/stop_recording
+- Audio monitor fed from block data each ingest
+- Remote command queue polled each frame, responses sent back
+- Export format selector UI in sidebar (CollapsingHeader)
+- Remote API start/stop logic tied to enabled toggle
+
+**Build verification:**
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-recorder` ✓
+- `RUSTUP_TOOLCHAIN=nightly cargo check -p kv-gui --target x86_64-pc-windows-msvc` ✓ (warnings only)
+- `RUSTUP_TOOLCHAIN=nightly cargo test --workspace --exclude kv-gui` ✓ (92 tests pass)
+
+**Next (Phase 4):**
+- Probe Map visualization
+- Selective channel save
+- Config persistence (save/load session settings)
+
+---
+
+### Session 22: Phase 1 — Impedance measurement + offline .kvraw playback
+
+**Goal**: Implement the two highest-priority features from the cross-GUI comparison:
+(1) impedance measurement, (2) offline .kvraw file reader + playback mode.
+
+**PR #5** (`devin/1781111069-phase1-impedance-playback` → `v2.0`):
+
+**Phase 1.1 — Impedance Measurement:**
+
+1. **`commands.rs`**: Added `ZcheckScale` enum (100fF/1pF/10pF with capacitance values),
+   `MAX_COMMAND_LENGTH = 1024`, `sample_rate()` getter, zcheck configuration methods
+   (`enable_zcheck`, `set_zcheck_scale`, `set_zcheck_polarity`, `set_zcheck_channel`),
+   and `create_command_list_zcheck_dac(frequency, amplitude)` that generates WRITE(6, x)
+   sine wave commands for the on-chip impedance DAC.
+
+2. **`impedance.rs` (new)**: `ChannelImpedance`, `ImpedanceTestConfig`, `ImpedanceResult`
+   types. `compute_impedance()` performs single-bin DFT at the test frequency to extract
+   magnitude/phase. `auto_select_scale()` picks the best capacitor scale based on
+   impedance range. Quality labels/colors for GUI display. 5 unit tests.
+
+3. **`backend.rs`**: Full `run_impedance_test()` implementation:
+   - Uploads DC waveform to AuxCmd1 Bank 0, sine wave to AuxCmd1 Bank 1
+   - Uploads register configs with zcheck enabled + 3 cap scales to AuxCmd3 Banks 2/3/4
+   - For each channel: sets zcheck_select, switches banks, runs acquisition, reads data
+   - Computes impedance via DFT, auto-selects best cap scale, re-measures if needed
+   - Restores normal operation (DC DAC, non-zcheck config) after test
+   - `extract_channel_from_raw()` helper extracts single-channel i16 from raw frame data
+
+4. **`impedance_panel.rs` (new GUI)**: Impedance panel in left sidebar with:
+   - Test frequency and periods configuration
+   - Progress bar during measurement
+   - Results table with per-channel magnitude (Ω/kΩ/MΩ), phase, and quality color coding
+
+**Phase 1.2 — Offline .kvraw Playback:**
+
+5. **`kv-recorder/src/lib.rs`**: Added `KvrawReader` and `KvrawMetadata` types.
+   Reader opens .kvraw files, parses embedded JSON header (v2) or companion .json (v1),
+   supports random-access `read_frames(start, count)` and `read_channels()`.
+   Minimal JSON parser avoids serde dependency.
+
+6. **`playback.rs` (new GUI)**: `PlaybackManager` state machine (Idle/Paused/Playing).
+   GUI panel with: file open dialog, transport controls (play/pause/rewind/close),
+   speed control (0.1x–10x), timeline scrubber slider, time position display.
+   Playback feeds SampleBlocks into the existing `ingest_block()` pipeline for display.
+
+**Build**: `cargo check -p kv-rhd` + `-p kv-gui --target x86_64-pc-windows-msvc` clean.
+All tests pass (impedance: 5, recorder reader round-trip: 1, plus all 89 existing).
+
+**Next steps (Phase 2, pending user approval):**
+- Roll mode display
+- Channel colors/grouping
+- FFT / spectrum analysis
+- Channel mapping/sorting
+
+---
+
+### Session 21: Cross-GUI comparison + code audit bug fixes
+
+**Goal**: (1) Horizontal comparison with Intan RHX, SpikeGLX, Open Ephys GUI, and
+NeuroScope2 to identify feature gaps. (2) Full codebase audit to find bugs and
+architecture issues.
+
+**PR #4** (`devin/1781109497-bugfix-and-improvements` → PR#3 branch):
+https://github.com/juanerdemao1999/keyvast-gui/pull/4
+
+**Bug fixes (5):**
+
+1. **B1**: `start_demo()` / `start_device()` snippet_store channel count was hardcoded
+   to 16 — now uses actual channel count from demo config or lazy-init from first block.
+2. **B2**: `dropped_blocks` was always 0 — now tracks packet-ID discontinuity in
+   `LivePipelineHandle` and passes to `compute_block_stats`.
+3. **B3**: `streaming_metadata_json()` hardcoded `"backend": "simulator"` — now infers
+   from device_id prefix (demo/rhd-hardware/simulator).
+4. **B4/B12**: `default_bitfile_path()` and `default_frontpanel_dll_path()` used
+   `env!("CARGO_MANIFEST_DIR")` (compile-time only) — now searches exe dir → cwd →
+   debug-only compile path → bare name fallback.
+5. **B5**: `MAX_CHANNEL_TOGGLES=64` renamed to `INITIAL_CHANNEL_TOGGLES` to clarify
+   the vec grows dynamically.
+
+**Architecture improvements (6):**
+
+6. **D1**: Preview channel bounded (1024 slots) with `try_send` — prevents OOM when
+   GUI falls behind; skips preview frames rather than stalling acquisition.
+7. **D2**: Recorder thread replaced 1ms sleep polling with condvar notification from
+   producer, matching kv-core/pipeline.rs pattern.
+8. **D3/D6**: Reduced block clones in `ingest_block()` — filtered is now `Option<SampleBlock>`,
+   avoiding a full clone when no user filter is active.
+9. **D4**: Extracted duplicate filter chain construction into `build_filter_chains()`.
+10. **D10**: Demo spike waveform improved from 1-sample biphasic to realistic 5-sample
+    template (onset → trough → overshoot → AHP → recovery).
+11. **D11**: Simulator `spike_component()` now generates spikes on all channels with
+    channel-dependent rarity (was limited to first 8 channels).
+
+**Cross-GUI comparison report**: Sent to user as attachment. Key findings:
+- 🔴 Missing: impedance measurement, offline file viewer/playback
+- 🟡 Missing: roll mode, channel colors, audio monitor, remote API, multi-format
+  recording, gate/trigger, channel mapping, probe map, spectrogram, channel subset save
+
+**Build**: All 89 tests pass. `cargo check` clean on all crates.
+
+**Next steps (from comparison report, pending user approval):**
+- Implement impedance measurement (RHD DAC waveform + amplitude/phase readout)
+- Implement KVRAW offline reader + playback mode
+- Add roll mode display option
+- Add recording format export (Intan .rhd / Binary)
+- Remote control API (TCP + JSON-RPC)
+
+---
+
+### Session 20: Comprehensive Open Ephys RHD plugin alignment (11 fixes)
+
+**Goal**: Deep code-level comparison of keyvast-gui against Open Ephys rhythm-plugins
+to find and fix all remaining issues and gaps.
+
+**PR #3** (`devin/1781107079-openephys-alignment` → `v2.0`):
+https://github.com/juanerdemao1999/keyvast-gui/pull/3
+
+Includes PR#2 cherry-pick plus 11 new fixes/improvements.
+
+**Critical fixes:**
+
+1. **Reverted Reg 3/6 writes in AuxCmd3** — PR#2 incorrectly added `reg_write(3)`
+   and `reg_write(6)` to `create_command_list_register_config`. Open Ephys
+   intentionally skips these (Reg 3 = temp sensor / dig out via AuxCmd1/2;
+   Reg 6 = impedance DAC). AuxCmd3 would overwrite AuxCmd2's temp sensor bits.
+
+2. **Added `set_data_source()` stream→port MUX** — `WireInDataStreamSel1234`
+   (0x12) / `WireInDataStreamSel5678` (0x13) now explicitly configured.
+   Previously relied on FPGA power-on defaults.
+
+3. **Split `setMaxTimeStep` into LSB (0x01) + MSB (0x02)** — was writing full
+   32-bit to single WireIn.
+
+**FIFO / USB3:**
+
+4. `flush_fifo()` now sets USB3 throttle override bit (WireInResetRun bit 16),
+   uses 256 KB bulk reads, then smaller aligned reads, and clears override.
+
+**Parser improvements:**
+
+5. Auxiliary data (temp, VDD, aux ADC) parsed into `SampleBlock::aux_data`
+6. Board ADC (8 ch) parsed into `SampleBlock::board_adc_data`
+7. Per-sample TTL in/out tracked (`ttl_in_per_sample`, `ttl_out_per_sample`)
+8. `SampleBlock` extended with optional fields; all constructors backward-compat
+
+**New capabilities:**
+
+9. `set_cable_delay_port()` for per-port MISO delay
+10. `set_sample_rate(f64)` with all 18 Open Ephys PLL M/D pairs (1kHz–30kHz)
+11. `RhdChipType` enum for RHD2132/2216/2164 identification
+
+**Stubs added:** impedance testing, DAC threshold, LED control, external fast settle.
+
+**Build**: `cargo check -p kv-rhd` + `-p kv-gui --target x86_64-pc-windows-msvc`
+clean. All 89 tests pass (workspace minus kv-gui).
+
+**What was NOT changed (verified correct):** frame header magic validation, timestamp
+continuity, ADC conversion (offset-binary → signed), PLL M/D for 30kHz, DSP cutoff
+frequency selection, bandwidth register DAC solving, ADC calibration sequence, frame
+length formula, AuxCmd1/2 command lists.
+
+**Next steps:**
+- Hardware retest after merging PR#3
+- If `setDataSource` MUX mapping is wrong (custom bitfile may use hardcoded mapping),
+  the user can disable `set_default_data_sources()` or adjust the mapping
+- Wire `RhdChipType` detection into the scan to auto-adjust channel count
+- Implement full impedance testing (requires dedicated AuxCmd bank with DAC waveform)
+- Wire multi-sample-rate into the GUI (currently hardcoded 30kHz)
+- Fill in DAC/LED/external-fast-settle stubs when hardware is available
+
+---
+
+### Session 19: Signal quality analysis + PR#2 (5 fixes)
+
+**Goal**: Diagnose "signal too large, all noise" when using keyvast-gui with the
+XEM7310 FPGA + RHD amplifier (works fine in Open Ephys RHD plugin).
+
+**PR #2** (`devin/1781105421-fix-signal-quality` → `v2.0`):
+https://github.com/juanerdemao1999/keyvast-gui/pull/2
+
+5 fixes: chip ID validation in port scan, FIFO MSB read (0x26), register config
+Reg 3/6 (later found to be wrong — reverted in session 20), display scaling with
+0.195 µV/count, flush_fifo loop improvement.
+
+---
+
+### Session 18: RHD chip register configuration + ADC calibration (flat-signal fix)
+
+**Symptom**: With the GUI on the RHD source, the board connected, data streamed
+at the true 30 kHz (115 blk/s, 1.89 MB/s, 0 drops, no errors) — but every
+channel was flat at ~0 µV. User confirmed the same bitfile + headstage produce
+real signal in the Open Ephys RHD plugin, so the gap was purely software.
+
+**Root cause**: the backend only configured the Rhythm *data plane* (sample
+rate, streams, cable delay). It never uploaded the RHD2000 *chip* register
+configuration or ran ADC self-calibration, so the amplifiers sat
+unconfigured and the ADC emitted mid-scale (offset-binary 32768 → signed 0).
+
+**Fix** (in `kv-rhd`):
+
+- New `commands.rs` — faithful port of Intan `Rhd2000RegistersUsb3`:
+  `Rhd2000Registers` (register state + defaults + sample-rate bias), DSP-cutoff
+  selection, RH1/RH2/RL bandwidth DAC solving, `register_value` bit packing,
+  16-bit MOSI command encoding (`create_rhd2000_command`), and the three
+  128-command lists (register config w/ optional calibrate, temp sensor,
+  dig-out). Verified line-by-line against the Open Ephys source.
+- `backend.rs` — new FrontPanel endpoints (CmdRam 0x05-0x07, AuxCmdBank1/2/3
+  0x08-0x0a, AuxCmdLength/Loop 0x0b/0x0c) and `upload_command_list` /
+  `select_aux_command_bank(_all_ports)` / `select_aux_command_length`.
+  `configure()` now runs `initialize_rhd_chips()`: upload AuxCmd1 (dig-out),
+  AuxCmd2 (temp), AuxCmd3 bank0 (config+calibrate) / bank1 (config) / bank2
+  (fast-settle); select calibrate bank; non-continuous 256-step run; read &
+  discard; then switch to bank1 for normal acquisition.
+- Also fixed the per-block re-trigger: `RhdHardwareBackend` now has an
+  `acquisition_started` flag and calls `start_continuous_acquisition()` once
+  on the first `read_block`, instead of re-running SPI every block.
+
+**Build**: `cargo build -p kv-rhd` and `-p kv-gui` both clean (only the 4
+pre-existing kv-gui dead-code warnings). Mirror note: builds go through the
+Tsinghua (TUNA) crates.io mirror configured in `.cargo/config.toml`.
+
+**Status**: awaiting on-hardware retest. Expectation: a few extra seconds at
+Start (register upload + ADC calibration), then real waveforms. If still flat,
+suspect MISO/cable-delay timing or a keyvast-bitfile endpoint difference, not
+the chip config.
+
+---
+
+### Session 17: RHD backend wired into GUI Device mode
+
+**Goal**: Let the GUI acquire from the real RHD / Opal Kelly board, not only the simulator.
+
+**What changed** (all in `crates/kv-gui`):
+
+- `Cargo.toml` — added `kv-rhd` path dependency.
+- `live_pipeline.rs` — new `PipelineSource` enum (`Simulator(SimulatorConfig)` | `Rhd(Box<RhdHardwareOptions>)`). `start_live_pipeline` now takes a `PipelineSource`. `producer_loop` opens the chosen backend behind an internal `ActiveSource` adapter: the simulator keeps its sleep pacing, hardware blocks inside `read_block()` (no artificial pacing). New `RecorderEvent::SourceError(String)` reports device open/read failures back to the GUI.
+- `panels.rs` — new `DeviceKind` enum + `DeviceSettings { kind, rhd_bitfile, rhd_streams }`. DEVICE panel gains a Simulator/RHD source selector, a bitfile picker (`rfd`, `.bit` filter), and a 1/2-headstage selector; all disabled while acquiring. `default_bitfile_path()` best-effort pre-fills `keyvast_260607_with_UART.bit` if found next to the workspace (returns None otherwise — nothing hard-coded into acquisition).
+- `app.rs` — `KvApp` gains `device: DeviceSettings` + `device_error`. `start_device()` builds the source via `build_pipeline_source()` (RHD requires a bitfile, otherwise a banner error and no start). `tick_device` handles `SourceError` → banner + pipeline teardown. New red dismissible device-error banner. The old `live_pipeline.as_ref().unwrap()` in `tick_device` is now a safe `if let` (a `SourceError` can drop the pipeline mid-frame).
+
+Everything downstream (fanout buffer, recorder thread, preview channel, display rings) is unchanged — the hardware-independent boundary holds, and `ingest_block` already adapts to each block's `channel_count` / `sample_rate`.
+
+**Default behaviour preserved**: Device mode still defaults to `DeviceKind::Simulator`, so the GUI runs with no hardware and there is no regression. RHD is opt-in from the DEVICE panel.
+
+**Build status**: `cargo build -p kv-gui` compiles cleanly (debug). The only new warning introduced was a stray `RHD_MIN_STREAMS` const, since removed; the remaining 4 warnings are pre-existing dead-code fields (`demo.rs`, `panels.rs`, `preview.rs`). `cargo test --workspace` not yet run.
+
+**Network note for future sessions**: crates.io is unreachable directly from this machine (curl timeouts on download). `.cargo/config.toml` now replaces `crates-io` with the Tsinghua (TUNA) sparse mirror — `rsproxy.cn` and `mirrors.ustc.edu.cn` both timed out from here, TUNA responded in ~3.5 s. If builds start failing with download timeouts again, check/rotate that mirror.
+
+**Hardware test steps**: build, run `kv-gui`, open the DEVICE panel → Source = RHD, pick `keyvast_260607_with_UART.bit`, Headstages = 2, then press Start (or Space). Watch for either live waveforms or the red device-error banner (which surfaces FrontPanel open / board-id / FIFO errors verbatim).
+
+**Backend caveats still open (in `kv-rhd`, unchanged this session — surfaced to the user, not yet fixed)**:
+
+- No RHD chip register / SPI command upload. The backend assumes the keyvast MicroBlaze firmware configures the RHD chips. UNVERIFIED — if amplifiers output nothing or garbage, this is the first suspect.
+- `read_raw_block` re-triggers `SPI_START` every block in continuous run mode (the CLI `rhd-smoke` does the same), which is suspect vs standard Rhythm semantics.
+- Synchronous poll read (`wait_for_fifo_words`, 1 s timeout); a non-blocking / continuous read may be needed if 30 kHz can't keep up.
+
+**Next**: compile + smoke-test on the hardware machine; if data is wrong, investigate the two backend caveats above.
+
+---
+
+### Session 16: RHD / Opal Kelly hardware discovery
+
+**Goal**: Understand how to connect the Keyvast GUI to the new bitfile and Open Ephys-compatible RHD acquisition path.
+
+**External reference downloaded**:
+
+```text
+D:\11111\1case\104_keyvast_gui\external\rhd-recording-controller
+```
+
+This repository contains the Open Ephys RHD Recording Controller plugin and the useful Intan Rhythm USB3 API files:
+
+```text
+Source/rhythm-api/rhd2000evalboardusb3.*
+Source/rhythm-api/rhd2000datablockusb3.*
+Source/rhythm-api/rhd2000registersusb3.*
+Source/rhythm-api/okFrontPanelDLL.h
+Resources/okFrontPanel.dll
+Resources/intan_rec_controller_7310.bit
+```
+
+**User-confirmed hardware decisions**:
+
+```text
+Opal Kelly board: XEM7310-A75
+Keyvast bitfile to use: D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit
+Windows package should bundle the FrontPanel runtime DLL where possible
+First live acquisition target: up to two 32-channel RHD headstages
+Display scaling should follow Open Ephys / Intan RHD conventions
+```
+
+**Important findings**:
+
+- `keyvast_top.sv` combines the Intan Rhythm data plane with the MicroBlaze control plane.
+- The Rhythm data plane uses FrontPanel endpoints matching the Intan/Open Ephys USB3 path.
+- Expected endpoint highlights: WireIn `0x00` reset/run, WireIn `0x03` sample clock M/D, WireIn `0x14` data stream enable, WireOut `0x20` FIFO words, WireOut `0x22` SPI running, WireOut `0x23` TTL in, WireOut `0x3e` board id, WireOut `0x3f` board version, BTPipeOut `0xA0` data.
+- Expected data frame magic: `0xd7a22aaa38132a53`.
+- Open Ephys converts amplifier words for display as `(uint16 - 32768) * 0.195`, i.e. unsigned offset-binary ADC words to microvolts. Preserve raw samples in recording unless changed later.
+
+**Recommended next implementation boundary**:
+
+Add a real hardware backend crate such as `kv-driver` or `kv-rhd` that implements the existing `kv-core::AcquisitionSource` contract and returns `SampleBlock`. Start with a CLI smoke command before wiring the GUI:
+
+```text
+kv-acq rhd-smoke --bitfile D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit --blocks 10
+```
+
+The smoke command should open the first XEM7310-A75, upload the bitfile, verify FrontPanel + board id, initialize Rhythm, enable streams for the first two 32-channel headstages, read from BTPipeOut `0xA0`, validate magic/timestamps, and write existing `kvraw` output.
+
+---
 
 ### Session 15: Multi-view tile display — planning complete, implementation starting
 
@@ -405,8 +952,47 @@ Implemented:
   - `BenchmarkSummary.cpu_percent_avg` and `memory_mb_max` populated during benchmark runs
   - `windows-sys` v0.59 added as a `cfg(windows)` dependency in kv-core
 
+### Session 17: RHD / Opal Kelly Bring-Up Start
+
+Implemented first RHD hardware integration layer:
+
+- New crate: `crates/kv-rhd`
+  - Rhythm USB3 constants and block-size helpers
+  - Rhythm raw USB frame parser into existing `SampleBlock`
+  - RHD offset-binary ADC conversion: `u16 - 32768` into signed `i16`
+  - Display scale helper: `0.195 uV/count`, matching Open Ephys / Intan RHD convention
+  - Windows FrontPanel runtime loader using bundled `okFrontPanel.dll`
+  - RHD command RAM generation for AuxCmd1/AuxCmd2/AuxCmd3
+  - FrontPanel board path: configure bitfile, verify board id 700, set 30 kHz data clock, set MISO delay, enable 1-2 streams, upload command RAM, run ADC calibration, then read BTPipeOut `0xA0`
+
+- New bundled runtime asset:
+  - `third_party/opalkelly/windows-x64/okFrontPanel.dll`
+  - Copied from downloaded Open Ephys RHD plugin resources for local packaging convenience.
+
+- New CLI command:
+  - `kv-acq rhd-smoke`
+  - Hardware mode: downloads `D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit` by default and reads Rhythm USB blocks.
+  - Offline mode: `kv-acq rhd-smoke --raw-input capture.bin` parses raw Rhythm USB bytes and writes normal `recording.kvraw`, `integrity.json`, `events.csv`, `log.txt`, and `benchmark.json`.
+
+- Build/network follow-up:
+  - `kv-gui` now disables `eframe` default features and uses the `glow` renderer only, avoiding the unnecessary `egui-wgpu` dependency for the current Windows GUI.
+  - `.cargo/config.toml` and `gui.bat` now set sparse registry protocol plus longer Cargo HTTP retry/timeout settings for slow crates.io downloads.
+
+Current limitations:
+
+- Not yet verified on a live XEM7310-A75 in this environment.
+- Physical channel ordering still needs confirmation against the actual two-headstage wiring.
+- The first implementation assumes Rhythm default stream mapping: stream 0 then stream 1, each with 32 channels.
+
+Why Open Ephys does more setup:
+
+- The bitfile exposes the USB data transport, FIFO, timing, and SPI scheduler.
+- The RHD headstage chips still need register writes over SPI for bandwidth, DSP offset removal, amplifier power-up, aux inputs, fast settle, and ADC calibration.
+- Open Ephys therefore uploads command lists into FPGA command RAM, selects command banks per SPI port, runs a short non-continuous calibration pass, then switches to the no-calibration bank for normal acquisition.
+
 Not yet implemented:
 
+- Live-board validation and final physical channel-map confirmation
 - `kv-daemon`
 
 ## Current Defaults In Use
@@ -426,7 +1012,27 @@ These are recommended defaults from `docs/14-open-questions.md`; they are not fi
 
 ## Last Verification
 
-Last verified: 2026-05-27 (session 14)
+Last verified: 2026-06-08 (session 17 partial, Rust toolchain unavailable)
+
+Verification attempted:
+
+```powershell
+cargo test -p kv-rhd
+cargo test -p kv-cli rhd_smoke_raw_input_writes_rhd_backend_metadata
+cmd /c where cargo
+cmd /c where rustc
+```
+
+Result:
+
+```text
+cargo and rustc were not found in the current PowerShell PATH.
+Common install locations such as %USERPROFILE%\.cargo\bin and C:\Program Files were also checked without finding cargo.exe.
+```
+
+The RHD code, command RAM initialization, CLI path, and offline raw-input smoke test were added, but Rust tests could not be executed in this environment until the Rust toolchain is installed or available on PATH.
+
+Previous full benchmark verification: 2026-05-27 (session 14)
 
 Commands run successfully:
 
@@ -493,10 +1099,11 @@ kv-integrity -> checks SampleBlock continuity and sample counts (batch or increm
 kv-recorder -> writes validated SampleBlock data to kvraw plus metadata (batch or streaming)
 kv-core -> orchestrates acquisition: run_fixed_blocks, run_threaded_pipeline, or run_streaming_pipeline
 kv-buffer -> bounded FIFO + fan-out buffering with per-consumer overflow counters
-kv-cli -> thin developer commands: simulator-record, simulator-pipeline, simulator-stream, benchmark
+kv-rhd -> Rhythm USB3 parser + Opal Kelly FrontPanel hardware smoke backend
+kv-cli -> thin developer commands: simulator-record, simulator-pipeline, simulator-stream, benchmark, rhd-smoke
 ```
 
-Do not add real FPGA packet format, USB details, CRC algorithm, ADC conversion, or channel mapping yet.
+Keep real hardware details behind `kv-rhd` / backend boundaries. Do not let GUI panels parse FrontPanel packets directly.
 
 ## Open Decisions To Ask Eventually
 
@@ -507,6 +1114,34 @@ These do not block the next core step:
 3. Whether TTL should remain `SampleBlock.ttl_bits` plus timestamped events.
 4. Recorder buffer defaults: 5 seconds for recorder, 1 second for GUI preview.
 5. Recording folder format: `run-YYYYMMDD-HHMMSS`.
+
+### Session: Phase 2 — display features (Roll mode, channel colors, FFT, channel mapping)
+
+**Date**: 2026-06-10
+**Branch**: `devin/1781113191-phase2-display-features` (base: `v2.0`)
+
+**What changed**:
+
+1. **Roll mode display** (`panels.rs`, `app.rs`) — `DisplayMode::Sweep | Roll` enum. In Roll mode, `sweep_start_ms = (latest_ms - window_ms).max(0.0)` every frame. Sweep cursor only drawn in Sweep mode. UI toggle in DISPLAY panel.
+
+2. **Channel colors/grouping** (`panels.rs`, `waveform.rs`) — `CHANNEL_GROUP_COLORS` 8-color palette. `channel_color()` cycles colors based on `channels_per_group`. Waveform renderer uses group color when `color_by_group` enabled.
+
+3. **FFT spectrum analysis** (`fft_panel.rs` — new) — `FftState` with configurable FFT size (256–4096), frequency range, log scale. Hand-written radix-2 Cooley-Tukey FFT. PSD computed from `DisplayRing::last_n_samples()`. Plot with 50/60 Hz markers. Available as sidebar section + tile view.
+
+4. **Channel mapping/sorting** (`channel_map.rs` — new) — `ChannelMapPreset::Natural|Reverse|EvenOdd|Custom`. `display_to_physical()` mapping. Custom comma-separated input with validation. Sidebar UI.
+
+5. **Tile system extended** (`multiview.rs`) — `TileKind::FftSpectrum` variant. FFT tile in "+ Add View" menu. `KvTileBehavior` carries `fft: &FftState`.
+
+6. **DisplayRing extension** (`disp_ring.rs`) — `last_n_samples(ch, n)` extracts recent samples as i16 for FFT.
+
+**Verification**:
+- `cargo check -p kv-rhd` — pass
+- `cargo check -p kv-gui --target x86_64-pc-windows-msvc` — pass (24 warnings, all pre-existing dead-code)
+- `cargo test --workspace --exclude kv-gui` — 85 tests pass (includes 2 FFT tests + 6 channel map tests)
+
+**Next steps**:
+- Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
+- Hardware testing of all Phase 2 features on Windows with XEM7310
 
 ## Notes For Future Agents
 

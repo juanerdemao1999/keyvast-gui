@@ -21,21 +21,39 @@ use std::collections::VecDeque;
 use std::time::Instant;
 
 use eframe::egui;
+use kv_rhd::RhdHardwareOptions;
 use kv_simulator::SimulatorConfig;
 use kv_types::SampleBlock;
 
 use kv_recorder::StreamingRecorder;
 
+use crate::channel_map::{self, ChannelMapState};
+use crate::channel_select::{self, ChannelSelectState};
+use crate::config_persist::{self, ConfigPersistState, PersistentConfig};
 use crate::demo::DemoPreview;
 use crate::disp_ring::DisplayRing;
 use crate::dsp::{Biquad, FilterChain, Q_BUTTERWORTH, Q_NOTCH};
-use crate::live_pipeline::{self, LivePipelineHandle, RecorderCmd, RecorderEvent};
+use crate::fft_panel::{self, FftState};
+use crate::impedance_panel::{self, ImpedanceMsg, ImpedanceState};
+use crate::live_pipeline::{self, LivePipelineHandle, PipelineSource, RecorderCmd, RecorderEvent};
 use crate::multiview::{self, AddViewRequest, KvTileBehavior, TileKind};
-use crate::spike_overlay::SpikeSnippetStore;
-use crate::panels::{self, DisplaySettings, FilterSettings, RecordingSettings, RecordingState};
+use crate::panels::{
+    self, DeviceKind, DeviceSettings, DisplaySettings, FilterSettings, RecordingSettings,
+    RecordingState,
+};
+use crate::playback::{self, PlaybackManager};
 use crate::preview::{BlockStats, compute_block_stats};
+use crate::remote_api::{
+    self, AppStatus, RemoteApiHandle, RemoteApiState, RemoteCommand, RemoteResponse,
+};
+use crate::spike_overlay::SpikeSnippetStore;
 use crate::theme;
+use crate::toast::Toasts;
+use crate::trigger::{self, TriggerAction, TriggerConfig};
 
+/// How long filter settings must stay unchanged before the full history
+/// is re-filtered (lets slider drags settle first).
+const REFILTER_DEBOUNCE_MS: u64 = 150;
 
 // ── Acquisition mode ────────────────────────────────────────────────
 
@@ -45,11 +63,49 @@ pub enum AcqMode {
     Device,
 }
 
+// ── Data source (B1) ────────────────────────────────────────────────
+
+/// The single, top-level data source the display is currently bound to.
+///
+/// Exactly one source feeds the waveform at a time, so the user always knows
+/// where the on-screen signal comes from:
+///   - `Demo`     — synthetic neural generator (no hardware).
+///   - `Device`   — live acquisition (simulator or RHD backend).
+///   - `Playback` — an offline `.kvraw` recording.
+///
+/// `Demo`/`Device` correspond to the live [`AcqMode`]; `Playback` drives the
+/// [`PlaybackManager`] instead.  Live acquisition and playback are mutually
+/// exclusive — selecting one stops the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataSource {
+    Demo,
+    Device,
+    Playback,
+}
+
 // ── Application state ───────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Acquire,
+    Display,
+    Tools,
+}
+
 pub struct KvApp {
+    // Sidebar
+    sidebar_tab: SidebarTab,
     // Mode
     mode: AcqMode,
+    /// Top-level data source (Demo / Device / Playback). Drives which source
+    /// feeds the display and enforces live-vs-playback mutual exclusion.
+    data_source: DataSource,
+    /// Whether the keyboard-shortcut help overlay is shown.
+    show_help: bool,
+    /// Transient toast notifications (top-right stack).
+    toasts: Toasts,
+    /// One-shot guard so the first-run welcome hint (B7) only fires once.
+    welcomed: bool,
     // Demo
     demo: DemoPreview,
     demo_started: bool,
@@ -58,9 +114,16 @@ pub struct KvApp {
     demo_start_time: Instant,
     // Device (live pipeline: producer thread + recorder thread + preview channel)
     live_pipeline: Option<LivePipelineHandle>,
+    /// User-selected acquisition source (simulator or RHD hardware) + config.
+    device: DeviceSettings,
+    /// Latest acquisition-source error (device open / read failure).
+    /// Surfaced as a dismissible banner; does not interrupt the GUI.
+    device_error: Option<String>,
     // Shared view state
     block_history: VecDeque<SampleBlock>,
-    /// Pre-filtered version of block_history (kept in sync).
+    /// Pre-filtered version of block_history. Only populated while a user
+    /// filter (or CAR) is active — empty otherwise to avoid duplicating
+    /// block_history in memory.
     filtered_history: VecDeque<SampleBlock>,
     history_capacity: usize,
     latest_block: Option<SampleBlock>,
@@ -71,6 +134,12 @@ pub struct KvApp {
     /// The settings that `filter_chains` was built with.  When the user
     /// changes filter parameters we detect the mismatch and rebuild.
     filter_settings_snapshot: FilterSettings,
+    /// Instant of the most recent (still unapplied) filter-settings change.
+    /// Re-filtering the full history is debounced behind this so dragging a
+    /// cutoff slider doesn't re-filter 10k blocks every frame.
+    filter_change_pending_since: Option<Instant>,
+    /// Filter settings as of the previous frame (debounce change detection).
+    filters_last_frame: FilterSettings,
     /// Pre-computed display ring buffer — user-configured filter (main tile).
     disp_ring: DisplayRing,
     /// Fixed LP 250 Hz ring for the LFP tile.
@@ -116,20 +185,65 @@ pub struct KvApp {
     last_frame: Instant,
     frame_ms_ema: f64,
     render_ms_ema: f64,
+    // Phase 1 features
+    impedance: ImpedanceState,
+    /// Receiver for progress/results from a background impedance thread.
+    impedance_rx: Option<std::sync::mpsc::Receiver<ImpedanceMsg>>,
+    playback_mgr: PlaybackManager,
+    // Phase 2 features
+    fft: FftState,
+    channel_map: ChannelMapState,
+    // Phase 3 features
+    trigger: TriggerConfig,
+    remote_api_state: RemoteApiState,
+    remote_api_handle: Option<RemoteApiHandle>,
+    /// Export format (for recording panel UI)
+    export_format: kv_recorder::export_formats::ExportFormat,
+    /// Receiver for the result of a background .kvraw export.
+    export_rx: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
+    /// Outcome of the last export (output path or error message).
+    export_status: Option<String>,
+    /// Channel subset captured when a Demo-mode recording starts.
+    record_channels: Option<Vec<usize>>,
+    // Phase 4 features
+    channel_select: ChannelSelectState,
+    config_persist: ConfigPersistState,
+    /// Global UI scale (pixels-per-point multiplier), persisted (#17).
+    ui_scale: f32,
+    /// Set once after the first frame restores the saved window size (#15).
+    window_restored: bool,
 }
 
 impl KvApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let now = Instant::now();
         let filters = FilterSettings::default();
-        Self {
+
+        // Restore persisted settings at startup (#15/#17).  Missing or invalid
+        // files fall back to defaults, so this never blocks launch.
+        let saved = config_persist::load_or_default();
+        let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let start_source = match saved.last_source.as_str() {
+            "device" => DataSource::Device,
+            "playback" => DataSource::Playback,
+            _ => DataSource::Demo,
+        };
+
+        let mut app = Self {
+            sidebar_tab: SidebarTab::Acquire,
             mode: AcqMode::Demo,
+            data_source: start_source,
+            show_help: false,
+            toasts: Toasts::default(),
+            welcomed: false,
             demo: DemoPreview::default_neural(),
             demo_started: false,
             demo_last_tick: now,
             demo_blocks_generated: 0,
             demo_start_time: now,
             live_pipeline: None,
+            device: DeviceSettings::default(),
+            device_error: None,
             // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
             block_history: VecDeque::with_capacity(10_000),
             filtered_history: VecDeque::with_capacity(10_000),
@@ -138,6 +252,8 @@ impl KvApp {
             latest_stats: None,
             filter_chains: Vec::new(),
             filter_settings_snapshot: filters,
+            filter_change_pending_since: None,
+            filters_last_frame: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
             disp_ring_ap: DisplayRing::new(16, 30_000.0),
@@ -160,12 +276,66 @@ impl KvApp {
             last_frame: now,
             frame_ms_ema: 16.7,
             render_ms_ema: 0.0,
+            impedance: ImpedanceState::default(),
+            impedance_rx: None,
+            playback_mgr: PlaybackManager::default(),
+            fft: FftState::default(),
+            channel_map: ChannelMapState::default(),
+            trigger: TriggerConfig::default(),
+            remote_api_state: RemoteApiState::default(),
+            remote_api_handle: None,
+            export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            export_rx: None,
+            export_status: None,
+            record_channels: None,
+            channel_select: ChannelSelectState::default(),
+            config_persist: ConfigPersistState::default(),
+            ui_scale,
+            window_restored: false,
+        };
+
+        // Apply the persisted display/filter/recording settings to live state.
+        saved.apply_to(
+            &mut app.display,
+            &mut app.filters,
+            &mut app.recording.output_dir,
+            &mut app.recording.file_prefix,
+            &mut app.remote_api_state.port,
+        );
+        app.filter_settings_snapshot = app.filters;
+        app.filters_last_frame = app.filters;
+        app.config_persist.loaded = true;
+
+        app
+    }
+
+    /// Snapshot the current settings (including UI scale, window size and the
+    /// active source) into a [`PersistentConfig`] for saving (#15/#17).
+    fn capture_persistent(&self, ctx: &egui::Context) -> PersistentConfig {
+        let mut cfg = PersistentConfig::capture_from(
+            &self.display,
+            &self.filters,
+            &self.recording.output_dir,
+            &self.recording.file_prefix,
+            self.remote_api_state.port,
+        );
+        cfg.ui_scale = self.ui_scale;
+        let size = ctx.screen_rect().size();
+        cfg.window_width = size.x;
+        cfg.window_height = size.y;
+        cfg.last_source = match self.data_source {
+            DataSource::Demo => "demo",
+            DataSource::Device => "device",
+            DataSource::Playback => "playback",
         }
+        .to_string();
+        cfg
     }
 
     /// Switch to Demo mode and start generating.
     fn start_demo(&mut self) {
         self.mode = AcqMode::Demo;
+        self.data_source = DataSource::Demo;
         self.demo = DemoPreview::default_neural();
         self.demo_started = true;
         self.demo_last_tick = Instant::now();
@@ -179,7 +349,8 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
-        self.snippet_store.reconfigure(16, 30_000.0);
+        self.snippet_store
+            .reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
@@ -188,8 +359,13 @@ impl KvApp {
     }
 
     /// Switch to Device mode: start the live pipeline (producer + recorder threads).
+    ///
+    /// The producer backend is chosen from `self.device` (simulator or RHD).
+    /// If the RHD source is selected without a bitfile, no pipeline is started
+    /// and a device error is recorded for the banner instead.
     fn start_device(&mut self) {
         self.mode = AcqMode::Device;
+        self.data_source = DataSource::Device;
         self.demo_started = false;
         self.block_history.clear();
         self.filtered_history.clear();
@@ -199,12 +375,38 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
-        self.snippet_store.reconfigure(16, 30_000.0);
+        // snippet_store will be reconfigured lazily on the first ingest_block()
+        // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
         self.latest_block = None;
         self.latest_stats = None;
-        let config = SimulatorConfig::default();
-        self.live_pipeline = Some(live_pipeline::start_live_pipeline(config));
+
+        match self.build_pipeline_source() {
+            Ok(source) => {
+                self.device_error = None;
+                self.live_pipeline = Some(live_pipeline::start_live_pipeline(source));
+            }
+            Err(message) => {
+                self.device_error = Some(message);
+                self.live_pipeline = None;
+            }
+        }
+    }
+
+    /// Build the live-pipeline data source from the current device settings.
+    /// Returns an error message (for the banner) when the selection is
+    /// incomplete, e.g. RHD chosen without a bitfile.
+    fn build_pipeline_source(&self) -> Result<PipelineSource, String> {
+        match self.device.kind {
+            DeviceKind::Simulator => Ok(PipelineSource::Simulator(SimulatorConfig::default())),
+            DeviceKind::Rhd => {
+                let bitfile = self.device.rhd_bitfile.clone().ok_or_else(|| {
+                    "Select an FPGA bitfile before starting RHD acquisition.".to_string()
+                })?;
+                let options = RhdHardwareOptions::new(bitfile, self.device.rhd_streams);
+                Ok(PipelineSource::Rhd(Box::new(options)))
+            }
+        }
     }
 
     fn stop_all(&mut self) {
@@ -214,14 +416,17 @@ impl KvApp {
                 AcqMode::Demo => {
                     if let Some(rec) = self.active_recorder.take() {
                         match rec.finish() {
-                            Ok(summary) => eprintln!(
-                                "[recorder] Auto-stopped: {} blocks saved → {}",
+                            Ok(summary) => log::info!(
+                                "Auto-stopped: {} blocks saved → {}",
                                 summary.recording.block_count,
                                 summary.recording.raw_path.display()
                             ),
-                            Err(e) => eprintln!("[recorder] Auto-stop finish error: {e}"),
+                            Err(e) => {
+                                self.recording_error = Some(format!("Auto-stop finish error: {e}"));
+                            }
                         }
                     }
+                    self.record_channels = None;
                 }
                 AcqMode::Device => {
                     // Recorder thread will finalize on Terminate (sent by pipeline stop below)
@@ -262,25 +467,35 @@ impl KvApp {
             .collect()
     }
 
+    /// Build a fresh Vec of filter chains from the current FilterSettings.
+    fn build_filter_chains(
+        filters: &FilterSettings,
+        sample_rate: f64,
+        channel_count: usize,
+    ) -> Vec<FilterChain> {
+        (0..channel_count)
+            .map(|_| {
+                let mut chain = FilterChain::passthrough();
+                if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
+                    chain.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                    chain.hp_enabled = true;
+                }
+                if filters.lp_enabled && filters.lp_cutoff_hz < sample_rate / 2.0 {
+                    chain.lp = Biquad::lowpass(filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
+                    chain.lp_enabled = true;
+                }
+                if filters.notch_enabled {
+                    chain.notch = Biquad::notch(filters.notch_freq_hz(), sample_rate, Q_NOTCH);
+                    chain.notch_enabled = true;
+                }
+                chain
+            })
+            .collect()
+    }
+
     /// Rebuild filter chains from the current FilterSettings.
     fn rebuild_filter_chains(&mut self, sample_rate: f64, channel_count: usize) {
-        self.filter_chains.clear();
-        for _ in 0..channel_count {
-            let mut chain = FilterChain::passthrough();
-            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
-                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.hp_enabled = true;
-            }
-            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
-                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.lp_enabled = true;
-            }
-            if self.filters.notch_enabled {
-                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-                chain.notch_enabled = true;
-            }
-            self.filter_chains.push(chain);
-        }
+        self.filter_chains = Self::build_filter_chains(&self.filters, sample_rate, channel_count);
         self.filter_settings_snapshot = self.filters;
         // Re-filter existing history with new chains
         self.refilter_history();
@@ -290,29 +505,24 @@ impl KvApp {
     fn refilter_history(&mut self) {
         self.filtered_history.clear();
         // Rebuild chains fresh for the re-filter pass
-        let sample_rate = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
-        let channel_count = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-        let mut chains: Vec<FilterChain> = Vec::with_capacity(channel_count);
-        for _ in 0..channel_count {
-            let mut chain = FilterChain::passthrough();
-            if self.filters.hp_enabled && self.filters.hp_cutoff_hz > 0.0 {
-                chain.hp = Biquad::highpass(self.filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.hp_enabled = true;
+        let sample_rate = self
+            .latest_block
+            .as_ref()
+            .map(|b| b.sample_rate)
+            .unwrap_or(30000.0);
+        let channel_count = self
+            .latest_block
+            .as_ref()
+            .map(|b| b.channel_count)
+            .unwrap_or(16);
+        let mut chains = Self::build_filter_chains(&self.filters, sample_rate, channel_count);
+        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
+        if needs_filter {
+            let car_enabled = self.filters.car_enabled;
+            for block in self.block_history.iter() {
+                let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
+                self.filtered_history.push_back(filtered);
             }
-            if self.filters.lp_enabled && self.filters.lp_cutoff_hz < sample_rate / 2.0 {
-                chain.lp = Biquad::lowpass(self.filters.lp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
-                chain.lp_enabled = true;
-            }
-            if self.filters.notch_enabled {
-                chain.notch = Biquad::notch(self.filters.notch_freq_hz(), sample_rate, Q_NOTCH);
-                chain.notch_enabled = true;
-            }
-            chains.push(chain);
-        }
-        let car_enabled = self.filters.car_enabled;
-        for block in self.block_history.iter() {
-            let filtered = Self::filter_block_with_chains(block, &mut chains, car_enabled);
-            self.filtered_history.push_back(filtered);
         }
         // Keep persistent chains in sync (their state now reflects all history)
         self.filter_chains = chains;
@@ -325,7 +535,6 @@ impl KvApp {
         } else {
             self.disp_ring.reset();
         }
-        let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
         let source = if needs_filter {
             &self.filtered_history
         } else {
@@ -380,8 +589,10 @@ impl KvApp {
         let ch_count = block.channel_count;
         let sample_rate = block.sample_rate;
 
-        // Detect filter settings change → rebuild chains
-        if self.filters != self.filter_settings_snapshot || self.filter_chains.len() != ch_count {
+        // Rebuild chains on channel-count change. Filter-settings changes are
+        // handled (debounced) in update() so slider drags don't re-filter the
+        // full history every frame.
+        if self.filter_chains.len() != ch_count {
             self.rebuild_filter_chains(sample_rate, ch_count);
         }
 
@@ -394,7 +605,7 @@ impl KvApp {
             self.disp_ring_ap.reconfigure(ch_count, sample_rate);
             // Rebuild fixed chains to match new channel count / sample rate.
             self.filter_chains_lfp = Self::build_lfp_chains(ch_count, sample_rate);
-            self.filter_chains_ap  = Self::build_ap_chains(ch_count, sample_rate);
+            self.filter_chains_ap = Self::build_ap_chains(ch_count, sample_rate);
         } else {
             // Lazy-initialise fixed chains on first block.
             if self.filter_chains_lfp.len() != ch_count {
@@ -408,56 +619,135 @@ impl KvApp {
         // Produce filtered version using persistent chains
         let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
         let filtered = if needs_filter {
-            Self::filter_block_with_chains(&block, &mut self.filter_chains, self.filters.car_enabled)
+            Some(Self::filter_block_with_chains(
+                &block,
+                &mut self.filter_chains,
+                self.filters.car_enabled,
+            ))
         } else {
-            block.clone()
+            None
         };
 
         // Feed main display ring from the display-ready (filtered or raw) block.
-        self.disp_ring.push_block(if needs_filter { &filtered } else { &block });
+        self.disp_ring
+            .push_block(filtered.as_ref().unwrap_or(&block));
 
-        // Feed fixed-filter rings (always incremental, never CAR).
-        let lfp_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
-        self.disp_ring_lfp.push_block(&lfp_block);
-
-        let ap_block = Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
-        self.disp_ring_ap.push_block(&ap_block);
-
-        // Feed AP-filtered block to the spike snippet detector.
-        if self.snippet_store.channel_count() != ch_count {
-            self.snippet_store.reconfigure(ch_count, sample_rate);
+        // Feed fixed-filter rings (always incremental, never CAR) — but only
+        // when a tile actually consumes them, so the default single-tile
+        // layout pays for one filter pass instead of three.
+        if self.lfp_tile_open() {
+            let lfp_block =
+                Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
+            self.disp_ring_lfp.push_block(&lfp_block);
         }
-        self.snippet_store.process_block(&ap_block);
 
-        // Feed raw block to the streaming recorder — Demo mode only.
+        // The AP band feeds both the AP tile and the spike snippet detector.
+        if self.ap_band_needed() {
+            let ap_block =
+                Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
+            self.disp_ring_ap.push_block(&ap_block);
+
+            if self.snippet_store.channel_count() != ch_count {
+                self.snippet_store.reconfigure(ch_count, sample_rate);
+            }
+            self.snippet_store.process_block(&ap_block);
+        }
+
+        // Phase 3: Process trigger/gate logic
+        let trigger_action = self.trigger.process_block(&block);
+        match trigger_action {
+            TriggerAction::StartRecording => {
+                if self.recording.state != RecordingState::Recording {
+                    self.begin_recording();
+                }
+            }
+            TriggerAction::StopRecording => {
+                if self.recording.state == RecordingState::Recording {
+                    self.stop_recording();
+                }
+            }
+            TriggerAction::None => {}
+        }
+
+        // Feed the block to the streaming recorder — Demo mode only.
         // Device mode recording is handled by the recorder thread in live_pipeline.
-        if self.mode == AcqMode::Demo && self.recording.state == RecordingState::Recording {
-            if let Some(ref mut rec) = self.active_recorder {
-                match rec.write_block(&block) {
-                    Ok(()) => {
-                        self.recording.recorded_blocks =
-                            self.recording.recorded_blocks.saturating_add(1);
-                        self.recording.recorded_bytes = self
-                            .recording
-                            .recorded_bytes
-                            .saturating_add(block.data.len() as u64 * 2);
-                    }
-                    Err(e) => {
-                        eprintln!("[recorder] write_block error: {e}");
-                    }
+        let mut demo_write_failed = false;
+        if self.mode == AcqMode::Demo
+            && self.recording.state == RecordingState::Recording
+            && let Some(ref mut rec) = self.active_recorder
+        {
+            let (write_result, written_values) = match self.record_channels {
+                Some(ref indices) => {
+                    let filtered = channel_select::filter_block_channels(&block, indices);
+                    let len = filtered.data.len() as u64;
+                    (rec.write_block(&filtered), len)
+                }
+                None => (rec.write_block(&block), block.data.len() as u64),
+            };
+            match write_result {
+                Ok(()) => {
+                    self.recording.recorded_blocks =
+                        self.recording.recorded_blocks.saturating_add(1);
+                    self.recording.recorded_bytes = self
+                        .recording
+                        .recorded_bytes
+                        .saturating_add(written_values * 2);
+                }
+                Err(e) => {
+                    // A failed write means the file can no longer be
+                    // trusted — stop instead of writing into a possibly
+                    // corrupt recording.
+                    self.recording_error = Some(format!(
+                        "Recording write failed: {e} — recording stopped; file may be incomplete"
+                    ));
+                    log::error!("recording write failed, stopping: {e}");
+                    demo_write_failed = true;
                 }
             }
         }
-
-        // Store raw + filtered history for pause/browse and re-filter
-        self.block_history.push_back(block.clone());
-        self.filtered_history.push_back(filtered);
-        while self.block_history.len() > self.history_capacity {
-            self.block_history.pop_front();
-            self.filtered_history.pop_front();
+        if demo_write_failed {
+            self.stop_recording();
         }
 
-        self.latest_block = Some(block);
+        // Store raw + filtered history for pause/browse and re-filter.
+        // filtered_history stays empty while no user filter is active — the
+        // raw history serves both roles in that case.
+        if let Some(filtered_block) = filtered {
+            self.filtered_history.push_back(filtered_block);
+        }
+        self.latest_block = Some(block.clone());
+        self.block_history.push_back(block);
+        while self.block_history.len() > self.history_capacity {
+            self.block_history.pop_front();
+        }
+        while self.filtered_history.len() > self.history_capacity {
+            self.filtered_history.pop_front();
+        }
+    }
+
+    /// True when an LFP tile exists in the layout.
+    fn lfp_tile_open(&self) -> bool {
+        self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
+    }
+
+    /// True when the AP band must be computed: an AP tile or a spike-overlay
+    /// tile (which consumes the snippet detector) exists in the layout.
+    fn ap_band_needed(&self) -> bool {
+        self.tile_has_pane(|kind| {
+            matches!(
+                kind,
+                TileKind::ApView { .. } | TileKind::SpikeOverlay { .. }
+            )
+        })
+    }
+
+    fn tile_has_pane(&self, pred: impl Fn(&TileKind) -> bool) -> bool {
+        self.tile_tree.as_ref().is_some_and(|tree| {
+            tree.tiles.tiles().any(|tile| match tile {
+                egui_tiles::Tile::Pane(kind) => pred(kind),
+                egui_tiles::Tile::Container(_) => false,
+            })
+        })
     }
 
     fn is_running(&self) -> bool {
@@ -474,6 +764,55 @@ impl KvApp {
             match self.mode {
                 AcqMode::Demo => self.start_demo(),
                 AcqMode::Device => self.start_device(),
+            }
+        }
+    }
+
+    /// Switch the top-level data source (B1).  Live acquisition and playback
+    /// are mutually exclusive: choosing `Playback` stops any running
+    /// acquisition (finalizing a recording first), and choosing `Demo`/`Device`
+    /// leaves playback paused in the background.
+    fn select_source(&mut self, src: DataSource) {
+        if self.data_source == src {
+            return;
+        }
+        match src {
+            DataSource::Demo => self.start_demo(),
+            DataSource::Device => self.start_device(),
+            DataSource::Playback => {
+                self.stop_all();
+                self.data_source = DataSource::Playback;
+                self.latest_block = None;
+                self.latest_stats = None;
+            }
+        }
+    }
+
+    /// Prompt for a `.kvraw` file, load it, and switch to Playback source.
+    /// Stops any live acquisition first so the two never feed the display at
+    /// once.  Surfaces success / failure via a toast.
+    fn open_playback_file_dialog(&mut self) {
+        let Some(path) = playback::pick_kvraw_file() else {
+            return;
+        };
+        self.stop_all();
+        self.playback_mgr.load_file(path);
+        self.data_source = DataSource::Playback;
+        self.latest_block = None;
+        self.latest_stats = None;
+        match self.playback_mgr.error.clone() {
+            Some(e) => self.toasts.error(format!("Open failed: {e}")),
+            None => {
+                self.playback_mgr.play();
+                let name = self
+                    .playback_mgr
+                    .file_path
+                    .as_ref()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("recording")
+                    .to_string();
+                self.toasts.success(format!("Loaded {name}"));
             }
         }
     }
@@ -496,70 +835,314 @@ impl KvApp {
             RecordingState::Idle => {
                 if self.is_running() {
                     self.recording.state = RecordingState::Armed;
+                } else {
+                    self.toasts.warning("Start acquisition before recording");
                 }
             }
-            RecordingState::Armed => match self.mode {
-                AcqMode::Device => {
-                    // Device mode: tell the recorder thread to open the file.
-                    if let Some(ref pipeline) = self.live_pipeline {
-                        let path: std::path::PathBuf = self.recording.output_dir.clone().into();
-                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start(path));
-                        self.recording.state = RecordingState::Recording;
-                        self.recording.recorded_blocks = 0;
-                        self.recording.recorded_bytes = 0;
-                        self.recording_start_time = Some(Instant::now());
-                        self.recording_error = None;
-                    }
+            RecordingState::Armed => self.begin_recording(),
+            RecordingState::Recording => self.stop_recording(),
+        }
+    }
+
+    /// Start recording (used by the Armed → Recording transition, triggers,
+    /// and the remote API). Captures the channel selection at start so a
+    /// mid-recording selection change cannot change the file's layout.
+    fn begin_recording(&mut self) {
+        let channels = self.channel_select.recording_selection();
+        match self.mode {
+            AcqMode::Device => {
+                if let Some(ref pipeline) = self.live_pipeline {
+                    let path: std::path::PathBuf = self.recording.output_dir.clone().into();
+                    let _ = pipeline
+                        .recorder_cmd_tx
+                        .send(RecorderCmd::Start { path, channels });
+                    self.recording.state = RecordingState::Recording;
+                    self.recording.recorded_blocks = 0;
+                    self.recording.recorded_bytes = 0;
+                    self.recording_start_time = Some(Instant::now());
+                    self.recording_error = None;
+                    self.toasts.info("Recording started");
                 }
-                AcqMode::Demo => {
-                    // Demo mode: open recorder in GUI thread (legacy path).
-                    match StreamingRecorder::new(&self.recording.output_dir) {
-                        Ok(rec) => {
-                            self.active_recorder = Some(rec);
-                            self.recording.state = RecordingState::Recording;
-                            self.recording.recorded_blocks = 0;
-                            self.recording.recorded_bytes = 0;
-                            self.recording_start_time = Some(Instant::now());
-                            self.recording_error = None;
-                        }
-                        Err(e) => {
-                            self.recording_error = Some(format!("Failed to open output: {e}"));
-                        }
-                    }
+            }
+            AcqMode::Demo => match StreamingRecorder::new(&self.recording.output_dir) {
+                Ok(rec) => {
+                    self.active_recorder = Some(rec);
+                    self.record_channels = channels;
+                    self.recording.state = RecordingState::Recording;
+                    self.recording.recorded_blocks = 0;
+                    self.recording.recorded_bytes = 0;
+                    self.recording_start_time = Some(Instant::now());
+                    self.recording_error = None;
+                    self.toasts.info("Recording started");
+                }
+                Err(e) => {
+                    let msg = format!("Failed to open output: {e}");
+                    self.toasts.error(msg.clone());
+                    self.recording_error = Some(msg);
                 }
             },
-            RecordingState::Recording => match self.mode {
-                AcqMode::Device => {
-                    // Device mode: tell the recorder thread to finalize.
-                    // State will be updated to Idle via RecorderEvent::Stopped.
-                    if let Some(ref pipeline) = self.live_pipeline {
-                        let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
-                        self.recording_start_time = None;
-                        self.recorder_buffer_occupancy = 0.0;
-                    }
-                }
-                AcqMode::Demo => {
-                    // Demo mode: finalize in GUI thread.
-                    if let Some(rec) = self.active_recorder.take() {
-                        match rec.finish() {
-                            Ok(summary) => {
-                                eprintln!(
-                                    "[recorder] Saved {} blocks ({} bytes) → {}",
-                                    summary.recording.block_count,
-                                    summary.recording.byte_count,
-                                    summary.recording.raw_path.display()
-                                );
-                            }
-                            Err(e) => {
-                                self.recording_error =
-                                    Some(format!("Finish error: {e}"));
-                            }
-                        }
-                    }
-                    self.recording.state = RecordingState::Idle;
+        }
+    }
+
+    /// Stop recording (used by the toggle, triggers, and the remote API).
+    fn stop_recording(&mut self) {
+        match self.mode {
+            AcqMode::Device => {
+                // Recorder thread finalizes; state goes Idle via RecorderEvent::Stopped.
+                if let Some(ref pipeline) = self.live_pipeline {
+                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
+            }
+            AcqMode::Demo => {
+                if let Some(rec) = self.active_recorder.take() {
+                    match rec.finish() {
+                        Ok(summary) => {
+                            log::info!(
+                                "Saved {} blocks ({} bytes) → {}",
+                                summary.recording.block_count,
+                                summary.recording.byte_count,
+                                summary.recording.raw_path.display()
+                            );
+                            self.toasts.success(format!(
+                                "Saved {} blocks ({})",
+                                summary.recording.block_count,
+                                theme::format_bytes(summary.recording.byte_count),
+                            ));
+                        }
+                        Err(e) => {
+                            let msg = format!("Finish error: {e}");
+                            self.toasts.error(msg.clone());
+                            self.recording_error = Some(msg);
+                        }
+                    }
+                }
+                self.record_channels = None;
+                self.recording.state = RecordingState::Idle;
+                self.recording_start_time = None;
+                self.recorder_buffer_occupancy = 0.0;
+            }
+        }
+    }
+
+    /// Launch a background impedance measurement on the RHD hardware.
+    /// The test drives the SPI bus itself, so any running acquisition is
+    /// stopped first and the device is reopened by the worker thread.
+    fn start_impedance_test(&mut self) {
+        if self.impedance.measuring {
+            return;
+        }
+        if self.device.kind != DeviceKind::Rhd {
+            self.impedance.error =
+                Some("Impedance test requires the RHD hardware source".to_string());
+            return;
+        }
+        let Some(bitfile) = self.device.rhd_bitfile.clone() else {
+            self.impedance.error =
+                Some("Select an FPGA bitfile in the DEVICE panel first".to_string());
+            return;
+        };
+        self.stop_all();
+
+        let streams = self.device.rhd_streams;
+        let config = kv_rhd::ImpedanceTestConfig {
+            frequency_hz: self.impedance.frequency_hz,
+            num_periods: self.impedance.num_periods,
+            channel_count: kv_rhd::CHANNELS_PER_STREAM * streams,
+            ..Default::default()
+        };
+        let options = RhdHardwareOptions::new(bitfile, streams);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.impedance.measuring = true;
+        self.impedance.error = None;
+        self.impedance.progress = (0, config.channel_count);
+        self.impedance_rx = Some(rx);
+
+        std::thread::spawn(move || {
+            let backend = match kv_rhd::RhdHardwareBackend::open(options) {
+                Ok(backend) => backend,
+                Err(e) => {
+                    let _ = tx.send(ImpedanceMsg::Failed(format!("device open failed: {e}")));
+                    return;
+                }
+            };
+            let progress_tx = tx.clone();
+            let progress = move |cur: usize, total: usize| {
+                let _ = progress_tx.send(ImpedanceMsg::Progress(cur, total));
+            };
+            match backend.run_impedance_test(&config, Some(&progress)) {
+                Ok(result) => {
+                    let _ = tx.send(ImpedanceMsg::Done(result));
+                }
+                Err(e) => {
+                    let _ = tx.send(ImpedanceMsg::Failed(e.to_string()));
+                }
+            }
+        });
+    }
+
+    /// Drain progress/results from the background impedance thread.
+    fn poll_impedance(&mut self) {
+        let Some(rx) = self.impedance_rx.as_ref() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match rx.try_recv() {
+                Ok(ImpedanceMsg::Progress(cur, total)) => {
+                    self.impedance.progress = (cur, total);
+                }
+                Ok(ImpedanceMsg::Done(result)) => {
+                    self.impedance.results = Some(result);
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+                Ok(ImpedanceMsg::Failed(e)) => {
+                    self.impedance.error = Some(e);
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.impedance.error = Some("impedance thread exited unexpectedly".to_string());
+                    self.impedance.measuring = false;
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.impedance_rx = None;
+        }
+    }
+
+    /// Convert a .kvraw recording to the selected export format on a
+    /// background thread, writing the output next to the source file.
+    fn start_export(&mut self, source: std::path::PathBuf) {
+        let format = self.export_format;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.export_rx = Some(rx);
+        self.export_status = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(export_kvraw(&source, format));
+        });
+    }
+
+    /// Drain the result of the background .kvraw export, if any.
+    fn poll_export(&mut self) {
+        let Some(rx) = self.export_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.toasts.success(format!(
+                    "Exported \u{2192} {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+                ));
+                self.export_status = Some(format!("Exported → {}", path.display()));
+                self.export_rx = None;
+            }
+            Ok(Err(e)) => {
+                self.toasts.error(format!("Export failed: {e}"));
+                self.export_status = Some(format!("Export failed: {e}"));
+                self.export_rx = None;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.toasts.error("Export thread exited unexpectedly");
+                self.export_status = Some("export thread exited unexpectedly".to_string());
+                self.export_rx = None;
+            }
+        }
+    }
+
+    /// Handle a remote API command and return a JSON result or error.
+    fn handle_remote_command(&mut self, cmd: &RemoteCommand) -> Result<String, String> {
+        match cmd {
+            RemoteCommand::Ping => Ok("\"pong\"".to_string()),
+            RemoteCommand::GetStatus => {
+                let status = AppStatus {
+                    is_running: self.is_running(),
+                    is_recording: self.recording.state == RecordingState::Recording,
+                    elapsed_seconds: self.elapsed_seconds(),
+                    channel_count: self
+                        .latest_block
+                        .as_ref()
+                        .map(|b| b.channel_count)
+                        .unwrap_or(0),
+                    sample_rate: self
+                        .latest_block
+                        .as_ref()
+                        .map(|b| b.sample_rate)
+                        .unwrap_or(0.0),
+                    display_mode: match self.display.display_mode {
+                        crate::panels::DisplayMode::Sweep => "sweep".to_string(),
+                        crate::panels::DisplayMode::Roll => "roll".to_string(),
+                    },
+                    recorded_blocks: self.recording.recorded_blocks,
+                };
+                Ok(remote_api::format_status_json(&status))
+            }
+            RemoteCommand::GetChannelCount => {
+                let ch = self
+                    .latest_block
+                    .as_ref()
+                    .map(|b| b.channel_count)
+                    .unwrap_or(0);
+                Ok(ch.to_string())
+            }
+            RemoteCommand::StartAcquisition { mode } => {
+                if self.is_running() {
+                    return Err("already running".to_string());
+                }
+                match mode.as_str() {
+                    "demo" => {
+                        self.start_demo();
+                        Ok("true".to_string())
+                    }
+                    "device" => {
+                        self.start_device();
+                        Ok("true".to_string())
+                    }
+                    _ => Err(format!("unknown mode: {mode}")),
+                }
+            }
+            RemoteCommand::StopAcquisition => {
+                self.stop_all();
+                Ok("true".to_string())
+            }
+            RemoteCommand::StartRecording { output_dir } => {
+                if !self.is_running() {
+                    return Err("acquisition not running".to_string());
+                }
+                if let Some(dir) = output_dir {
+                    remote_api::validate_output_dir(dir)?;
+                    self.recording.output_dir = dir.clone();
+                }
+                self.begin_recording();
+                Ok("true".to_string())
+            }
+            RemoteCommand::StopRecording => {
+                if self.recording.state != RecordingState::Recording {
+                    return Err("not recording".to_string());
+                }
+                self.stop_recording();
+                Ok("true".to_string())
+            }
+            RemoteCommand::SetDisplayMode { mode } => match mode.as_str() {
+                "sweep" => {
+                    self.display.display_mode = crate::panels::DisplayMode::Sweep;
+                    Ok("true".to_string())
+                }
+                "roll" => {
+                    self.display.display_mode = crate::panels::DisplayMode::Roll;
+                    Ok("true".to_string())
+                }
+                _ => Err(format!("unknown display mode: {mode}")),
             },
         }
     }
@@ -613,6 +1196,7 @@ impl KvApp {
                 block,
                 self.demo_blocks_generated,
                 elapsed_total,
+                0, // demo mode has no drops
             );
             self.latest_stats = Some(stats);
         }
@@ -640,6 +1224,13 @@ impl KvApp {
 
             while let Ok(block) = pipeline.preview_rx.try_recv() {
                 pipeline.total_blocks += 1;
+                // Detect dropped blocks via packet-ID discontinuity
+                if let Some(expected) = pipeline.expected_next_packet_id
+                    && block.packet_id > expected
+                {
+                    pipeline.dropped_blocks += block.packet_id - expected;
+                }
+                pipeline.expected_next_packet_id = Some(block.packet_id + 1);
                 preview_blocks.push(block);
             }
         } // borrow released here
@@ -654,12 +1245,55 @@ impl KvApp {
                     self.recording.state = RecordingState::Idle;
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
+                    self.toasts.success(format!(
+                        "Saved {} blocks ({})",
+                        blocks,
+                        theme::format_bytes(bytes),
+                    ));
+                }
+                RecorderEvent::Progress { blocks, bytes } => {
+                    self.recording.recorded_blocks = blocks;
+                    self.recording.recorded_bytes = bytes;
                 }
                 RecorderEvent::Error(e) => {
+                    self.toasts.error(format!("Recorder error: {e}"));
                     self.recording_error = Some(e);
                 }
                 RecorderEvent::BufferStatus { occupancy } => {
                     self.recorder_buffer_occupancy = occupancy;
+                }
+                RecorderEvent::SourceError(e) => {
+                    // The producer (device) thread has stopped. Surface the
+                    // error and tear down the pipeline so the UI shows
+                    // "Disconnected" and recording cannot continue silently.
+                    self.toasts.error(format!("Device error: {e}"));
+                    self.device_error = Some(e);
+                    self.live_pipeline = None;
+                    if self.recording.state == RecordingState::Recording {
+                        self.recording.state = RecordingState::Idle;
+                        self.recording_start_time = None;
+                    }
+                    self.recorder_buffer_occupancy = 0.0;
+                }
+            }
+        }
+
+        // ── Process remote API commands ──────────────────────────────────────
+        let remote_cmds: Vec<(u64, RemoteCommand)> = self
+            .remote_api_handle
+            .as_ref()
+            .map(|h| remote_api::lock_recover(&h.commands).drain(..).collect())
+            .unwrap_or_default();
+        if !remote_cmds.is_empty() {
+            let mut responses: Vec<RemoteResponse> = Vec::new();
+            for (id, cmd) in remote_cmds {
+                let result = self.handle_remote_command(&cmd);
+                responses.push(RemoteResponse { id, result });
+            }
+            if let Some(ref handle) = self.remote_api_handle {
+                let mut resp_q = remote_api::lock_recover(&handle.responses);
+                for r in responses {
+                    resp_q.push_back(r);
                 }
             }
         }
@@ -671,10 +1305,15 @@ impl KvApp {
         }
 
         // Update stats from the most-recent block received this frame.
-        if let Some(ref block) = last_block {
-            let pipeline = self.live_pipeline.as_ref().unwrap();
+        // (live_pipeline may have just been torn down by a SourceError above.)
+        if let (Some(block), Some(pipeline)) = (last_block.as_ref(), self.live_pipeline.as_ref()) {
             let elapsed = pipeline.start_time.elapsed().as_secs_f64();
-            self.latest_stats = Some(compute_block_stats(block, pipeline.total_blocks, elapsed));
+            self.latest_stats = Some(compute_block_stats(
+                block,
+                pipeline.total_blocks,
+                elapsed,
+                pipeline.dropped_blocks,
+            ));
         }
     }
 
@@ -685,12 +1324,28 @@ impl KvApp {
             return;
         }
 
+        // Snapshot the source outside the input closure to avoid borrowing
+        // self twice.
+        let playback = self.data_source == DataSource::Playback;
+
         ctx.input(|i| {
             if i.key_pressed(egui::Key::Space) {
-                self.toggle_acquisition();
+                if playback {
+                    self.playback_mgr.toggle_play_pause();
+                } else {
+                    self.toggle_acquisition();
+                }
             }
-            if i.key_pressed(egui::Key::R) {
+            // Recording is a live-acquisition action only.
+            if i.key_pressed(egui::Key::R) && !playback {
                 self.toggle_recording();
+            }
+            // Toggle the shortcut cheat-sheet overlay.
+            if i.key_pressed(egui::Key::Questionmark) || i.key_pressed(egui::Key::F1) {
+                self.show_help = !self.show_help;
+            }
+            if i.key_pressed(egui::Key::Escape) {
+                self.show_help = false;
             }
             if i.key_pressed(egui::Key::G) {
                 self.display.show_grid = !self.display.show_grid;
@@ -729,25 +1384,90 @@ impl KvApp {
             // +/- for channel spacing
             if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
                 self.display.channel_spacing =
-                    (self.display.channel_spacing + panels::SPACING_STEP)
-                        .min(panels::SPACING_MAX);
+                    (self.display.channel_spacing + panels::SPACING_STEP).min(panels::SPACING_MAX);
             }
             if i.key_pressed(egui::Key::Minus) {
                 self.display.channel_spacing =
-                    (self.display.channel_spacing - panels::SPACING_STEP)
-                        .max(panels::SPACING_MIN);
+                    (self.display.channel_spacing - panels::SPACING_STEP).max(panels::SPACING_MIN);
             }
         });
+    }
+
+    /// Draw the keyboard-shortcut cheat-sheet overlay (B4).  Shown on demand
+    /// via the toolbar `?` button or the `?` / F1 key; dismissed with Esc, a
+    /// click outside, or the close button.
+    ///
+    /// Rendered as an [`egui::Modal`] so it sits on a dimmed backdrop — the busy
+    /// running waveform behind it is darkened, keeping the shortcut list legible
+    /// instead of competing with the moving traces.
+    fn draw_help_overlay(&mut self, ctx: &egui::Context) {
+        if !self.show_help {
+            return;
+        }
+        let modal = egui::Modal::new(egui::Id::new("kv_help_modal"))
+            // Darken the running waveform clearly so the dialog reads as modal.
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_max_width(380.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Keyboard shortcuts")
+                            .size(theme::FONT_HEADING)
+                            .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button(egui::RichText::new("\u{2715}").size(theme::FONT_BODY))
+                            .on_hover_text("Close (Esc)")
+                            .clicked()
+                        {
+                            self.show_help = false;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(2.0);
+                let rows = [
+                    (
+                        "Space",
+                        "Start / stop acquisition (play / pause in Playback)",
+                    ),
+                    ("R", "Arm \u{2192} record \u{2192} stop recording"),
+                    ("P", "Pause / resume the display (acquisition continues)"),
+                    ("G", "Toggle the waveform grid"),
+                    ("F", "Toggle the performance overlay"),
+                    ("[  ]", "Decrease / increase the time window"),
+                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    ("+  \u{2212}", "Increase / decrease channel spacing"),
+                    ("?  /  F1", "Toggle this help (Esc to close)"),
+                ];
+                egui::Grid::new("kv_help_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 6.0])
+                    .show(ui, |ui| {
+                        for (key, desc) in rows {
+                            ui.label(
+                                egui::RichText::new(key)
+                                    .size(theme::FONT_BODY)
+                                    .strong()
+                                    .monospace()
+                                    .color(theme::ACCENT_BLUE),
+                            );
+                            ui.label(theme::body(desc));
+                            ui.end_row();
+                        }
+                    });
+            });
+        if modal.should_close() {
+            self.show_help = false;
+        }
     }
 }
 
 impl eframe::App for KvApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
-        let frame_delta_ms = frame_start
-            .duration_since(self.last_frame)
-            .as_secs_f64()
-            * 1000.0;
+        let frame_delta_ms = frame_start.duration_since(self.last_frame).as_secs_f64() * 1000.0;
         self.last_frame = frame_start;
         // EMA of frame interval (~250ms time constant at 60fps)
         self.frame_ms_ema = self.frame_ms_ema * 0.9 + frame_delta_ms * 0.1;
@@ -758,29 +1478,101 @@ impl eframe::App for KvApp {
             self.theme_applied = true;
         }
 
+        // Apply the persisted UI scale every frame so slider changes take
+        // effect live (#17).
+        ctx.set_pixels_per_point(self.ui_scale);
+
+        // Restore the saved window size on the first frame (#15).  Done here
+        // rather than in NativeOptions so it stays in sync with the same
+        // config the rest of the settings come from.
+        if !self.window_restored {
+            self.window_restored = true;
+            let saved = config_persist::load_or_default();
+            let w = saved.window_width.clamp(640.0, 7680.0);
+            let h = saved.window_height.clamp(480.0, 4320.0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+        }
+
+        // Auto-save the full config when the window is closing (#15).
+        if ctx.input(|i| i.viewport().close_requested()) && self.config_persist.auto_save {
+            let cfg = self.capture_persistent(ctx);
+            let _ = config_persist::save_config(&self.config_persist.config_path, &cfg);
+        }
+
         // Auto-start demo on first frame
-        if !self.demo_started && self.mode == AcqMode::Demo && self.latest_block.is_none() {
+        if !self.demo_started
+            && self.data_source == DataSource::Demo
+            && self.mode == AcqMode::Demo
+            && self.latest_block.is_none()
+        {
             self.start_demo();
+        }
+
+        // First-run guidance (B7): a single welcome toast points new users at
+        // the source switcher and the shortcut help.
+        if !self.welcomed {
+            self.welcomed = true;
+            self.toasts
+                .info("Streaming demo data \u{2014} switch Source or press ? for shortcuts");
         }
 
         // Handle keyboard shortcuts
         self.handle_keys(ctx);
 
-        // Tick (acquisition runs regardless of display pause)
-        match self.mode {
-            AcqMode::Demo => self.tick_demo(),
-            AcqMode::Device => self.tick_device(),
+        // Tick the live source (acquisition runs regardless of display pause).
+        // Skipped while playing back an offline recording so the two sources
+        // never feed the display at once.
+        if self.data_source != DataSource::Playback {
+            match self.mode {
+                AcqMode::Demo => self.tick_demo(),
+                AcqMode::Device => self.tick_device(),
+            }
+        }
+
+        // Drain background impedance-test and export results.
+        self.poll_impedance();
+        self.poll_export();
+
+        // Tick playback only while it is the selected source.
+        if self.data_source == DataSource::Playback
+            && self.playback_mgr.is_loaded()
+            && let Some(block) = self.playback_mgr.tick()
+        {
+            self.ingest_block(block);
         }
 
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
 
-        // Detect filter settings change (user toggled in UI) — re-filter history
+        // Detect filter settings change (user toggled in UI) — re-filter
+        // history once the settings have been stable for the debounce window,
+        // so dragging a cutoff slider doesn't re-filter 10k blocks per frame.
         if self.filters != self.filter_settings_snapshot {
-            let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
-            let ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
-            self.rebuild_filter_chains(sr, ch);
+            if self.filters != self.filters_last_frame || self.filter_change_pending_since.is_none()
+            {
+                self.filter_change_pending_since = Some(Instant::now());
+            }
+            let stable = self
+                .filter_change_pending_since
+                .is_some_and(|t| t.elapsed().as_millis() as u64 >= REFILTER_DEBOUNCE_MS);
+            if stable {
+                let sr = self
+                    .latest_block
+                    .as_ref()
+                    .map(|b| b.sample_rate)
+                    .unwrap_or(30000.0);
+                let ch = self
+                    .latest_block
+                    .as_ref()
+                    .map(|b| b.channel_count)
+                    .unwrap_or(16);
+                self.rebuild_filter_chains(sr, ch);
+                self.filter_change_pending_since = None;
+            }
+        } else {
+            self.filter_change_pending_since = None;
         }
+        self.filters_last_frame = self.filters;
 
         let elapsed_live = self.elapsed_seconds();
         // Use frozen elapsed for display when paused
@@ -790,19 +1582,22 @@ impl eframe::App for KvApp {
             elapsed_live
         };
 
-        // ── Sweep-mode window management ─────────────────────────
-        // Advance sweep_start_ms when new data has filled the current window.
-        // This keeps x_left / x_right FIXED within a sweep — the entire display
-        // is stationary and only the cursor moves right, matching the SpikeGLX /
-        // Intan RHX default display mode.  When the window fills, the display
-        // resets to a new window (brief flash, once per window duration).
+        // ── Display-mode window management ─────────────────────────
         if !self.display_paused && self.disp_ring.ready {
             let latest_ms = self.disp_ring.latest_time_ms();
             let window_ms = self.display.time_window_ms();
-            if latest_ms >= self.sweep_start_ms + window_ms {
-                // Snap to the most recent complete window boundary
-                self.sweep_start_ms =
-                    (latest_ms / window_ms).floor() * window_ms;
+            match self.display.display_mode {
+                panels::DisplayMode::Sweep => {
+                    // Fixed window, cursor sweeps right.  When the window fills,
+                    // snap to the next window boundary (brief flash, once per window).
+                    if latest_ms >= self.sweep_start_ms + window_ms {
+                        self.sweep_start_ms = (latest_ms / window_ms).floor() * window_ms;
+                    }
+                }
+                panels::DisplayMode::Roll => {
+                    // Continuous scrolling: x_right = latest, x_left = latest - window.
+                    self.sweep_start_ms = (latest_ms - window_ms).max(0.0);
+                }
             }
         }
 
@@ -833,121 +1628,291 @@ impl eframe::App for KvApp {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // Transport buttons
+                    // Transport buttons.  In Playback mode the live transport
+                    // is replaced by playback controls so only one source is
+                    // ever driven from the toolbar.
                     let running = self.is_running();
-                    if theme::transport_button(
-                        ui,
-                        if running { "  Stop  " } else { "  Start  " },
-                        if running {
-                            theme::BTN_STOP
-                        } else {
-                            theme::BTN_PLAY
-                        },
-                        true,
-                    ) {
-                        self.toggle_acquisition();
-                    }
-
-                    // Record button — always clickable when running
-                    let rec_label = match self.recording.state {
-                        RecordingState::Idle => " Record ",
-                        RecordingState::Armed => "  ARM  ",
-                        RecordingState::Recording => " STOP REC ",
-                    };
-                    let rec_color = match self.recording.state {
-                        RecordingState::Idle => theme::BTN_RECORD,
-                        RecordingState::Armed => theme::ACCENT_YELLOW,
-                        RecordingState::Recording => theme::BTN_RECORD_ACTIVE,
-                    };
-                    let rec_enabled =
-                        running || self.recording.state != RecordingState::Idle;
-                    if theme::transport_button(ui, rec_label, rec_color, rec_enabled) {
-                        self.toggle_recording();
-                    }
-
-                    // Pause button — only shown when running or already paused
-                    if running || self.display_paused {
-                        let pause_label = if self.display_paused {
-                            " Resume "
-                        } else {
-                            " Pause "
-                        };
-                        let pause_color = if self.display_paused {
-                            theme::ACCENT_BLUE
-                        } else {
-                            theme::TEXT_SECONDARY
-                        };
-                        if theme::transport_button(ui, pause_label, pause_color, true) {
-                            self.toggle_pause_display();
+                    let mut open_playback = false;
+                    if self.data_source == DataSource::Playback {
+                        let loaded = self.playback_mgr.is_loaded();
+                        let playing = self.playback_mgr.state == playback::PlaybackState::Playing;
+                        if theme::transport_button_sized(
+                            ui,
+                            if playing { " Pause " } else { "  Play  " },
+                            if playing {
+                                theme::TEXT_SECONDARY
+                            } else {
+                                theme::BTN_PLAY
+                            },
+                            loaded,
+                            "Play / pause the recording (Space)",
+                            88.0,
+                        ) {
+                            self.playback_mgr.toggle_play_pause();
                         }
+                        if theme::transport_button_tip(
+                            ui,
+                            " Restart ",
+                            theme::BG_WIDGET,
+                            loaded,
+                            "Jump back to the start of the recording",
+                        ) {
+                            self.playback_mgr.seek_to(0);
+                        }
+                        ui.add_space(8.0);
+                        if loaded {
+                            let name = self
+                                .playback_mgr
+                                .file_path
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("recording")
+                                .to_string();
+                            ui.label(theme::caption(format!("\u{25B6} {name}")));
+                        } else if theme::transport_button_tip(
+                            ui,
+                            " Open\u{2026} ",
+                            theme::BTN_PLAY,
+                            true,
+                            "Open a .kvraw recording to play back",
+                        ) {
+                            open_playback = true;
+                        }
+                    } else {
+                        if theme::transport_button_sized(
+                            ui,
+                            if running { "  Stop  " } else { "  Start  " },
+                            if running {
+                                theme::BTN_STOP
+                            } else {
+                                theme::BTN_PLAY
+                            },
+                            true,
+                            "Start / stop acquisition (Space)",
+                            88.0,
+                        ) {
+                            self.toggle_acquisition();
+                        }
+
+                        // Record button — always clickable when running.
+                        let rec_label = match self.recording.state {
+                            RecordingState::Idle => " Record ",
+                            RecordingState::Armed => " ARMED ",
+                            RecordingState::Recording => " STOP REC ",
+                        };
+                        let rec_color = match self.recording.state {
+                            RecordingState::Idle => theme::BTN_RECORD,
+                            RecordingState::Armed => theme::ACCENT_YELLOW,
+                            RecordingState::Recording => theme::BTN_RECORD_ACTIVE,
+                        };
+                        let rec_enabled = running || self.recording.state != RecordingState::Idle;
+                        let rec_tip = match self.recording.state {
+                            RecordingState::Idle => "Arm recording (R)",
+                            RecordingState::Armed => "Begin recording (R)",
+                            RecordingState::Recording => "Stop recording (R)",
+                        };
+                        // Fixed width fits the widest label ("STOP REC") so
+                        // arming / recording never shoves the toolbar sideways.
+                        if theme::transport_button_sized(
+                            ui,
+                            rec_label,
+                            rec_color,
+                            rec_enabled,
+                            rec_tip,
+                            104.0,
+                        ) {
+                            self.toggle_recording();
+                        }
+
+                        // Pause button — only shown when running or already paused.
+                        if running || self.display_paused {
+                            let pause_label = if self.display_paused {
+                                " Resume "
+                            } else {
+                                " Pause "
+                            };
+                            let pause_color = if self.display_paused {
+                                theme::ACCENT_BLUE
+                            } else {
+                                theme::TEXT_SECONDARY
+                            };
+                            if theme::transport_button_sized(
+                                ui,
+                                pause_label,
+                                pause_color,
+                                true,
+                                "Freeze / resume the display; acquisition continues (P)",
+                                88.0,
+                            ) {
+                                self.toggle_pause_display();
+                            }
+                        }
+                    }
+                    if open_playback {
+                        self.open_playback_file_dialog();
                     }
 
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(8.0);
 
-                    // Mode selector
+                    // Data-source selector (B1): one switch for Demo / Device /
+                    // Playback so it is always clear where the signal comes from.
                     ui.label(
-                        egui::RichText::new("Mode:")
-                            .size(10.0)
+                        egui::RichText::new("Source:")
+                            .size(theme::FONT_BODY)
                             .color(theme::TEXT_DIM),
                     );
-                    let demo_selected = self.mode == AcqMode::Demo;
-                    if ui
-                        .selectable_label(
-                            demo_selected,
-                            egui::RichText::new("Demo").size(11.0),
-                        )
-                        .on_hover_text("Synthetic neural data (Space to toggle)")
-                        .clicked()
-                        && !demo_selected
-                    {
-                        self.start_demo();
-                    }
-                    if ui
-                        .selectable_label(
-                            !demo_selected,
-                            egui::RichText::new("Device").size(11.0),
-                        )
-                        .on_hover_text("Simulator backend")
-                        .clicked()
-                        && demo_selected
-                    {
-                        self.start_device();
+                    let device_tip = match self.device.kind {
+                        DeviceKind::Simulator => "Live acquisition \u{2014} Simulator backend",
+                        DeviceKind::Rhd => {
+                            "Live acquisition \u{2014} RHD hardware (set bitfile in DEVICE panel)"
+                        }
+                    };
+                    // Segmented control: the three sources sit flush inside one
+                    // recessed frame so they read as a single "pick one" switch
+                    // rather than three independent buttons.
+                    let mut pick: Option<DataSource> = None;
+                    egui::Frame::new()
+                        .fill(theme::BG_DARKEST)
+                        .corner_radius(egui::CornerRadius::same(5))
+                        .inner_margin(egui::Margin::same(2))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for (src, label, tip) in [
+                                (
+                                    DataSource::Demo,
+                                    "Demo",
+                                    "Synthetic neural data \u{2014} no hardware",
+                                ),
+                                (DataSource::Device, "Device", device_tip),
+                                (
+                                    DataSource::Playback,
+                                    "Playback",
+                                    "Replay a saved .kvraw recording",
+                                ),
+                            ] {
+                                let selected = self.data_source == src;
+                                if ui
+                                    .add_sized(
+                                        [66.0, 22.0],
+                                        egui::SelectableLabel::new(
+                                            selected,
+                                            egui::RichText::new(label).size(theme::FONT_HEADING),
+                                        ),
+                                    )
+                                    .on_hover_text(tip)
+                                    .clicked()
+                                    && !selected
+                                {
+                                    pick = Some(src);
+                                }
+                            }
+                        });
+                    if let Some(src) = pick {
+                        self.select_source(src);
                     }
 
-                    // Right-aligned clock + version
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(
-                                egui::RichText::new("v0.2.0")
-                                    .size(9.0)
-                                    .color(theme::TEXT_DIM),
-                            );
-                            ui.add_space(8.0);
+                    ui.add_space(8.0);
+                    if ui
+                        .button(
+                            egui::RichText::new(" ? ")
+                                .size(theme::FONT_HEADING)
+                                .strong(),
+                        )
+                        .on_hover_text("Keyboard shortcuts")
+                        .clicked()
+                    {
+                        self.show_help = !self.show_help;
+                    }
 
-                            // Acquisition clock
-                            let clock_color = if self.recording.state
-                                == RecordingState::Recording
-                            {
-                                theme::ACCENT_RED
-                            } else if running {
-                                theme::ACCENT_YELLOW
-                            } else {
-                                theme::TEXT_DIM
-                            };
-                            ui.label(
-                                egui::RichText::new(theme::format_clock(elapsed))
-                                    .size(14.0)
-                                    .monospace()
-                                    .strong()
-                                    .color(clock_color),
-                            );
-                        },
-                    );
+                    // Right-aligned: live status pill + clock + version
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new("v0.2.0")
+                                .size(9.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(10.0);
+
+                        // Acquisition clock — colored by state.
+                        let clock_color = if self.recording.state == RecordingState::Recording {
+                            theme::ACCENT_RED
+                        } else if running {
+                            theme::ACCENT_YELLOW
+                        } else {
+                            theme::TEXT_DIM
+                        };
+                        ui.label(
+                            egui::RichText::new(theme::format_clock(elapsed))
+                                .size(15.0)
+                                .monospace()
+                                .strong()
+                                .color(clock_color),
+                        );
+
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(10.0);
+
+                        // At-a-glance state pill: REC / ARMED / LIVE / IDLE.
+                        let (dot, label, color) = match self.recording.state {
+                            RecordingState::Recording => {
+                                (theme::STATUS_RECORDING, "REC", theme::ACCENT_RED)
+                            }
+                            RecordingState::Armed => {
+                                (theme::STATUS_ARMED, "ARMED", theme::ACCENT_YELLOW)
+                            }
+                            RecordingState::Idle if running => {
+                                (theme::STATUS_CONNECTED, "LIVE", theme::ACCENT_GREEN)
+                            }
+                            RecordingState::Idle => {
+                                (theme::STATUS_IDLE, "IDLE", theme::TEXT_SECONDARY)
+                            }
+                        };
+                        // In a right-to-left layout, add the label first so the
+                        // status dot lands to its left, reading "● LABEL".
+                        // Fixed-width label keeps the dot from hopping as the
+                        // state text (REC / ARMED / LIVE / IDLE) changes width.
+                        ui.add_sized(
+                            [44.0, 16.0],
+                            egui::Label::new(
+                                egui::RichText::new(label).size(12.0).strong().color(color),
+                            ),
+                        );
+                        ui.add_space(5.0);
+                        theme::status_dot(ui, dot);
+                    });
                 });
             });
+
+        // ── Device error banner ─────────────────────────────────
+        // Surfaced when the acquisition source fails to open or read.
+        // Dismissible; the GUI and any other mode keep running regardless.
+        if let Some(err) = self.device_error.clone() {
+            egui::TopBottomPanel::top("device_error_banner")
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::ACCENT_RED)
+                        .inner_margin(egui::Margin::symmetric(8, 4)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("\u{26A0} Device error: {err}"))
+                                .size(12.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                self.device_error = None;
+                            }
+                        });
+                    });
+                });
+        }
 
         // ── Bottom status bar ───────────────────────────────────
         egui::TopBottomPanel::bottom("status_bar")
@@ -981,32 +1946,202 @@ impl eframe::App for KvApp {
                 let mut start = false;
                 let mut stop = false;
                 let mut toggle_rec = false;
+                let mut dismiss_error = false;
+                let mut start_impedance = false;
+                let mut open_playback_file = false;
+                let mut save_clicked = false;
+                let mut load_clicked = false;
 
                 // Compute elapsed recording seconds for the clock display.
                 let rec_elapsed_secs = self
                     .recording_start_time
                     .map(|t| t.elapsed().as_secs_f64());
+                let acq_running = self.is_running();
+                let total_ch = self.latest_block.as_ref().map(|b| b.channel_count).unwrap_or(16);
+                let sr = self.latest_block.as_ref().map(|b| b.sample_rate).unwrap_or(30000.0);
+                let prev_remote_enabled = self.remote_api_state.enabled;
 
-                let mut dismiss_error = false;
-                panels::draw_left_panel(
-                    ui,
-                    self.is_running(),
-                    &mut start,
-                    &mut stop,
-                    &mut toggle_rec,
-                    &mut self.display,
-                    &mut self.filters,
-                    &mut self.recording,
-                    self.latest_block.as_ref(),
-                    rec_elapsed_secs,
-                    self.recorder_buffer_occupancy,
-                    self.recording_error.as_deref(),
-                    &mut dismiss_error,
-                );
+                ui.set_min_width(220.0);
+
+                // Tab strip grouping the sidebar sections by purpose.
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (SidebarTab::Acquire, "ACQUIRE"),
+                        (SidebarTab::Display, "DISPLAY"),
+                        (SidebarTab::Tools, "TOOLS"),
+                    ] {
+                        ui.selectable_value(
+                            &mut self.sidebar_tab,
+                            tab,
+                            egui::RichText::new(label).size(10.0).strong(),
+                        );
+                    }
+                });
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    match self.sidebar_tab {
+                        SidebarTab::Acquire => {
+                            panels::draw_acquire_core(
+                                ui,
+                                acq_running,
+                                &mut self.device,
+                                &mut start,
+                                &mut stop,
+                                &mut toggle_rec,
+                                &mut self.recording,
+                                self.latest_block.as_ref(),
+                                rec_elapsed_secs,
+                                self.recorder_buffer_occupancy,
+                                self.recording_error.as_deref(),
+                                &mut dismiss_error,
+                            );
+
+                            ui.add_space(4.0);
+                            trigger::draw_trigger_section(ui, &mut self.trigger);
+
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("EXPORT FORMAT")
+                                    .size(11.0)
+                                    .strong()
+                                    .color(theme::TEXT_SECONDARY),
+                            )
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                use kv_recorder::export_formats::ExportFormat;
+                                ui.horizontal(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::IntanRhd,
+                                        egui::RichText::new("Intan .rhd").size(10.0),
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::FlatBinary,
+                                        egui::RichText::new("Flat binary").size(10.0),
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(self.export_format.label())
+                                        .size(9.0)
+                                        .italics()
+                                        .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(2.0);
+                                let exporting = self.export_rx.is_some();
+                                if ui
+                                    .add_enabled(
+                                        !exporting,
+                                        egui::Button::new(
+                                            egui::RichText::new("Export .kvraw…").size(10.0),
+                                        ),
+                                    )
+                                    .on_hover_text("Convert a .kvraw recording to the selected format")
+                                    .clicked()
+                                    && let Some(path) = playback::pick_kvraw_file() {
+                                        self.start_export(path);
+                                    }
+                                if exporting {
+                                    ui.label(
+                                        egui::RichText::new("Exporting…")
+                                            .size(9.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                } else if let Some(ref status) = self.export_status {
+                                    ui.label(
+                                        egui::RichText::new(status)
+                                            .size(9.0)
+                                            .color(theme::TEXT_DIM),
+                                    );
+                                }
+                            });
+
+                            ui.add_space(4.0);
+                            self.channel_select.sync_channel_count(total_ch);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Recording {} of {} channels \u{00B7} configure in DISPLAY \u{25B8} CHANNELS",
+                                    self.channel_select.selected_count(),
+                                    total_ch,
+                                ))
+                                .size(theme::FONT_CAPTION)
+                                .color(theme::TEXT_DIM),
+                            );
+                        }
+                        SidebarTab::Display => {
+                            panels::draw_display_settings(ui, &mut self.display);
+
+                            ui.add_space(4.0);
+                            panels::draw_filter_settings(ui, &mut self.filters);
+
+                            ui.add_space(4.0);
+                            channel_select::draw_unified_channels(
+                                ui,
+                                &mut self.display,
+                                &mut self.channel_select,
+                                self.latest_block.as_ref(),
+                                self.recording.state == RecordingState::Recording,
+                            );
+
+                            ui.add_space(4.0);
+                            channel_map::draw_channel_map_section(
+                                ui,
+                                &mut self.channel_map,
+                                &mut self.display,
+                                total_ch,
+                            );
+
+                            ui.add_space(4.0);
+                            fft_panel::draw_fft_section(
+                                ui,
+                                &mut self.fft,
+                                &self.disp_ring,
+                                sr,
+                                total_ch,
+                            );
+                        }
+                        SidebarTab::Tools => {
+                            let can_measure = self.device.kind == DeviceKind::Rhd
+                                && self.device.rhd_bitfile.is_some();
+                            impedance_panel::draw_impedance_section(
+                                ui,
+                                &mut self.impedance,
+                                can_measure,
+                                &mut start_impedance,
+                            );
+
+                            ui.add_space(4.0);
+                            playback::draw_playback_section(
+                                ui,
+                                &mut self.playback_mgr,
+                                &mut open_playback_file,
+                            );
+
+                            ui.add_space(4.0);
+                            remote_api::draw_remote_api_section(
+                                ui,
+                                &mut self.remote_api_state,
+                            );
+
+                            ui.add_space(4.0);
+                            config_persist::draw_config_section(
+                                ui,
+                                &mut self.config_persist,
+                                &mut self.ui_scale,
+                                &mut save_clicked,
+                                &mut load_clicked,
+                            );
+                        }
+                    }
+                });
+
                 if dismiss_error {
                     self.recording_error = None;
                 }
-
+                if start_impedance {
+                    self.start_impedance_test();
+                }
                 if start {
                     match self.mode {
                         AcqMode::Demo => self.start_demo(),
@@ -1018,6 +2153,74 @@ impl eframe::App for KvApp {
                 }
                 if toggle_rec {
                     self.toggle_recording();
+                }
+
+                // Handle playback file open (outside borrow scope). Switches
+                // the top-level source to Playback so the file actually drives
+                // the display (live acquisition is stopped first).
+                if open_playback_file {
+                    self.open_playback_file_dialog();
+                }
+
+                // Start/stop remote API server based on enabled toggle
+                let prev_enabled = prev_remote_enabled;
+                if self.remote_api_state.enabled && !prev_enabled {
+                    match remote_api::start_server(self.remote_api_state.port) {
+                        Ok(handle) => {
+                            self.remote_api_handle = Some(handle);
+                            self.remote_api_state.running = true;
+                            self.remote_api_state.error = None;
+                        }
+                        Err(e) => {
+                            self.remote_api_state.error = Some(e);
+                            self.remote_api_state.enabled = false;
+                        }
+                    }
+                } else if !self.remote_api_state.enabled && prev_enabled {
+                    if let Some(mut handle) = self.remote_api_handle.take() {
+                        handle.stop();
+                    }
+                    self.remote_api_state.running = false;
+                }
+                // Update client count
+                if let Some(ref handle) = self.remote_api_handle {
+                    self.remote_api_state.client_count =
+                        *remote_api::lock_recover(&handle.client_count);
+                }
+
+                if save_clicked {
+                    let cfg = self.capture_persistent(ctx);
+                    match config_persist::save_config(&self.config_persist.config_path, &cfg) {
+                        Ok(()) => {
+                            self.config_persist.status_message = Some("Saved".to_string());
+                            self.toasts.success("Configuration saved");
+                        }
+                        Err(e) => {
+                            self.toasts.error(format!("Save failed: {e}"));
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
+                }
+                if load_clicked {
+                    match config_persist::load_config(&self.config_persist.config_path) {
+                        Ok(cfg) => {
+                            cfg.apply_to(
+                                &mut self.display,
+                                &mut self.filters,
+                                &mut self.recording.output_dir,
+                                &mut self.recording.file_prefix,
+                                &mut self.remote_api_state.port,
+                            );
+                            self.ui_scale = cfg.ui_scale.clamp(0.8, 1.6);
+                            self.config_persist.status_message = Some("Loaded".to_string());
+                            self.config_persist.loaded = true;
+                            self.toasts.success("Configuration loaded");
+                        }
+                        Err(e) => {
+                            self.toasts.error(format!("Load failed: {e}"));
+                            self.config_persist.status_message = Some(e);
+                        }
+                    }
                 }
             });
 
@@ -1039,23 +2242,35 @@ impl eframe::App for KvApp {
                 let elapsed_secs = self.elapsed_seconds();
                 let mut pending_add: Option<AddViewRequest> = None;
 
+                // Placeholder copy that matches the active source: in Playback the
+                // user loads a file (no Start button), so "Press Start" would be
+                // misleading.
+                let empty_hint: &str = match self.data_source {
+                    // Playback shows an actionable Open button below (#18), so
+                    // the subtitle just sets context rather than pointing away.
+                    DataSource::Playback => "No recording loaded yet",
+                    _ => "Press Start to begin acquisition",
+                };
+
                 {
                     let mut behavior = KvTileBehavior {
-                        disp_ring:     &self.disp_ring,
+                        disp_ring: &self.disp_ring,
                         disp_ring_lfp: &self.disp_ring_lfp,
-                        disp_ring_ap:  &self.disp_ring_ap,
-                        latest_block:  self.latest_block.as_ref(),
-                        display:       &mut self.display,
-                        filters:       &self.filters,
+                        disp_ring_ap: &self.disp_ring_ap,
+                        latest_block: self.latest_block.as_ref(),
+                        display: &mut self.display,
+                        filters: &self.filters,
                         display_paused: self.display_paused,
                         paused_elapsed: &mut self.paused_elapsed,
                         sweep_start_ms: self.sweep_start_ms,
                         elapsed_secs,
                         show_perf_overlay: self.show_perf_overlay,
-                        render_ms_ema:     &mut self.render_ms_ema,
+                        render_ms_ema: &mut self.render_ms_ema,
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
-                        pending_add:   &mut pending_add,
+                        fft: &self.fft,
+                        pending_add: &mut pending_add,
+                        empty_hint,
                     };
                     tree.ui(&mut behavior, ui);
                 }
@@ -1065,8 +2280,9 @@ impl eframe::App for KvApp {
                     let visible = self.display.visible_channels;
                     let kind = match req {
                         AddViewRequest::Lfp => TileKind::new_lfp(visible),
-                        AddViewRequest::Ap  => TileKind::new_ap(visible),
+                        AddViewRequest::Ap => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
+                        AddViewRequest::Fft => TileKind::new_fft(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }
@@ -1074,11 +2290,114 @@ impl eframe::App for KvApp {
                 self.tile_tree = Some(tree);
             });
 
+        // ── Actionable empty-state for Playback (#18) ───────────
+        // When no recording is loaded yet, drop an Open button (with an icon)
+        // right on the canvas so the user doesn't have to hunt the toolbar.
+        if self.data_source == DataSource::Playback && !self.playback_mgr.is_loaded() {
+            let mut open_clicked = false;
+            egui::Area::new(egui::Id::new("kv_playback_empty_cta"))
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 44.0))
+                .interactable(true)
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("\u{1F4C1}")
+                                .size(34.0)
+                                .color(theme::TEXT_DIM),
+                        );
+                        ui.add_space(4.0);
+                        if theme::primary_button(ui, "Open .kvraw\u{2026}", true) {
+                            open_clicked = true;
+                        }
+                    });
+                });
+            if open_clicked {
+                self.open_playback_file_dialog();
+            }
+        }
+
+        // ── Shortcut help overlay (B4) ──────────────────────────
+        self.draw_help_overlay(ctx);
+
+        // ── Toast notifications (B5) ────────────────────────────
+        self.toasts.show(ctx);
+
         // Request continuous repaints while running (or paused — for overlay)
-        if self.is_running() || self.display_paused {
+        // and while background impedance/export work needs progress updates.
+        if self.is_running()
+            || self.display_paused
+            || self.impedance_rx.is_some()
+            || self.export_rx.is_some()
+            || self.filter_change_pending_since.is_some()
+        {
             ctx.request_repaint();
         }
     }
+}
+
+/// Read an entire .kvraw file and export it in the requested format.
+/// Returns the output path on success.
+fn export_kvraw(
+    source: &std::path::Path,
+    format: kv_recorder::export_formats::ExportFormat,
+) -> Result<std::path::PathBuf, String> {
+    use kv_recorder::KvrawReader;
+    use kv_recorder::export_formats::{self, ExportFormat};
+
+    let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
+    let meta = reader.metadata().clone();
+    if meta.channel_count == 0 {
+        return Err("kvraw file has no channels".to_string());
+    }
+    let total_frames = reader.total_frames();
+
+    // Read in ~1 s chunks; the exporters re-chunk internally as needed.
+    const FRAMES_PER_CHUNK: usize = 30_000;
+    let mut blocks: Vec<SampleBlock> = Vec::new();
+    let mut frame: u64 = 0;
+    let mut packet_id: u64 = 0;
+    while frame < total_frames {
+        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+        let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
+        if data.is_empty() {
+            break;
+        }
+        let frames_read = data.len() / meta.channel_count;
+        blocks.push(SampleBlock {
+            device_id: meta.device_id.clone(),
+            stream_id: 0,
+            packet_id,
+            timestamp_start: frame,
+            sample_rate: meta.sample_rate,
+            channel_count: meta.channel_count,
+            samples_per_channel: frames_read,
+            ttl_bits: 0,
+            data,
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        });
+        packet_id += 1;
+        frame += frames_read as u64;
+    }
+    if blocks.is_empty() {
+        return Err("no data to export".to_string());
+    }
+
+    let notes = format!("exported from {}", source.display());
+    match format {
+        ExportFormat::IntanRhd => {
+            let output = source.with_extension(format.extension());
+            export_formats::export_intan_rhd(&output, &blocks, &notes)
+        }
+        ExportFormat::FlatBinary => {
+            // Flat binary writes recording.bin + recording.meta.json into a directory.
+            let output_dir = source.with_extension("export");
+            export_formats::export_flat_binary(&output_dir, &blocks, &notes)
+        }
+    }
+    .map_err(|e| e.to_string())
 }
 
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

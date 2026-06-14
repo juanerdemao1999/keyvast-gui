@@ -281,64 +281,74 @@ Known:
 ```text
 Future connector is USB Type-C.
 Transfer is USB-based.
+First hardware module is Opal Kelly XEM7310-A75.
+First hardware transport uses FrontPanel over USB 3.0.
+Host application should bundle the FrontPanel runtime DLL when packaging for Windows.
 ```
 
 Unknown:
 
 ```text
-USB speed
-USB class or vendor protocol
-Windows driver path
-endpoint layout
-packet framing
+Exact Windows installer/driver packaging steps
 hotplug behavior
 device serial number format
-firmware or bit-file version reporting
+whether to auto-open the first XEM7310-A75 or require serial selection
 ```
 
 Status:
 
 ```text
-Not needed for simulator-first work.
+Needed for first hardware bring-up, but keep behind a hardware backend.
 ```
 
 ### 11. Real FPGA Packet Format
 
-Unknown:
+Known for first hardware bring-up:
 
 ```text
-real header layout
-packet counter width
-timestamp tick frequency
+Use the Keyvast bitfile D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit.
+The FPGA design currently embeds an Intan Rhythm USB3-style data plane.
+Expected FrontPanel data endpoint is BTPipeOut 0xA0.
+Expected frame magic is 0xd7a22aaa38132a53.
+Expected board id is 700 if the Rhythm endpoint map is unchanged.
+```
+
+Still unknown:
+
+```text
+whether the Keyvast bitfile changes any Rhythm endpoint behavior
 CRC algorithm
-sample packing
-endianness
 TTL edge encoding
-channel mapping
+full physical channel mapping beyond the first two 32-channel headstages
 ```
 
 Status:
 
 ```text
-Not needed now. Keep behind DeviceBackend.
+Use the Rhythm USB3 parser first, but keep it behind DeviceBackend.
 ```
 
 ### 12. ADC Conversion And Channel Map
 
-Unknown:
+Known:
 
 ```text
-ADC gain
-raw-to-microvolt conversion
+First live hardware target is up to two 32-channel RHD headstages.
+For display scaling, follow the Open Ephys / Intan RHD convention.
+Preserve raw data in recording unless a later product decision changes this.
+```
+
+Still unknown:
+
+```text
 physical channel ordering
-headstage mapping
 reference channel behavior
 ```
 
 Status:
 
 ```text
-Not needed for raw simulator MVP.
+Needed for hardware bring-up and metadata, but not for the upper GUI contract.
 ```
 
 ## Tier 4: Product Features To Delay

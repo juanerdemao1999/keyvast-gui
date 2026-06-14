@@ -6,11 +6,11 @@ use std::{
 };
 
 use kv_cli::{
-    BenchmarkOptions, CliCommand, CliError, SimulatorPipelineOptions, SimulatorRecordingOptions,
-    blocks_for_duration, parse_args, run_benchmark, run_directory_name_utc, run_simulator_pipeline,
-    run_simulator_recording, run_simulator_stream,
+    BenchmarkOptions, CliCommand, CliError, RhdSmokeOptions, SimulatorPipelineOptions,
+    SimulatorRecordingOptions, blocks_for_duration, parse_args, run_benchmark,
+    run_directory_name_utc, run_rhd_smoke, run_simulator_pipeline, run_simulator_recording,
+    run_simulator_stream,
 };
-use kv_recorder::KVRAW_DATA_OFFSET;
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET};
 
 #[test]
@@ -41,6 +41,7 @@ fn simulator_recording_writes_raw_metadata_and_integrity_summary() {
 
     let metadata = fs::read_to_string(output_dir.join("recording.json"))
         .expect("metadata file should be readable");
+    assert!(metadata.contains("\"backend\": \"simulator\""));
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
@@ -535,6 +536,68 @@ fn kv_acq_binary_runs_benchmark_command() {
     cleanup_dir(&output_dir);
 }
 
+#[test]
+fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
+    let command = parse_args([
+        "rhd-smoke",
+        "--blocks",
+        "2",
+        "--streams",
+        "1",
+        "--raw-input",
+        "capture.bin",
+        "--output",
+        "rhd-out",
+    ])
+    .expect("args should parse");
+
+    let CliCommand::RhdSmoke(options) = command else {
+        panic!("expected RhdSmoke command");
+    };
+
+    assert_eq!(options.blocks, 2);
+    assert_eq!(options.enabled_streams, 1);
+    assert_eq!(options.raw_input, Some(PathBuf::from("capture.bin")));
+    assert_eq!(options.output_dir, PathBuf::from("rhd-out"));
+    assert!(options.bitfile_path.ends_with("keyvast_260607_with_UART.bit"));
+}
+
+#[test]
+fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
+    let output_dir = unique_output_dir("rhd-raw-smoke");
+    fs::create_dir_all(&output_dir).expect("test output dir should be creatable");
+    let raw_path = output_dir.join("capture.bin");
+    fs::write(&raw_path, build_rhd_raw_blocks(1, 1)).expect("raw capture should be writable");
+
+    let result = run_rhd_smoke(RhdSmokeOptions {
+        output_dir: output_dir.clone(),
+        blocks: 1,
+        enabled_streams: 1,
+        raw_input: Some(raw_path),
+        bitfile_path: PathBuf::from("unused.bit"),
+        frontpanel_dll_path: None,
+        serial: None,
+    })
+    .expect("raw RHD smoke should parse");
+
+    assert!(!result.hardware);
+    assert_eq!(result.acquisition.acquired_blocks, 1);
+    assert_eq!(result.recording.written_samples, 32 * 256);
+    assert_eq!(result.integrity.summary.missing_packets, 0);
+
+    let metadata = fs::read_to_string(output_dir.join("recording.json"))
+        .expect("metadata file should be readable");
+    assert!(metadata.contains("\"device_id\": \"rhd-xem7310\""));
+    assert!(metadata.contains("\"backend\": \"rhd-frontpanel\""));
+    assert!(metadata.contains("\"channel_count\": 32"));
+
+    let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
+        .expect("benchmark file should be readable");
+    assert!(benchmark.contains("\"measurement_kind\": \"rhd_raw_input\""));
+
+    cleanup_dir(&output_dir);
+}
+
 fn unique_output_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -550,4 +613,50 @@ fn cleanup_dir(path: &Path) {
     if path.exists() {
         fs::remove_dir_all(path).expect("test output directory should be removable");
     }
+}
+
+fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
+    const SAMPLES_PER_BLOCK: usize = 256;
+    const CHANNELS_PER_STREAM: usize = 32;
+    const HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
+
+    let words_per_frame = 4
+        + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + (enabled_streams % 4)
+        + 8
+        + 2;
+    let mut raw = Vec::with_capacity(block_count * SAMPLES_PER_BLOCK * words_per_frame * 2);
+
+    for block in 0..block_count {
+        for sample in 0..SAMPLES_PER_BLOCK {
+            raw.extend_from_slice(&HEADER_MAGIC.to_le_bytes());
+            let timestamp = (block * SAMPLES_PER_BLOCK + sample) as u32;
+            raw.extend_from_slice(&timestamp.to_le_bytes());
+
+            for _ in 0..3 {
+                for stream in 0..enabled_streams {
+                    raw.extend_from_slice(&(0x0100_u16 + stream as u16).to_le_bytes());
+                }
+            }
+
+            for channel in 0..CHANNELS_PER_STREAM {
+                for stream in 0..enabled_streams {
+                    let signed = (stream * 1000 + channel) as i32;
+                    raw.extend_from_slice(&((signed + 32_768) as u16).to_le_bytes());
+                }
+            }
+
+            for _ in 0..(enabled_streams % 4) {
+                raw.extend_from_slice(&0_u16.to_le_bytes());
+            }
+            for _ in 0..8 {
+                raw.extend_from_slice(&0_u16.to_le_bytes());
+            }
+            raw.extend_from_slice(&0x0001_u16.to_le_bytes());
+            raw.extend_from_slice(&0_u16.to_le_bytes());
+        }
+    }
+
+    raw
 }

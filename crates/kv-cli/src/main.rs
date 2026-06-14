@@ -64,6 +64,24 @@ fn main() -> ExitCode {
             println!("measurement_kind=measured_streaming");
             ExitCode::SUCCESS
         }
+        Ok(CommandResult::RhdSmoke(result)) => {
+            println!("output_dir={}", result.recording.output_dir.display());
+            println!("acquired_blocks={}", result.acquisition.acquired_blocks);
+            println!("written_samples={}", result.recording.written_samples);
+            println!(
+                "missing_packets={}",
+                result.integrity.summary.missing_packets
+            );
+            println!(
+                "measurement_kind={}",
+                if result.hardware {
+                    "rhd_hardware_smoke"
+                } else {
+                    "rhd_raw_input"
+                }
+            );
+            ExitCode::SUCCESS
+        }
         Err(error) => {
             eprintln!("error: {error}");
             ExitCode::FAILURE

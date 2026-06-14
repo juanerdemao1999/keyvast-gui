@@ -72,6 +72,10 @@ impl SimulatorBackend {
             samples_per_channel: self.config.device.samples_per_packet,
             ttl_bits: self.ttl_bits(packet_id),
             data: self.samples_for_packet(packet_id, timestamp_start),
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
         };
 
         block
@@ -255,13 +259,14 @@ fn triangle_wave(sample_index: u64) -> i32 {
 }
 
 fn spike_component(seed: u64, sample_index: u64, channel: usize) -> i32 {
-    if channel >= 8 {
-        return 0;
-    }
+    // Channel-dependent spike rate: lower channels spike more often.
+    // Modulus controls rarity — higher modulus = fewer spikes.
+    let rarity = 512 + (channel as u64 % 8) * 128;
 
     let event_seed =
         seed ^ (sample_index / DEFAULT_SAMPLES_PER_PACKET as u64) ^ (channel as u64 * 17);
-    if mix_u64(event_seed).is_multiple_of(512) && sample_index % 6 <= 2 {
+    if mix_u64(event_seed).is_multiple_of(rarity) && sample_index % 6 <= 2 {
+        // 3-sample biphasic spike template
         match sample_index % 6 {
             0 => -180,
             1 => 260,

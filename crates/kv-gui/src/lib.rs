@@ -7,15 +7,25 @@
 //! signals (spikes, LFP, bursts) for demonstration without hardware.
 
 mod app;
+mod channel_map;
+mod channel_select;
+mod config_persist;
 mod demo;
 mod disp_ring;
+mod diskspace;
 mod dsp;
+mod fft_panel;
+mod impedance_panel;
 mod live_pipeline;
 mod multiview;
 mod panels;
-mod spike_overlay;
+mod playback;
 mod preview;
+mod remote_api;
+mod spike_overlay;
 mod theme;
+mod toast;
+mod trigger;
 mod waveform;
 
 pub use app::KvApp;

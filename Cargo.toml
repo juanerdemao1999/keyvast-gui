@@ -5,11 +5,18 @@ members = [
     "crates/kv-core",
     "crates/kv-gui",
     "crates/kv-integrity",
+    "crates/kv-rhd",
     "crates/kv-recorder",
     "crates/kv-simulator",
     "crates/kv-types",
 ]
 resolver = "3"
+
+# Real-time signal display benefits from cross-crate inlining of the filter
+# and ring-buffer hot paths.
+[profile.release]
+lto = "thin"
+codegen-units = 1
 
 [workspace.package]
 edition = "2024"

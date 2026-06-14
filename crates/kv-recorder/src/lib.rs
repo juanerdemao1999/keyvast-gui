@@ -1,9 +1,11 @@
 //! Raw recorder for Keyvast sample blocks.
 
+pub mod export_formats;
+
 use std::{
     fmt,
     fs::{self, File},
-    io::{BufWriter, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -114,6 +116,14 @@ pub fn write_recording(
     output_dir: impl AsRef<Path>,
     blocks: &[SampleBlock],
 ) -> Result<RecordingSummary, RecorderError> {
+    write_recording_with_backend(output_dir, blocks, "simulator")
+}
+
+pub fn write_recording_with_backend(
+    output_dir: impl AsRef<Path>,
+    blocks: &[SampleBlock],
+    backend: &str,
+) -> Result<RecordingSummary, RecorderError> {
     validate_blocks(blocks)?;
 
     let output_dir = output_dir.as_ref().to_path_buf();
@@ -126,7 +136,7 @@ pub fn write_recording(
     let metadata_path = output_dir.join("recording.json");
 
     write_raw_file(&raw_path, blocks)?;
-    write_metadata_file(&metadata_path, blocks)?;
+    write_metadata_file(&metadata_path, blocks, backend)?;
 
     Ok(RecordingSummary {
         output_dir,
@@ -292,8 +302,12 @@ fn write_raw_file(path: &Path, blocks: &[SampleBlock]) -> Result<(), RecorderErr
     })
 }
 
-fn write_metadata_file(path: &Path, blocks: &[SampleBlock]) -> Result<(), RecorderError> {
-    let metadata = recording_metadata_json(blocks);
+fn write_metadata_file(
+    path: &Path,
+    blocks: &[SampleBlock],
+    backend: &str,
+) -> Result<(), RecorderError> {
+    let metadata = recording_metadata_json(blocks, backend);
 
     fs::write(path, metadata).map_err(|source| RecorderError::Io {
         path: path.to_path_buf(),
@@ -301,7 +315,7 @@ fn write_metadata_file(path: &Path, blocks: &[SampleBlock]) -> Result<(), Record
     })
 }
 
-fn recording_metadata_json(blocks: &[SampleBlock]) -> String {
+fn recording_metadata_json(blocks: &[SampleBlock], backend: &str) -> String {
     let Some(first) = blocks.first() else {
         return empty_recording_metadata_json();
     };
@@ -316,7 +330,7 @@ fn recording_metadata_json(blocks: &[SampleBlock]) -> String {
             "  \"format\": \"kvraw\",\n",
             "  \"format_version\": 1,\n",
             "  \"device_id\": \"{}\",\n",
-            "  \"backend\": \"simulator\",\n",
+            "  \"backend\": \"{}\",\n",
             "  \"sample_rate\": {},\n",
             "  \"channel_count\": {},\n",
             "  \"samples_per_packet\": {},\n",
@@ -330,6 +344,7 @@ fn recording_metadata_json(blocks: &[SampleBlock]) -> String {
             "}}\n"
         ),
         escape_json_string(&first.device_id),
+        escape_json_string(backend),
         format_sample_rate(first.sample_rate),
         first.channel_count,
         first.samples_per_channel,
@@ -629,6 +644,10 @@ impl StreamingRecorder {
         self.block_count
     }
 
+    pub fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
     /// Write one block, validating consistency and appending raw samples.
     pub fn write_block(&mut self, block: &SampleBlock) -> Result<(), RecorderError> {
         block
@@ -786,6 +805,18 @@ impl StreamingRecorder {
             return empty_recording_metadata_json();
         };
 
+        // Infer backend from device_id: "demo-*" → demo, "rhd-*" → rhd-hardware,
+        // "simulator-*" → simulator.  Falls back to the raw device_id prefix.
+        let backend = if device_id.starts_with("demo") {
+            "demo"
+        } else if device_id.starts_with("rhd") {
+            "rhd-hardware"
+        } else if device_id.starts_with("simulator") {
+            "simulator"
+        } else {
+            device_id.split('-').next().unwrap_or("unknown")
+        };
+
         format!(
             concat!(
                 "{{\n",
@@ -793,7 +824,7 @@ impl StreamingRecorder {
                 "  \"format_version\": 2,\n",
                 "  \"data_offset_bytes\": {},\n",
                 "  \"device_id\": \"{}\",\n",
-                "  \"backend\": \"simulator\",\n",
+                "  \"backend\": \"{}\",\n",
                 "  \"sample_rate\": {},\n",
                 "  \"channel_count\": {},\n",
                 "  \"samples_per_channel\": {},\n",
@@ -809,6 +840,7 @@ impl StreamingRecorder {
             ),
             KVRAW_DATA_OFFSET,
             escape_json_string(device_id),
+            escape_json_string(backend),
             format_sample_rate(self.sample_rate.unwrap_or(0.0)),
             self.channel_count.unwrap_or(0),
             self.samples_per_packet.unwrap_or(0),
@@ -902,4 +934,338 @@ fn escape_json_string(value: &str) -> String {
     }
 
     escaped
+}
+
+// ── KVRAW v2 Reader ──────────────────────────────────────────────────────────
+
+/// Metadata parsed from a KVRAW v2 file header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KvrawMetadata {
+    pub format_version: u32,
+    pub data_offset_bytes: u64,
+    pub device_id: String,
+    pub backend: String,
+    pub sample_rate: f64,
+    pub channel_count: usize,
+    pub samples_per_channel: usize,
+    pub written_samples: u64,
+    pub block_count: u64,
+    pub first_packet_id: Option<u64>,
+    pub last_packet_id: Option<u64>,
+    pub clean_stop: bool,
+}
+
+impl KvrawMetadata {
+    /// Total number of complete multi-channel samples in the file.
+    /// Each "sample" contains `channel_count` i16 values.
+    pub fn total_frames(&self) -> u64 {
+        if self.channel_count == 0 {
+            return 0;
+        }
+        self.written_samples / self.channel_count as u64
+    }
+
+    /// Duration in seconds.
+    pub fn duration_seconds(&self) -> f64 {
+        if self.sample_rate <= 0.0 {
+            return 0.0;
+        }
+        self.total_frames() as f64 / self.sample_rate
+    }
+}
+
+/// Reader for KVRAW v2 files (embedded JSON header + raw i16 samples).
+pub struct KvrawReader {
+    reader: BufReader<File>,
+    metadata: KvrawMetadata,
+    data_start: u64,
+    file_size: u64,
+}
+
+impl KvrawReader {
+    /// Open a .kvraw file and parse its embedded header.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RecorderError> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let file_size = file.metadata()
+            .map_err(|source| RecorderError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len();
+
+        let mut reader = BufReader::new(file);
+
+        // Read magic
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic).map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+        // Check for KVRAW v2 (embedded header) vs v1 (external JSON)
+        let (metadata, data_start) = if &magic == KVRAW_MAGIC {
+            // v2: embedded JSON header
+            let mut json_len_bytes = [0u8; 4];
+            reader.read_exact(&mut json_len_bytes).map_err(|source| RecorderError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let json_len = u32::from_le_bytes(json_len_bytes) as usize;
+            let json_len = json_len.min(KVRAW_JSON_RESERVED);
+
+            let mut json_block = vec![0u8; KVRAW_JSON_RESERVED];
+            reader.read_exact(&mut json_block).map_err(|source| RecorderError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+            let json_str = std::str::from_utf8(&json_block[..json_len])
+                .unwrap_or("{}");
+            let meta = parse_kvraw_json(json_str);
+            let data_offset = meta.data_offset_bytes;
+            (meta, data_offset)
+        } else {
+            // v1: no embedded header — try loading companion .json file
+            let json_path = path.with_extension("json");
+            let meta = if json_path.exists() {
+                let json_str = fs::read_to_string(&json_path)
+                    .map_err(|source| RecorderError::Io {
+                        path: json_path,
+                        source,
+                    })?;
+                parse_kvraw_json(&json_str)
+            } else {
+                // Minimal fallback
+                KvrawMetadata {
+                    format_version: 1,
+                    data_offset_bytes: 0,
+                    device_id: String::new(),
+                    backend: String::new(),
+                    sample_rate: 30_000.0,
+                    channel_count: 64,
+                    samples_per_channel: 0,
+                    written_samples: 0,
+                    block_count: 0,
+                    first_packet_id: None,
+                    last_packet_id: None,
+                    clean_stop: false,
+                }
+            };
+            // v1 files have raw data from offset 0
+            (meta, 0)
+        };
+
+        // If written_samples is 0, compute from file size.
+        let mut metadata = metadata;
+        if metadata.written_samples == 0 && metadata.channel_count > 0 {
+            let data_bytes = file_size.saturating_sub(data_start);
+            metadata.written_samples = data_bytes / 2; // i16 = 2 bytes
+        }
+
+        Ok(Self {
+            reader,
+            metadata,
+            data_start,
+            file_size,
+        })
+    }
+
+    /// Get the parsed metadata.
+    pub fn metadata(&self) -> &KvrawMetadata {
+        &self.metadata
+    }
+
+    /// Total number of time-frames in the file.
+    pub fn total_frames(&self) -> u64 {
+        self.metadata.total_frames()
+    }
+
+    /// Read a range of frames as interleaved i16 samples.
+    /// Returns `channel_count * num_frames` i16 values.
+    pub fn read_frames(
+        &mut self,
+        start_frame: u64,
+        num_frames: usize,
+    ) -> Result<Vec<i16>, RecorderError> {
+        let ch = self.metadata.channel_count;
+        if ch == 0 {
+            return Ok(Vec::new());
+        }
+
+        let max_frames = self.total_frames();
+        let start_frame = start_frame.min(max_frames);
+        let available = (max_frames - start_frame) as usize;
+        let num_frames = num_frames.min(available);
+        if num_frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        let sample_offset = start_frame * ch as u64;
+        let byte_offset = self.data_start + sample_offset * 2;
+        let total_samples = ch * num_frames;
+        let byte_count = total_samples * 2;
+
+        self.reader
+            .seek(SeekFrom::Start(byte_offset))
+            .map_err(|source| RecorderError::Io {
+                path: PathBuf::from("<kvraw>"),
+                source,
+            })?;
+
+        let mut bytes = vec![0u8; byte_count];
+        self.reader
+            .read_exact(&mut bytes)
+            .map_err(|source| RecorderError::Io {
+                path: PathBuf::from("<kvraw>"),
+                source,
+            })?;
+
+        let samples: Vec<i16> = bytes
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+
+        Ok(samples)
+    }
+
+    /// Read a range of frames and return per-channel vectors.
+    /// Returns `channel_count` vectors, each with `num_frames` samples.
+    pub fn read_channels(
+        &mut self,
+        start_frame: u64,
+        num_frames: usize,
+    ) -> Result<Vec<Vec<i16>>, RecorderError> {
+        let ch = self.metadata.channel_count;
+        let interleaved = self.read_frames(start_frame, num_frames)?;
+        let actual_frames = interleaved.len() / ch.max(1);
+
+        let mut channels: Vec<Vec<i16>> = (0..ch)
+            .map(|_| Vec::with_capacity(actual_frames))
+            .collect();
+
+        for frame in interleaved.chunks_exact(ch) {
+            for (c, &sample) in frame.iter().enumerate() {
+                channels[c].push(sample);
+            }
+        }
+
+        Ok(channels)
+    }
+}
+
+impl fmt::Debug for KvrawReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvrawReader")
+            .field("metadata", &self.metadata)
+            .field("data_start", &self.data_start)
+            .field("file_size", &self.file_size)
+            .finish()
+    }
+}
+
+/// Minimal JSON parser for KVRAW metadata.  Avoids adding serde as a
+/// dependency — the JSON is always machine-generated with a known schema.
+fn parse_kvraw_json(json: &str) -> KvrawMetadata {
+    let get_str = |key: &str| -> String {
+        json.find(&format!("\"{key}\""))
+            .and_then(|pos| {
+                let after = &json[pos + key.len() + 2..];
+                let colon = after.find(':')?;
+                let rest = after[colon + 1..].trim_start();
+                let value = rest.strip_prefix('"')?;
+                let end = value.find('"')?;
+                Some(value[..end].to_string())
+            })
+            .unwrap_or_default()
+    };
+
+    let get_u64 = |key: &str| -> u64 {
+        json.find(&format!("\"{key}\""))
+            .and_then(|pos| {
+                let after = &json[pos + key.len() + 2..];
+                let colon = after.find(':')?;
+                let rest = after[colon + 1..].trim_start();
+                // Extract numeric chars
+                let num_str: String = rest.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                num_str.parse().ok()
+            })
+            .unwrap_or(0)
+    };
+
+    let get_f64 = |key: &str| -> f64 {
+        json.find(&format!("\"{key}\""))
+            .and_then(|pos| {
+                let after = &json[pos + key.len() + 2..];
+                let colon = after.find(':')?;
+                let rest = after[colon + 1..].trim_start();
+                let num_str: String = rest.chars()
+                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E' || *c == '+')
+                    .collect();
+                num_str.parse().ok()
+            })
+            .unwrap_or(0.0)
+    };
+
+    let get_optional_u64 = |key: &str| -> Option<u64> {
+        json.find(&format!("\"{key}\""))
+            .and_then(|pos| {
+                let after = &json[pos + key.len() + 2..];
+                let colon = after.find(':')?;
+                let rest = after[colon + 1..].trim_start();
+                if rest.starts_with("null") {
+                    return None;
+                }
+                let num_str: String = rest.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                num_str.parse().ok()
+            })
+    };
+
+    let get_bool = |key: &str| -> bool {
+        json.find(&format!("\"{key}\""))
+            .and_then(|pos| {
+                let after = &json[pos + key.len() + 2..];
+                let colon = after.find(':')?;
+                let rest = after[colon + 1..].trim_start();
+                if rest.starts_with("true") {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            })
+            .unwrap_or(false)
+    };
+
+    let format_version = get_u64("format_version") as u32;
+    let data_offset = if format_version >= 2 {
+        get_u64("data_offset_bytes")
+    } else {
+        0
+    };
+
+    KvrawMetadata {
+        format_version,
+        data_offset_bytes: if data_offset > 0 {
+            data_offset
+        } else {
+            KVRAW_DATA_OFFSET
+        },
+        device_id: get_str("device_id"),
+        backend: get_str("backend"),
+        sample_rate: get_f64("sample_rate"),
+        channel_count: get_u64("channel_count") as usize,
+        samples_per_channel: get_u64("samples_per_channel") as usize,
+        written_samples: get_u64("written_samples"),
+        block_count: get_u64("block_count"),
+        first_packet_id: get_optional_u64("first_packet_id"),
+        last_packet_id: get_optional_u64("last_packet_id"),
+        clean_stop: get_bool("clean_stop"),
+    }
 }

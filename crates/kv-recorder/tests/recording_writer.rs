@@ -260,6 +260,10 @@ fn sample_block(
         samples_per_channel,
         ttl_bits: 0,
         data,
+        aux_data: None,
+        board_adc_data: None,
+        ttl_in_per_sample: None,
+        ttl_out_per_sample: None,
     }
 }
 
@@ -439,6 +443,51 @@ fn streaming_recorder_rejects_inconsistent_device_id() {
             ..
         }
     ));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvraw_reader_round_trips_streaming_data() {
+    use kv_recorder::KvrawReader;
+
+    let output_dir = unique_output_dir("reader-round-trip");
+    let blocks = next_simulator_blocks(5);
+    let ch = blocks[0].channel_count;
+    let sr = blocks[0].sample_rate;
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    for block in &blocks {
+        recorder.write_block(block).expect("write");
+    }
+    recorder.finish().expect("finish");
+
+    let raw_path = output_dir.join("recording.kvraw");
+    let mut reader = KvrawReader::open(&raw_path).expect("open kvraw");
+
+    let meta = reader.metadata();
+    assert_eq!(meta.channel_count, ch);
+    assert!((meta.sample_rate - sr).abs() < 0.1);
+    assert!(meta.total_frames() > 0);
+
+    // Read first 256 frames and verify shape.
+    let frames_to_read = 256.min(meta.total_frames() as usize);
+    let data = reader.read_frames(0, frames_to_read).expect("read frames");
+    assert_eq!(data.len(), ch * frames_to_read);
+
+    // Read as per-channel vectors.
+    let channels = reader.read_channels(0, frames_to_read).expect("read channels");
+    assert_eq!(channels.len(), ch);
+    for c in &channels {
+        assert_eq!(c.len(), frames_to_read);
+    }
+
+    // Verify interleaved and per-channel agree.
+    for frame in 0..frames_to_read {
+        for c in 0..ch {
+            assert_eq!(data[frame * ch + c], channels[c][frame]);
+        }
+    }
 
     cleanup_dir(&output_dir);
 }

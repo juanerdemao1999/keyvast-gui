@@ -885,7 +885,8 @@ impl RhythmFrontPanelBoard {
     /// sweep all 16 FPGA MISO delays, measuring how many amplifier words are railed
     /// (idle-high 0xFFFF / 0x0000). A correctly-delayed, populated port reports ~0%
     /// railed; an empty port reports ~100% at every delay. We keep the least-railed
-    /// port and, like scanPorts, pick a middle "good" delay for timing margin.
+    /// port and, like Open Ephys scanPorts, pick the second good delay
+    /// (indexSecondGoodDelay) for timing margin.
     ///
     /// Each probe enables exactly `enabled_streams` streams (the same count
     /// acquisition will use), so the FPGA frame size during the scan matches what the
@@ -953,9 +954,13 @@ impl RhythmFrontPanelBoard {
                 (low_railed_delays, false)
             };
 
-            // Mirror scanPorts: 1-2 good delays -> first; >2 -> a middle one (margin).
+            // Match Open Ephys DeviceThread::scanPorts exactly: 1-2 good delays ->
+            // the first; >2 -> the SECOND good delay (indexSecondGoodDelay), NOT the
+            // middle. good_delays is in ascending order, so [..] index 1 is the
+            // second. On this rig the second good delay (5 for good delays 4-7) reads
+            // measurably quieter in the 5-300 Hz / mains band than the middle (6).
             let chosen_delay = if good_delays.len() > 2 {
-                good_delays[good_delays.len() / 2]
+                good_delays[1]
             } else if let Some(&d) = good_delays.first() {
                 d
             } else {

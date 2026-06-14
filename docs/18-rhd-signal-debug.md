@@ -175,3 +175,75 @@ this is a real kv-rhd vs Open Ephys difference, not ambient pickup.
   on identical hardware+environment. Most promising lever so far: the MISO cable-delay
   selection (Open Ephys = indexSecondGoodDelay = 5; kv-rhd picked 6). Needs a cleaner,
   fluctuation-robust delay-selection + likely a power-rail check.
+
+---
+
+# Session 2 — 2026-06-15 (follow-up)
+
+Continued on host **DESKTOP-LJQ11QD** (the OE reference recording in
+`openephys_data/` was made on a *different* host, **DESKTOP-Q9LU978**, OE GUI 1.0.2).
+**Capturing requires a power-cycle of the device before each run.**
+
+## 9. Changes shipped this session (commit on `devin/1781369404-gui-ux-overhaul`)
+Acted on the §6 leads and hardened the bring-up. All in `kv-rhd`:
+
+- **MISO delay rule now matches Open Ephys exactly** (`backend.rs`
+  `scan_ports_for_headstage`): for >2 chip-ID-valid delays pick the **second**
+  (`good_delays[1]` = `indexSecondGoodDelay`, → delay **5** for good delays 4–7),
+  not the middle (was delay 6). This is the §6/§8 "most promising lever".
+- **Upper bandwidth 10000 → 7500 Hz** (`commands.rs`) to match OE `HighCut=7500`.
+  Test `default_registers_match_open_ephys_rhd_30khz_settings` updated (RH1/RH2 DAC
+  regs 8/10 = 22/23 for 7.5 kHz; were 17/16 for 10 kHz).
+- **Board analog plane reset added to `configure()`** (`reset_board_analog_state`),
+  mirroring OE `initializeBoard`: DAC re-ref off (`WireInDacReref` 0x0e), all 8 DACs
+  off (`WireInDacSource1..8` 0x16–0x1d), `setDacManual(32768)`, DAC gain / audio
+  noise-suppress 0, **external fast-settle off** (TrigInConfig bit 6), external
+  dig-out off (TrigInDacConfig bits 16–23).
+- **No more silent wrong-phase fallback**: if no chip answers after the scan budget,
+  `configure()` returns `RhdReadError::HeadstageNotFound` instead of arming Port A /
+  delay 0 (which records half-scale 0x4000). Scan budget raised `SCAN_MAX_ATTEMPTS`
+  6 → 12 (~8.4 s) to exceed the ~6 s I²C power retry cadence.
+- **Post-delay centering guard**: after the delay is committed, a short probe checks
+  the amplifier mean; a mean in 0x3000–0x5000 (the half-scale signature) now aborts
+  with `RhdReadError::HalfScaleAmplifierData` instead of recording corrupt data.
+
+## 10. Board analog reset (DAC re-ref etc.) is RULED OUT for the mains excess
+Hypothesis: a hardware DAC-reref / external-fast-settle left enabled by FPGA
+power-up could inject a common reference into every channel (would also explain
+shorted-to-REF channels carrying mains). **Tested on a clean power-cycle** with the
+reset in place (`pc_run`, log shows `board analog plane reset...`, centering 0x7d71):
+
+| metric | result |
+|---|---|
+| shorted-ch 50 Hz | **~3322 µV — unchanged** |
+| shorted-ch std | ~5800 µV (still rail-grazing) |
+| first block range | **shrank** to −2384..2216 (board reset *did* tame the startup transient) |
+
+→ DAC re-ref / DACs / external fast-settle are **not** the cause of the steady-state
+mains. Board reset stays (correct + tames startup), but it is not the fix.
+
+## 11. What the on-disk captures this session show
+- 30 s capture (`long_run`, 3600 blocks): acquisition is **rock-solid** — 0 missing
+  packets, 0 timestamp gaps, 0 errors; `read_block` never errors. So "signal goes
+  flat after a few seconds" is **not** a data/acquisition stall: the data keeps
+  streaming a persistent, clipped ~50 Hz. The on-screen "flat line" is the display
+  pinning an over-range (mV-scale) signal at the window edges.
+- The mains amplitude here is **much larger** than Session 1's numbers (this session:
+  ~3–6 mV on every channel incl. shorted; Session 1 table: ~271 µV). The pickup is
+  highly variable and host/environment dependent. On a channel **shorted to REF**,
+  6 mV can only come from common-mode 50 Hz beyond the amplifier's CM range (a
+  floating analog ground/reference) — by signal physics, not a digital artifact.
+
+## 12. Where it stands / the decisive next test
+Every layer comparable in *software* now matches Open Ephys: RHD registers, on-chip
+bandwidth + DSP, ADC calibration, board analog state, data-block format, sample-rate
+PLL, centering, **and the MISO delay rule**. If the mains excess persists after this,
+the only remaining software-controllable suspect is outside `kv-rhd` (the KeyVast
+MicroBlaze power/reference bring-up, §1 control plane) — i.e. a marginal isolated
+rail degrading amplifier CMRR.
+
+**To settle software-vs-environment for good, do an A/B on the SAME rig, each after
+its own power-cycle:** record with **OpenEphys 0.6.7** (note its settings; keep the
+`continuous.dat`) and with **this branch's GUI** (`.kvraw`), then diff. If OE is
+clean (~tens of µV) and the GUI is not on the same rig, the difference is isolated
+and software; if both show mV-scale mains, it is the rig's grounding/CMRR.

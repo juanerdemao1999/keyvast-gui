@@ -42,6 +42,11 @@ pub struct PersistentConfig {
     pub file_prefix: String,
     // Remote API
     pub remote_port: u16,
+    // App / window (#15, #17)
+    pub ui_scale: f32,
+    pub window_width: f32,
+    pub window_height: f32,
+    pub last_source: String, // "demo", "device" or "playback"
 }
 
 impl Default for PersistentConfig {
@@ -65,8 +70,18 @@ impl Default for PersistentConfig {
             output_dir: "recordings".to_string(),
             file_prefix: "session".to_string(),
             remote_port: 4444,
+            ui_scale: 1.0,
+            window_width: 1200.0,
+            window_height: 800.0,
+            last_source: "demo".to_string(),
         }
     }
+}
+
+/// Load the persisted config from its default location, falling back to
+/// defaults if no file exists yet.  Used at startup before the app is built.
+pub fn load_or_default() -> PersistentConfig {
+    load_config(&default_config_path()).unwrap_or_default()
 }
 
 // ── Persistence state ───────────────────────────────────────────────
@@ -126,7 +141,11 @@ impl PersistentConfig {
   "car_enabled": {car_enabled},
   "output_dir": "{output_dir}",
   "file_prefix": "{file_prefix}",
-  "remote_port": {remote_port}
+  "remote_port": {remote_port},
+  "ui_scale": {ui_scale:.2},
+  "window_width": {window_width:.0},
+  "window_height": {window_height:.0},
+  "last_source": "{last_source}"
 }}"#,
             visible_channels = self.visible_channels,
             time_scale_idx = self.time_scale_idx,
@@ -146,6 +165,10 @@ impl PersistentConfig {
             output_dir = self.output_dir.replace('\\', "\\\\").replace('"', "\\\""),
             file_prefix = self.file_prefix.replace('"', "\\\""),
             remote_port = self.remote_port,
+            ui_scale = self.ui_scale,
+            window_width = self.window_width,
+            window_height = self.window_height,
+            last_source = self.last_source,
         )
     }
 
@@ -171,6 +194,10 @@ impl PersistentConfig {
         if let Some(v) = extract_string(json, "output_dir") { cfg.output_dir = v; }
         if let Some(v) = extract_string(json, "file_prefix") { cfg.file_prefix = v; }
         if let Some(v) = extract_usize(json, "remote_port") { cfg.remote_port = v as u16; }
+        if let Some(v) = extract_f64(json, "ui_scale") { cfg.ui_scale = v as f32; }
+        if let Some(v) = extract_f64(json, "window_width") { cfg.window_width = v as f32; }
+        if let Some(v) = extract_f64(json, "window_height") { cfg.window_height = v as f32; }
+        if let Some(v) = extract_string(json, "last_source") { cfg.last_source = v; }
 
         cfg
     }
@@ -205,6 +232,9 @@ impl PersistentConfig {
             output_dir: output_dir.to_string(),
             file_prefix: file_prefix.to_string(),
             remote_port,
+            // #15/#17 fields are filled in by the caller (capture_persistent);
+            // start from the defaults so this constructor stays valid.
+            ..Self::default()
         }
     }
 
@@ -263,6 +293,7 @@ pub fn load_config(path: &PathBuf) -> Result<PersistentConfig, String> {
 pub fn draw_config_section(
     ui: &mut egui::Ui,
     state: &mut ConfigPersistState,
+    ui_scale: &mut f32,
     save_clicked: &mut bool,
     load_clicked: &mut bool,
 ) {
@@ -274,6 +305,20 @@ pub fn draw_config_section(
     )
     .default_open(false)
     .show(ui, |ui| {
+        // UI scale (#17) — scales the whole interface for high-DPI or distance
+        // viewing.  Applied live and persisted with the rest of the config.
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("UI scale").size(10.0));
+            ui.add(
+                egui::Slider::new(ui_scale, 0.8..=1.6)
+                    .step_by(0.05)
+                    .fixed_decimals(2),
+            );
+            if ui.button(egui::RichText::new("Reset").size(10.0)).clicked() {
+                *ui_scale = 1.0;
+            }
+        });
+
         // Auto-save toggle
         ui.checkbox(
             &mut state.auto_save,

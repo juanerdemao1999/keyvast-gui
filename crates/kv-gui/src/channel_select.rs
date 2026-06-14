@@ -47,7 +47,11 @@ impl ChannelSelectState {
         if !self.enabled {
             return self.channel_count;
         }
-        self.selected.iter().take(self.channel_count).filter(|&&s| s).count()
+        self.selected
+            .iter()
+            .take(self.channel_count)
+            .filter(|&&s| s)
+            .count()
     }
 
     /// Get ordered list of selected channel indices.
@@ -127,85 +131,368 @@ pub fn filter_block_channels(block: &SampleBlock, indices: &[usize]) -> SampleBl
     }
 }
 
+// ── Channel filter (#9) ─────────────────────────────────────────────
+
+/// Whether channel `ch` should be shown given the filter/jump box text.
+///
+/// Accepts comma-separated tokens, each either a single number (`5`) or an
+/// inclusive range (`0-15`).  Empty filter shows everything.  If nothing
+/// numeric parses, falls back to a substring match on the `chN` label.
+fn channel_matches(ch: usize, filter: &str) -> bool {
+    let f = filter.trim();
+    if f.is_empty() {
+        return true;
+    }
+    let mut any_numeric = false;
+    for tok in f.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some((a, b)) = tok.split_once('-')
+            && let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>())
+        {
+            any_numeric = true;
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            if ch >= lo && ch <= hi {
+                return true;
+            }
+            continue;
+        }
+        if let Ok(n) = tok.parse::<usize>() {
+            any_numeric = true;
+            if ch == n {
+                return true;
+            }
+            continue;
+        }
+    }
+    if !any_numeric {
+        return format!("ch{ch}").contains(&f.to_lowercase());
+    }
+    false
+}
+
+/// Draw a tiny min/max-normalized waveform of the latest block for one channel
+/// (#10), giving an at-a-glance health check per row.
+fn draw_row_sparkline(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    block: &SampleBlock,
+    ch: usize,
+    color: egui::Color32,
+) {
+    let cc = block.channel_count;
+    let n = block.samples_per_channel;
+    if cc == 0 || n == 0 || ch >= cc {
+        return;
+    }
+    let max_pts = 40usize;
+    let stride = (n / max_pts).max(1);
+    let mut samples: Vec<f32> = Vec::with_capacity(max_pts + 1);
+    let mut i = 0;
+    while i < n {
+        samples.push(block.data[i * cc + ch] as f32);
+        i += stride;
+    }
+    if samples.len() < 2 {
+        return;
+    }
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for &v in &samples {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let span = (hi - lo).max(1.0);
+    let pad = 1.5;
+    let h = rect.height() - 2.0 * pad;
+    let last = (samples.len() - 1) as f32;
+    let pts: Vec<egui::Pos2> = samples
+        .iter()
+        .enumerate()
+        .map(|(k, &v)| {
+            let x = rect.left() + rect.width() * (k as f32 / last);
+            let t = (v - lo) / span;
+            let y = rect.bottom() - pad - t * h;
+            egui::pos2(x, y)
+        })
+        .collect();
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
+}
+
 // ── GUI drawing ─────────────────────────────────────────────────────
 
-/// Draw the channel selection section in the sidebar.
-pub fn draw_channel_select_section(
+/// Unified channel panel (B3).
+///
+/// Merges the former display-channel list and recording-channel selector into
+/// a single place, with one row per channel exposing both a **Disp** toggle
+/// (whether the channel is drawn) and a **Rec** toggle (whether it is written
+/// to disk).  The Rec column is only interactive when "Record subset only" is
+/// enabled, and is locked entirely while a recording is in progress (`rec_locked`,
+/// B2) since the on-disk channel set is fixed when recording starts.
+pub fn draw_unified_channels(
     ui: &mut egui::Ui,
-    state: &mut ChannelSelectState,
+    display: &mut crate::panels::DisplaySettings,
+    select: &mut ChannelSelectState,
+    block: Option<&SampleBlock>,
+    rec_locked: bool,
 ) {
+    let ch_count = block.map(|b| b.channel_count).unwrap_or(0);
+    let visible = display.visible_channels.min(ch_count);
+    select.sync_channel_count(ch_count);
+
     egui::CollapsingHeader::new(
-        egui::RichText::new("CHANNEL SELECTION (REC)")
-            .size(11.0)
+        egui::RichText::new(format!("CHANNELS ({visible})"))
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
     .default_open(false)
     .show(ui, |ui| {
-        ui.checkbox(
-            &mut state.enabled,
-            egui::RichText::new("Save selected channels only").size(10.0),
-        );
-
-        if !state.enabled {
+        if visible == 0 {
             ui.label(
-                egui::RichText::new("All channels will be recorded")
-                    .size(9.0)
-                    .italics()
+                egui::RichText::new("No channels")
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             return;
         }
 
-        // Summary
-        let count = state.selected_count();
-        let total = state.channel_count;
+        // Ensure the display-enable vector covers every visible channel.
+        while display.channel_enabled.len() < visible {
+            display.channel_enabled.push(true);
+        }
+
+        // Recording-subset master toggle.
+        ui.add_enabled_ui(!rec_locked, |ui| {
+            ui.checkbox(
+                &mut select.enabled,
+                egui::RichText::new("Record subset only").size(theme::FONT_BODY),
+            )
+            .on_hover_text("When off, every channel is recorded regardless of the Rec column");
+        });
+
+        // Counts summary.
+        let disp_on = (0..visible)
+            .filter(|&i| display.channel_enabled.get(i).copied().unwrap_or(true))
+            .count();
+        let rec_on = select.selected_count().min(visible);
         ui.label(
-            egui::RichText::new(format!("{count}/{total} channels selected"))
-                .size(10.0)
-                .color(if count == 0 { theme::ACCENT_RED } else { theme::ACCENT_GREEN }),
+            egui::RichText::new(format!(
+                "Display {disp_on}/{visible}  \u{00B7}  Record {rec_on}/{visible}"
+            ))
+            .size(theme::FONT_CAPTION)
+            .color(theme::TEXT_DIM),
         );
 
-        // Quick actions
+        // Bulk actions — Display row.
         ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Disp")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
             if ui.small_button("All").clicked() {
-                state.select_all();
-            }
-            if ui.small_button("None").clicked() {
-                state.deselect_all();
-            }
-            if ui.small_button("Even").clicked() {
-                for ch in 0..state.channel_count {
-                    if let Some(s) = state.selected.get_mut(ch) {
-                        *s = ch % 2 == 0;
-                    }
+                for i in 0..visible {
+                    display.channel_enabled[i] = true;
                 }
             }
-            if ui.small_button("Odd").clicked() {
-                for ch in 0..state.channel_count {
-                    if let Some(s) = state.selected.get_mut(ch) {
-                        *s = ch % 2 == 1;
-                    }
+            if ui.small_button("None").clicked() {
+                for i in 0..visible {
+                    display.channel_enabled[i] = false;
+                }
+            }
+            if ui.small_button("Invert").clicked() {
+                for i in 0..visible {
+                    display.channel_enabled[i] = !display.channel_enabled[i];
                 }
             }
         });
 
-        // Channel grid (compact checkboxes)
-        ui.add_space(2.0);
-        let cols = 4;
-        egui::Grid::new("ch_select_grid")
-            .num_columns(cols)
-            .spacing(egui::vec2(2.0, 1.0))
-            .show(ui, |ui| {
-                for ch in 0..state.channel_count {
-                    let label = format!("{ch:2}");
-                    ui.checkbox(
-                        &mut state.selected[ch],
-                        egui::RichText::new(label).size(9.0).monospace(),
-                    );
-                    if (ch + 1) % cols == 0 {
-                        ui.end_row();
+        // Bulk actions — Record row (only when selecting a subset, unlocked).
+        // Wrapped so the full set (All/None/Invert/Even/Odd) flows onto a second
+        // line in the narrow side panel instead of clipping the last button.
+        ui.add_enabled_ui(select.enabled && !rec_locked, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("Rec ")
+                        .size(theme::FONT_CAPTION)
+                        .color(theme::TEXT_DIM),
+                );
+                if ui.small_button("All").clicked() {
+                    select.select_all();
+                }
+                if ui.small_button("None").clicked() {
+                    select.deselect_all();
+                }
+                if ui.small_button("Invert").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = !*s;
+                        }
                     }
+                }
+                if ui.small_button("Even").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = ch % 2 == 0;
+                        }
+                    }
+                }
+                if ui.small_button("Odd").clicked() {
+                    for ch in 0..select.channel_count {
+                        if let Some(s) = select.selected.get_mut(ch) {
+                            *s = ch % 2 == 1;
+                        }
+                    }
+                }
+            });
+        });
+
+        if rec_locked {
+            ui.label(
+                egui::RichText::new("\u{1F512} Record selection locked while recording")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
+        }
+
+        ui.add_space(2.0);
+
+        // Filter / jump box (#9) — quickly narrow a 64-channel list. Accepts a
+        // number, a range (`0-15`) or comma-separated mix.
+        let filter_id = ui.id().with("kv_chan_filter");
+        let mut filter: String = ui
+            .memory_mut(|m| m.data.get_temp::<String>(filter_id))
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Filter")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut filter)
+                    .hint_text("e.g. 5  or  0-15")
+                    .desired_width(104.0),
+            );
+            if !filter.is_empty()
+                && ui
+                    .small_button("\u{2715}")
+                    .on_hover_text("Clear filter")
+                    .clicked()
+            {
+                filter.clear();
+            }
+        });
+        ui.memory_mut(|m| m.data.insert_temp(filter_id, filter.clone()));
+
+        // Shared column widths so the pinned header lines up with scrolled rows.
+        const W_CH: f32 = 62.0;
+        const W_WAVE: f32 = 54.0;
+        const W_TOG: f32 = 34.0;
+        let header_cell = |ui: &mut egui::Ui, w: f32, text: &str| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(w, 14.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(text)
+                            .size(theme::FONT_CAPTION)
+                            .color(theme::TEXT_DIM),
+                    );
+                },
+            );
+        };
+
+        // Pinned column header (#11) — stays put while the list scrolls.
+        ui.horizontal(|ui| {
+            header_cell(ui, W_CH, "Channel");
+            header_cell(ui, W_WAVE, "Wave");
+            header_cell(ui, W_TOG, "Disp");
+            header_cell(ui, W_TOG, "Rec");
+        });
+        ui.separator();
+
+        // Per-channel rows: [color · CHn] [sparkline] [Disp] [Rec].
+        egui::ScrollArea::vertical()
+            .max_height(220.0)
+            .min_scrolled_width(190.0)
+            .show(ui, |ui| {
+                ui.set_min_width(190.0);
+                let mut shown = 0usize;
+                for ch in 0..visible {
+                    if !channel_matches(ch, &filter) {
+                        continue;
+                    }
+                    shown += 1;
+                    let color = theme::channel_color(ch);
+                    let disp_on = display.channel_enabled[ch];
+                    let label_color = if disp_on { color } else { theme::TEXT_DIM };
+
+                    ui.horizontal(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(W_CH, 16.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(3.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(bar_rect, 0.0, color);
+                                ui.label(
+                                    egui::RichText::new(format!("CH{ch}"))
+                                        .size(theme::FONT_BODY)
+                                        .monospace()
+                                        .color(label_color),
+                                );
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(W_WAVE, 16.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(W_WAVE - 4.0, 14.0),
+                                    egui::Sense::hover(),
+                                );
+                                if let Some(b) = block {
+                                    let spark = if disp_on { color } else { theme::TEXT_DIM };
+                                    draw_row_sparkline(ui.painter(), rect, b, ch, spark);
+                                }
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(W_TOG, 16.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.checkbox(&mut display.channel_enabled[ch], "");
+                            },
+                        );
+
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(W_TOG, 16.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_enabled_ui(select.enabled && !rec_locked, |ui| {
+                                    if select.selected.len() <= ch {
+                                        select.selected.resize(ch + 1, true);
+                                    }
+                                    ui.checkbox(&mut select.selected[ch], "");
+                                });
+                            },
+                        );
+                    });
+                }
+
+                if shown == 0 {
+                    ui.label(
+                        egui::RichText::new("No channels match the filter")
+                            .size(theme::FONT_CAPTION)
+                            .color(theme::TEXT_DIM),
+                    );
                 }
             });
     });

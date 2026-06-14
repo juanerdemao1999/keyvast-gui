@@ -81,11 +81,19 @@ impl TileKind {
     }
 
     pub fn new_lfp(visible_count: usize) -> Self {
-        Self::LfpView { start_ch: 0, visible_count, scroll_accum_ch: 0.0 }
+        Self::LfpView {
+            start_ch: 0,
+            visible_count,
+            scroll_accum_ch: 0.0,
+        }
     }
 
     pub fn new_ap(visible_count: usize) -> Self {
-        Self::ApView { start_ch: 0, visible_count, scroll_accum_ch: 0.0 }
+        Self::ApView {
+            start_ch: 0,
+            visible_count,
+            scroll_accum_ch: 0.0,
+        }
     }
 
     pub fn new_spike_overlay() -> Self {
@@ -117,9 +125,9 @@ pub enum AddViewRequest {
 /// Context passed to the tile behavior so each pane can render with live data.
 pub struct KvTileBehavior<'a> {
     // Rings
-    pub disp_ring:     &'a DisplayRing,
+    pub disp_ring: &'a DisplayRing,
     pub disp_ring_lfp: &'a DisplayRing,
-    pub disp_ring_ap:  &'a DisplayRing,
+    pub disp_ring_ap: &'a DisplayRing,
     // Latest block (channel count, sample rate)
     pub latest_block: Option<&'a SampleBlock>,
     // Shared display settings (amp scale, time window) — modified by main tile scroll
@@ -130,10 +138,10 @@ pub struct KvTileBehavior<'a> {
     pub display_paused: bool,
     pub paused_elapsed: &'a mut f64,
     pub sweep_start_ms: f64,
-    pub elapsed_secs:   f64,
+    pub elapsed_secs: f64,
     // Perf overlay (main tile only)
     pub show_perf_overlay: bool,
-    pub render_ms_ema:     &'a mut f64,
+    pub render_ms_ema: &'a mut f64,
     pub block_history_len: usize,
     // Spike snippet store — mutable so the tile UI can update detection params.
     pub snippet_store: &'a mut SpikeSnippetStore,
@@ -141,6 +149,9 @@ pub struct KvTileBehavior<'a> {
     pub fft: &'a crate::fft_panel::FftState,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
+    // Source-aware subtitle for the "No Data" placeholder (e.g. "Press Start…"
+    // vs. "Open a .kvraw recording…") so the empty view matches the active source.
+    pub empty_hint: &'a str,
 }
 
 impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
@@ -157,21 +168,61 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 scroll_accum_y,
                 scroll_accum_t,
                 scroll_accum_browse,
-            } => self.draw_main_waveform(ui, *start_ch, scroll_accum_y, scroll_accum_t, scroll_accum_browse),
+            } => self.draw_main_waveform(
+                ui,
+                *start_ch,
+                scroll_accum_y,
+                scroll_accum_t,
+                scroll_accum_browse,
+            ),
 
-            TileKind::LfpView { start_ch, visible_count, scroll_accum_ch } => {
-                self.draw_band_view(ui, self.disp_ring_lfp, start_ch, *visible_count, scroll_accum_ch, "LFP");
+            TileKind::LfpView {
+                start_ch,
+                visible_count,
+                scroll_accum_ch,
+            } => {
+                self.draw_band_view(
+                    ui,
+                    self.disp_ring_lfp,
+                    start_ch,
+                    *visible_count,
+                    scroll_accum_ch,
+                    "LFP",
+                );
                 UiResponse::None
             }
 
-            TileKind::ApView { start_ch, visible_count, scroll_accum_ch } => {
-                self.draw_band_view(ui, self.disp_ring_ap, start_ch, *visible_count, scroll_accum_ch, "Spike AP");
+            TileKind::ApView {
+                start_ch,
+                visible_count,
+                scroll_accum_ch,
+            } => {
+                self.draw_band_view(
+                    ui,
+                    self.disp_ring_ap,
+                    start_ch,
+                    *visible_count,
+                    scroll_accum_ch,
+                    "Spike AP",
+                );
                 UiResponse::None
             }
 
-            TileKind::SpikeOverlay { channels, show_grid, pre_ms, post_ms, max_snippets } => {
+            TileKind::SpikeOverlay {
+                channels,
+                show_grid,
+                pre_ms,
+                post_ms,
+                max_snippets,
+            } => {
                 self.draw_spike_overlay_pane(
-                    ui, _tile_id, channels, show_grid, pre_ms, post_ms, max_snippets,
+                    ui,
+                    _tile_id,
+                    channels,
+                    show_grid,
+                    pre_ms,
+                    post_ms,
+                    max_snippets,
                 );
                 UiResponse::None
             }
@@ -186,25 +237,42 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
 
     fn tab_title_for_pane(&mut self, pane: &TileKind) -> egui::WidgetText {
         match pane {
-            TileKind::MainWaveform { start_ch, visible_count, .. } =>
-                format!("Waveform  CH{}–{}", start_ch, start_ch + visible_count).into(),
-            TileKind::LfpView { start_ch, visible_count, .. } =>
-                format!("LFP  CH{}–{}", start_ch, start_ch + visible_count).into(),
-            TileKind::ApView { start_ch, visible_count, .. } =>
-                format!("Spike AP  CH{}–{}", start_ch, start_ch + visible_count).into(),
-            TileKind::SpikeOverlay { channels, .. } =>
-                format!("Spike Overlay  ({} ch)", channels.len()).into(),
-            TileKind::FftSpectrum =>
-                "FFT Spectrum".into(),
+            TileKind::MainWaveform {
+                start_ch,
+                visible_count,
+                ..
+            } => format!("Waveform  CH{}–{}", start_ch, start_ch + visible_count).into(),
+            TileKind::LfpView {
+                start_ch,
+                visible_count,
+                ..
+            } => format!("LFP  CH{}–{}", start_ch, start_ch + visible_count).into(),
+            TileKind::ApView {
+                start_ch,
+                visible_count,
+                ..
+            } => format!("Spike AP  CH{}–{}", start_ch, start_ch + visible_count).into(),
+            TileKind::SpikeOverlay { channels, .. } => {
+                format!("Spike Overlay  ({} ch)", channels.len()).into()
+            }
+            TileKind::FftSpectrum => "FFT Spectrum".into(),
         }
     }
 
-    fn is_tab_closable(&self, _tiles: &egui_tiles::Tiles<TileKind>, _tile_id: egui_tiles::TileId) -> bool {
+    fn is_tab_closable(
+        &self,
+        _tiles: &egui_tiles::Tiles<TileKind>,
+        _tile_id: egui_tiles::TileId,
+    ) -> bool {
         // All tiles are closable; main waveform can also be closed (user can re-add)
         true
     }
 
-    fn on_tab_close(&mut self, _tiles: &mut egui_tiles::Tiles<TileKind>, _tile_id: egui_tiles::TileId) -> bool {
+    fn on_tab_close(
+        &mut self,
+        _tiles: &mut egui_tiles::Tiles<TileKind>,
+        _tile_id: egui_tiles::TileId,
+    ) -> bool {
         true
     }
 
@@ -233,22 +301,7 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
     ) {
         ui.add_space(4.0);
         ui.menu_button(egui::RichText::new("＋ Add View").size(11.0), |ui| {
-            if ui.button(egui::RichText::new("LFP view  (LP 250 Hz)").size(11.0)).clicked() {
-                *self.pending_add = Some(AddViewRequest::Lfp);
-                ui.close_menu();
-            }
-            if ui.button(egui::RichText::new("Spike view  (HP 300 Hz)").size(11.0)).clicked() {
-                *self.pending_add = Some(AddViewRequest::Ap);
-                ui.close_menu();
-            }
-            if ui.button(egui::RichText::new("Spike Overlay").size(11.0)).clicked() {
-                *self.pending_add = Some(AddViewRequest::SpikeOverlay);
-                ui.close_menu();
-            }
-            if ui.button(egui::RichText::new("FFT Spectrum").size(11.0)).clicked() {
-                *self.pending_add = Some(AddViewRequest::Fft);
-                ui.close_menu();
-            }
+            self.add_view_menu_items(ui);
         });
     }
 }
@@ -260,6 +313,39 @@ const X_STRIP_H: f32 = 28.0;
 const SCROLL_STEP_PX: f32 = 30.0;
 
 impl<'a> KvTileBehavior<'a> {
+    /// The shared "Add View" menu items, used by both the tab-bar button and
+    /// the right-click context menu on a tile (B6).
+    fn add_view_menu_items(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(egui::RichText::new("LFP view  (LP 250 Hz)").size(11.0))
+            .clicked()
+        {
+            *self.pending_add = Some(AddViewRequest::Lfp);
+            ui.close_menu();
+        }
+        if ui
+            .button(egui::RichText::new("Spike view  (HP 300 Hz)").size(11.0))
+            .clicked()
+        {
+            *self.pending_add = Some(AddViewRequest::Ap);
+            ui.close_menu();
+        }
+        if ui
+            .button(egui::RichText::new("Spike Overlay").size(11.0))
+            .clicked()
+        {
+            *self.pending_add = Some(AddViewRequest::SpikeOverlay);
+            ui.close_menu();
+        }
+        if ui
+            .button(egui::RichText::new("FFT Spectrum").size(11.0))
+            .clicked()
+        {
+            *self.pending_add = Some(AddViewRequest::Fft);
+            ui.close_menu();
+        }
+    }
+
     /// Main waveform tile: zone-aware scroll + full waveform rendering.
     fn draw_main_waveform(
         &mut self,
@@ -271,13 +357,24 @@ impl<'a> KvTileBehavior<'a> {
     ) -> UiResponse {
         let tile_rect = ui.max_rect();
 
+        // `click` is always part of the sense so the right-click "Add View"
+        // context menu (B6) works in both live and paused modes; paused mode
+        // additionally needs drag for browsing the buffer.
         let sense = if self.display_paused {
             egui::Sense::click_and_drag()
         } else {
-            egui::Sense::hover()
+            egui::Sense::click()
         };
-        let scroll_response =
-            ui.interact(tile_rect, egui::Id::new("main_waveform_drag"), sense);
+        let scroll_response = ui.interact(tile_rect, egui::Id::new("main_waveform_drag"), sense);
+
+        scroll_response.context_menu(|ui| {
+            ui.label(
+                egui::RichText::new("Add view")
+                    .size(theme::FONT_CAPTION)
+                    .color(theme::TEXT_DIM),
+            );
+            self.add_view_menu_items(ui);
+        });
 
         let raw_scroll = ui.input(|i| i.smooth_scroll_delta.y);
         let cursor_pos = ui.input(|i| i.pointer.hover_pos());
@@ -285,17 +382,18 @@ impl<'a> KvTileBehavior<'a> {
         // Route raw scroll into the correct accumulator (zone-aware)
         if raw_scroll.abs() > 0.5
             && let Some(pos) = cursor_pos
-                && tile_rect.contains(pos) {
-                    let in_y_strip = pos.x < tile_rect.left() + Y_STRIP_W;
-                    let in_x_strip = pos.y > tile_rect.bottom() - X_STRIP_H;
-                    if in_y_strip && !in_x_strip {
-                        *scroll_accum_y += raw_scroll;
-                    } else if in_x_strip {
-                        *scroll_accum_t += raw_scroll;
-                    } else if self.display_paused {
-                        *scroll_accum_browse += raw_scroll;
-                    }
-                }
+            && tile_rect.contains(pos)
+        {
+            let in_y_strip = pos.x < tile_rect.left() + Y_STRIP_W;
+            let in_x_strip = pos.y > tile_rect.bottom() - X_STRIP_H;
+            if in_y_strip && !in_x_strip {
+                *scroll_accum_y += raw_scroll;
+            } else if in_x_strip {
+                *scroll_accum_t += raw_scroll;
+            } else if self.display_paused {
+                *scroll_accum_browse += raw_scroll;
+            }
+        }
 
         // Y-axis accumulator → amplitude scale
         {
@@ -370,6 +468,7 @@ impl<'a> KvTileBehavior<'a> {
             self.display,
             self.filters,
             sweep_left_ms,
+            self.empty_hint,
         );
         let render_ms = render_start.elapsed().as_secs_f64() * 1000.0;
         *self.render_ms_ema = *self.render_ms_ema * 0.9 + render_ms * 0.1;
@@ -411,9 +510,10 @@ impl<'a> KvTileBehavior<'a> {
         let raw_scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if raw_scroll.abs() > 0.5
             && let Some(pos) = ui.input(|i| i.pointer.hover_pos())
-                && tile_rect.contains(pos) {
-                    *scroll_accum_ch += raw_scroll;
-                }
+            && tile_rect.contains(pos)
+        {
+            *scroll_accum_ch += raw_scroll;
+        }
         while *scroll_accum_ch >= SCROLL_STEP_PX {
             *scroll_accum_ch -= SCROLL_STEP_PX;
             *start_ch = start_ch.saturating_sub(1);
@@ -444,6 +544,7 @@ impl<'a> KvTileBehavior<'a> {
             &tile_display,
             self.filters,
             sweep_left_ms,
+            self.empty_hint,
         );
 
         // Tile type badge (top-left corner)
@@ -475,52 +576,81 @@ impl<'a> KvTileBehavior<'a> {
         // ── Config strip ─────────────────────────────────────────────
         // Read current store values into locals so we can borrow snippet_store
         // mutably for controls then immutably for rendering.
-        let mut sigma        = self.snippet_store.sigma;
-        let mut pre_ms_val   = self.snippet_store.pre_ms();
-        let mut post_ms_val  = self.snippet_store.post_ms();
-        let mut max_snips    = self.snippet_store.max_snippets;
+        let mut sigma = self.snippet_store.sigma;
+        let mut pre_ms_val = self.snippet_store.pre_ms();
+        let mut post_ms_val = self.snippet_store.post_ms();
+        let mut max_snips = self.snippet_store.max_snippets;
 
         let mut params_changed = false;
 
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("σ").size(11.0).color(theme::TEXT_DIM))
                 .on_hover_text("Detection threshold multiplier (−σ × per-channel RMS)");
-            if ui.add(
-                egui::DragValue::new(&mut sigma)
-                    .speed(0.1)
-                    .range(0.5_f32..=20.0)
-                    .suffix("σ"),
-            ).changed() { params_changed = true; }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut sigma)
+                        .speed(0.1)
+                        .range(0.5_f32..=20.0)
+                        .suffix("σ"),
+                )
+                .changed()
+            {
+                params_changed = true;
+            }
 
             ui.separator();
 
             ui.label(egui::RichText::new("pre").size(10.0).color(theme::TEXT_DIM));
-            if ui.add(
-                egui::DragValue::new(&mut pre_ms_val)
-                    .speed(0.05)
-                    .range(0.1_f32..=5.0)
-                    .suffix(" ms"),
-            ).changed() { params_changed = true; }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut pre_ms_val)
+                        .speed(0.05)
+                        .range(0.1_f32..=5.0)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                params_changed = true;
+            }
 
-            ui.label(egui::RichText::new("post").size(10.0).color(theme::TEXT_DIM));
-            if ui.add(
-                egui::DragValue::new(&mut post_ms_val)
-                    .speed(0.05)
-                    .range(0.1_f32..=10.0)
-                    .suffix(" ms"),
-            ).changed() { params_changed = true; }
+            ui.label(
+                egui::RichText::new("post")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            );
+            if ui
+                .add(
+                    egui::DragValue::new(&mut post_ms_val)
+                        .speed(0.05)
+                        .range(0.1_f32..=10.0)
+                        .suffix(" ms"),
+                )
+                .changed()
+            {
+                params_changed = true;
+            }
 
             ui.separator();
             ui.label(egui::RichText::new("max").size(10.0).color(theme::TEXT_DIM));
-            if ui.add(
-                egui::DragValue::new(&mut max_snips)
-                    .speed(1)
-                    .range(5_usize..=200),
-            ).changed() { params_changed = true; }
+            if ui
+                .add(
+                    egui::DragValue::new(&mut max_snips)
+                        .speed(1)
+                        .range(5_usize..=200),
+                )
+                .changed()
+            {
+                params_changed = true;
+            }
 
             ui.separator();
-            ui.checkbox(show_grid, egui::RichText::new("Grid").size(10.0).color(theme::TEXT_DIM))
-                .on_hover_text("Toggle this tile's grid");
+            ui.checkbox(
+                show_grid,
+                egui::RichText::new("Grid")
+                    .size(10.0)
+                    .color(theme::TEXT_DIM),
+            )
+            .on_hover_text("Toggle this tile's grid");
         });
 
         // Apply any parameter changes back to the store.
@@ -543,9 +673,14 @@ impl<'a> KvTileBehavior<'a> {
             ui.horizontal_wrapped(|ui| {
                 for ch in 0..total_ch {
                     let selected = channels.iter().any(|c| c.ch == ch);
-                    let label = egui::RichText::new(format!("CH{ch}"))
-                        .size(10.0)
-                        .color(if selected { theme::channel_color(ch) } else { theme::TEXT_DIM });
+                    let label =
+                        egui::RichText::new(format!("CH{ch}"))
+                            .size(10.0)
+                            .color(if selected {
+                                theme::channel_color(ch)
+                            } else {
+                                theme::TEXT_DIM
+                            });
                     if ui
                         .selectable_label(selected, label)
                         .on_hover_text(format!("Toggle CH{ch}"))
@@ -597,7 +732,11 @@ impl<'a> KvTileBehavior<'a> {
         // ── Snippet plot ─────────────────────────────────────────────
         // Reborrow &mut as & for the read-only renderer.
         spike_overlay::draw_spike_overlay(
-            ui, &*self.snippet_store, channels, *show_grid, tile_salt,
+            ui,
+            &*self.snippet_store,
+            channels,
+            *show_grid,
+            tile_salt,
         );
     }
 }

@@ -49,7 +49,7 @@ use crate::remote_api::{
 use crate::spike_overlay::SpikeSnippetStore;
 use crate::theme;
 use crate::toast::Toasts;
-use crate::trigger::{self, TriggerAction, TriggerConfig};
+use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 
 /// How long filter settings must stay unchanged before the full history
 /// is re-filtered (lets slider drags settle first).
@@ -195,6 +195,8 @@ pub struct KvApp {
     channel_map: ChannelMapState,
     // Phase 3 features
     trigger: TriggerConfig,
+    /// Rolling TTL transition history feeding the live TTL monitor tile.
+    ttl_history: TtlHistory,
     remote_api_state: RemoteApiState,
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
@@ -284,6 +286,7 @@ impl KvApp {
             fft: FftState::default(),
             channel_map: ChannelMapState::default(),
             trigger: TriggerConfig::default(),
+            ttl_history: TtlHistory::new(),
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
             export_format: kv_recorder::export_formats::ExportFormat::KeyvastNative,
@@ -351,6 +354,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         self.snippet_store
             .reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
@@ -377,6 +381,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         // snippet_store will be reconfigured lazily on the first ingest_block()
         // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
@@ -655,7 +660,8 @@ impl KvApp {
             self.snippet_store.process_block(&ap_block);
         }
 
-        // Phase 3: Process trigger/gate logic
+        // Phase 3: feed the TTL monitor and process the recording gate.
+        self.ttl_history.push_block(&block);
         let trigger_action = self.trigger.process_block(&block);
         match trigger_action {
             TriggerAction::StartRecording => {
@@ -2311,6 +2317,8 @@ impl eframe::App for KvApp {
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
                         fft: &self.fft,
+                        trigger: &self.trigger,
+                        ttl_history: &self.ttl_history,
                         pending_add: &mut pending_add,
                         empty_hint,
                     };
@@ -2325,6 +2333,7 @@ impl eframe::App for KvApp {
                         AddViewRequest::Ap => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
                         AddViewRequest::Fft => TileKind::new_fft(),
+                        AddViewRequest::Ttl => TileKind::new_ttl_monitor(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }

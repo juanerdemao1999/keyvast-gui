@@ -258,7 +258,7 @@ impl KvApp {
             filters_last_frame: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
-            disp_ring_ap: DisplayRing::new(16, 30_000.0),
+            disp_ring_ap: DisplayRing::new(16, 30_000.0).with_peak_hold(),
             filter_chains_lfp: Vec::new(),
             filter_chains_ap: Vec::new(),
             tile_tree: Some(multiview::make_initial_tree(16)),

@@ -11,6 +11,7 @@ kv-recorder = { path = "../kv-recorder" }
 kv-rhd = { path = "../kv-rhd" }
 kv-simulator = { path = "../kv-simulator" }
 kv-types = { path = "../kv-types" }
+env_logger = "0.11"
 
 [[bin]]
 name = "kv-acq"

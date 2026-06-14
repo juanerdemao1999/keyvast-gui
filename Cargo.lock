@@ -1513,6 +1513,7 @@ dependencies = [
 name = "kv-cli"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "kv-buffer",
  "kv-core",
  "kv-integrity",

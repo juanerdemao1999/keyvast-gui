@@ -216,7 +216,9 @@ impl Rhd2000Registers {
         };
         registers.define_sample_rate(sample_rate);
         registers.set_dsp_cutoff_freq(1.0);
-        registers.set_upper_bandwidth(10_000.0);
+        // Match the Open Ephys RHD plugin reference (settings.xml HighCut=7500):
+        // a 10 kHz corner passes ~33% more wideband noise than OE's 7.5 kHz.
+        registers.set_upper_bandwidth(7_500.0);
         registers.set_lower_bandwidth(1.0);
         registers
     }

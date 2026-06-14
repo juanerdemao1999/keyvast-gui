@@ -732,6 +732,11 @@ impl KvApp {
         self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
     }
 
+    /// True when an FFT spectrum tile exists in the layout.
+    fn fft_tile_open(&self) -> bool {
+        self.tile_has_pane(|kind| matches!(kind, TileKind::FftSpectrum))
+    }
+
     /// True when the AP band must be computed: an AP tile or a spike-overlay
     /// tile (which consumes the snippet detector) exists in the layout.
     fn ap_band_needed(&self) -> bool {
@@ -1546,6 +1551,18 @@ impl eframe::App for KvApp {
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
 
+        // Refresh the FFT spectrum once per frame while an FFT view is open, so
+        // the view is self-contained and no longer depends on the sidebar
+        // section being expanded/enabled (#4a).
+        if self.fft_tile_open() {
+            let sr = self
+                .latest_block
+                .as_ref()
+                .map(|b| b.sample_rate)
+                .unwrap_or(30000.0);
+            self.fft.update_from_ring(&self.disp_ring, sr);
+        }
+
         // Detect filter settings change (user toggled in UI) — re-filter
         // history once the settings have been stable for the debounce window,
         // so dragging a cutoff slider doesn't re-filter 10k blocks per frame.
@@ -2122,13 +2139,7 @@ impl eframe::App for KvApp {
                             );
 
                             ui.add_space(4.0);
-                            fft_panel::draw_fft_section(
-                                ui,
-                                &mut self.fft,
-                                &self.disp_ring,
-                                sr,
-                                total_ch,
-                            );
+                            fft_panel::draw_fft_section(ui, &mut self.fft, sr, total_ch);
                         }
                         SidebarTab::Tools => {
                             let can_measure = self.device.kind == DeviceKind::Rhd

@@ -253,3 +253,242 @@ pub struct IntegritySummary {
     pub expected_samples: u64,
     pub written_samples: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_block_passes_validation() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 4,
+            samples_per_channel: 8,
+            ttl_bits: 0,
+            data: vec![0i16; 32],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert!(block.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_sample_rate_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 0.0,
+            channel_count: 1,
+            samples_per_channel: 1,
+            ttl_bits: 0,
+            data: vec![0i16; 1],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert_eq!(block.validate(), Err(SampleBlockError::InvalidSampleRate));
+    }
+
+    #[test]
+    fn negative_sample_rate_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: -1.0,
+            channel_count: 1,
+            samples_per_channel: 1,
+            ttl_bits: 0,
+            data: vec![0i16; 1],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert_eq!(block.validate(), Err(SampleBlockError::InvalidSampleRate));
+    }
+
+    #[test]
+    fn zero_channels_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 0,
+            samples_per_channel: 1,
+            ttl_bits: 0,
+            data: vec![],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert_eq!(block.validate(), Err(SampleBlockError::EmptyChannelSet));
+    }
+
+    #[test]
+    fn zero_samples_per_channel_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 4,
+            samples_per_channel: 0,
+            ttl_bits: 0,
+            data: vec![],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert_eq!(block.validate(), Err(SampleBlockError::EmptyBlock));
+    }
+
+    #[test]
+    fn data_length_mismatch_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 4,
+            samples_per_channel: 8,
+            ttl_bits: 0,
+            data: vec![0i16; 16], // should be 32
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert_eq!(
+            block.validate(),
+            Err(SampleBlockError::DataLengthMismatch {
+                expected: 32,
+                observed: 16
+            })
+        );
+    }
+
+    #[test]
+    fn ttl_bits_within_line_count_passes() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 1,
+            samples_per_channel: 1,
+            ttl_bits: 0b1111,
+            data: vec![0i16; 1],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert!(block.validate_against_ttl_lines(4).is_ok());
+    }
+
+    #[test]
+    fn ttl_bits_exceeding_line_count_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 1,
+            samples_per_channel: 1,
+            ttl_bits: 0b1_0000, // bit 4 set but only 4 lines configured
+            data: vec![0i16; 1],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert!(matches!(
+            block.validate_against_ttl_lines(4),
+            Err(SampleBlockError::TtlBitsOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn ttl_line_count_exceeding_32_is_rejected() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 1,
+            samples_per_channel: 1,
+            ttl_bits: 0,
+            data: vec![0i16; 1],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        assert!(matches!(
+            block.validate_against_ttl_lines(33),
+            Err(SampleBlockError::TtlLineCountOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn expected_sample_values_uses_saturating_mul() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: usize::MAX,
+            samples_per_channel: 2,
+            ttl_bits: 0,
+            data: vec![],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        // Should saturate instead of panicking
+        assert_eq!(block.expected_sample_values(), usize::MAX);
+    }
+
+    #[test]
+    fn timestamp_after_block_uses_saturating_add() {
+        let block = SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: u64::MAX - 5,
+            sample_rate: 30_000.0,
+            channel_count: 1,
+            samples_per_channel: 64,
+            ttl_bits: 0,
+            data: vec![0i16; 64],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        };
+        // Should saturate to u64::MAX instead of panicking
+        assert_eq!(block.timestamp_after_block(), u64::MAX);
+    }
+}

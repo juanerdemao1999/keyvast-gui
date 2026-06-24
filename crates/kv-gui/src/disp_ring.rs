@@ -269,3 +269,117 @@ impl DisplayRing {
         pts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_block(ch_count: usize, spc: usize, timestamp_start: u64) -> SampleBlock {
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: timestamp_start / spc as u64,
+            timestamp_start,
+            sample_rate: 30_000.0,
+            channel_count: ch_count,
+            samples_per_channel: spc,
+            ttl_bits: 0,
+            data: (0..(ch_count * spc)).map(|i| (i % 1000) as i16).collect(),
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn new_ring_is_empty() {
+        let ring = DisplayRing::new(4, 30_000.0);
+        assert_eq!(ring.len, 0);
+        assert!(!ring.ready);
+        assert_eq!(ring.channel_count, 4);
+    }
+
+    #[test]
+    fn push_block_stores_decimated_samples() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        // Push a block with 64 samples — at dwnsp=4, that's 16 ring entries
+        let block = make_block(2, 64, 0);
+        ring.push_block(&block);
+
+        assert!(ring.ready);
+        assert_eq!(ring.len, 16);
+    }
+
+    #[test]
+    fn push_block_ignores_wrong_channel_count() {
+        let mut ring = DisplayRing::new(4, 30_000.0);
+        // Block has 2 channels but ring expects 4
+        let block = make_block(2, 64, 0);
+        ring.push_block(&block);
+
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+    }
+
+    #[test]
+    fn reset_clears_ring() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&make_block(2, 64, 0));
+        assert!(ring.ready);
+
+        ring.reset();
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+    }
+
+    #[test]
+    fn capacity_overflow_evicts_oldest() {
+        // Use a small capacity ring to test eviction
+        let mut ring = DisplayRing::new(1, 30_000.0);
+        let old_cap = ring.capacity;
+        // Force a smaller capacity for testing
+        ring.capacity = 8;
+
+        // Push enough data to overflow: 64 samples / dwnsp(4) = 16 entries > capacity 8
+        let block = make_block(1, 64, 0);
+        ring.push_block(&block);
+
+        assert_eq!(ring.len, 8);
+        // t0 should have advanced past the initial position
+        assert!(ring.t0 > 0);
+
+        ring.capacity = old_cap; // restore
+    }
+
+    #[test]
+    fn collect_channel_returns_empty_for_invalid_channel() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&make_block(2, 64, 0));
+
+        let pts = ring.collect_channel(99, 0.0, 10.0, 100, 100);
+        assert!(pts.is_empty());
+    }
+
+    #[test]
+    fn collect_channel_returns_empty_on_empty_ring() {
+        let ring = DisplayRing::new(2, 30_000.0);
+        let pts = ring.collect_channel(0, 0.0, 10.0, 100, 100);
+        assert!(pts.is_empty());
+    }
+
+    #[test]
+    fn latest_time_ms_is_zero_on_empty_ring() {
+        let ring = DisplayRing::new(2, 30_000.0);
+        assert_eq!(ring.latest_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn last_n_samples_f64_returns_empty_for_invalid_channel() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&make_block(2, 64, 0));
+
+        let samples = ring.last_n_samples_f64(99, 10);
+        assert!(samples.is_empty());
+    }
+}

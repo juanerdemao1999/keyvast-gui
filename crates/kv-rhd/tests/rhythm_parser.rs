@@ -119,6 +119,76 @@ fn test_config(enabled_streams: usize, samples_per_block: usize) -> RhythmDataCo
     }
 }
 
+/// L25: Verifies that a single-stream (streams=1) block round-trips correctly,
+/// exercising the filler-word formula for the 1-stream case.
+#[test]
+fn parses_single_stream_into_correct_sample_values() {
+    let config = test_config(1, 4);
+    let raw = build_raw_block(&config, 100, 0x1234);
+
+    let block = parse_rhythm_data_block(42, &raw, &config).expect("single-stream block");
+
+    assert_eq!(block.channel_count, 32);
+    assert_eq!(block.samples_per_channel, 4);
+    assert_eq!(block.packet_id, 42);
+    assert_eq!(block.timestamp_start, 100);
+    assert_eq!(block.ttl_bits, 0x1234);
+    assert_eq!(block.data.len(), 32 * 4);
+
+    // Verify sample values: signed = sample*100 + stream*1000 + channel
+    // For streams=1 (stream index 0): signed = sample*100 + channel
+    for sample in 0..4_i32 {
+        for channel in 0..32_i32 {
+            let expected = sample * 100 + channel;
+            let idx = sample as usize * 32 + channel as usize;
+            assert_eq!(
+                block.data[idx], expected as i16,
+                "mismatch at sample={sample}, channel={channel}"
+            );
+        }
+    }
+}
+
+/// L22: Verifies that timestamp wrapping at u32::MAX boundary is handled
+/// correctly by the parser (wrapping_add semantics).
+#[test]
+fn timestamp_rollover_at_u32_max_boundary() {
+    let config = test_config(1, 4);
+    // Start near u32::MAX so timestamps wrap around to 0+
+    let start = u32::MAX - 1; // 0xFFFF_FFFE
+    let raw = build_raw_block(&config, start, 0);
+
+    let block = parse_rhythm_data_block(0, &raw, &config).expect("rollover block should parse");
+
+    assert_eq!(block.timestamp_start, start as u64);
+    // The parser should accept wrapping timestamps within a block
+    assert_eq!(block.samples_per_channel, 4);
+}
+
+/// I7: Verifies that magic corruption in a non-first frame (sample index > 0)
+/// is detected and reported with the correct sample_index.
+#[test]
+fn rejects_bad_magic_at_non_first_frame() {
+    let config = test_config(1, 4);
+    let mut raw = build_raw_block(&config, 0, 0);
+
+    // Corrupt magic at sample index 2 (third frame)
+    let frame_size = words_per_frame(1).expect("valid words") * 2; // bytes per frame
+    let offset = frame_size * 2; // start of frame index 2
+    raw[offset] = 0xFF; // corrupt first byte of magic
+
+    let error = parse_rhythm_data_block(0, &raw, &config)
+        .expect_err("corrupt magic at sample 2 should be rejected");
+
+    assert!(matches!(
+        error,
+        RhythmParseError::BadMagic {
+            sample_index: 2,
+            ..
+        }
+    ));
+}
+
 fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u16) -> Vec<u8> {
     let mut raw = Vec::with_capacity(
         bytes_per_block(config.enabled_streams, config.samples_per_block)

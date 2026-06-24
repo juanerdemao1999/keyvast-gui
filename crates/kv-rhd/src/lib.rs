@@ -20,8 +20,9 @@ pub use impedance::{
 };
 pub use parser::{RhythmParseError, parse_rhythm_data_block};
 pub use protocol::{
-    CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT,
-    RHYTHM_BOARD_ID, RhdChipType, RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
+    CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID,
+    DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT, RHYTHM_BOARD_ID,
+    RhdChipType, RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
     USB3_BLOCK_SIZE_BYTES, bytes_per_block, raw_word_to_signed_count, signed_count_to_microvolts,
     words_per_frame,
 };

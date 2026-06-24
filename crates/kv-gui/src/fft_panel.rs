@@ -45,12 +45,6 @@ impl Default for FftState {
 /// Available FFT sizes.
 const FFT_SIZES: &[usize] = &[256, 512, 1024, 2048, 4096];
 
-/// ADC µV-per-count conversion factor.
-///
-/// TODO(hardware): Replace this constant with the device-specific factor
-/// from `DeviceConfig` once the real ADC calibration is available.
-const ADC_UV_PER_COUNT: f64 = 0.195;
-
 /// Compute the PSD from the display ring for a given channel.
 ///
 /// `hardware_sample_rate` is the raw device rate (e.g. 30 000 Hz). The
@@ -90,7 +84,7 @@ pub fn compute_spectrum(
 
     for (i, &sample) in raw.iter().enumerate().take(n) {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos());
-        real.push(sample as f64 * ADC_UV_PER_COUNT * w);
+        real.push(sample as f64 * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64 * w);
     }
 
     // In-place radix-2 FFT.

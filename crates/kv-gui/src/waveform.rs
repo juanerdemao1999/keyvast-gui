@@ -27,7 +27,7 @@ use crate::theme;
 /// ±32767 counts at 0.195 µV/count → ±6389.6 µV. Display normalization
 /// divides by i16::MAX, so a normalized value of 1.0 corresponds to this
 /// many microvolts.
-const RHD_FULL_SCALE_UV: f64 = 32_767.0 * 0.195;
+const RHD_FULL_SCALE_UV: f64 = 32_767.0 * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
 
 /// Maximum rendered points per channel.
 /// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.

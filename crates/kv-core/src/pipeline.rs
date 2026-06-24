@@ -176,18 +176,42 @@ where
             state = cvar.wait(state).expect("condvar wait failed");
         }
 
-        drain_consumer(&mut state.buffer, recorder_id, &mut recorded_blocks);
+        // Collect Arc pointers inside the lock, then release before cloning.
+        let drained = collect_consumer(&mut state.buffer, recorder_id);
+        let done = state.producer_done;
+        let error = if done {
+            state.producer_error.clone()
+        } else {
+            None
+        };
+        collect_preview(&mut state.buffer, preview_id);
+
+        // Additional drain when producer is done.
+        let drained_final = if done {
+            let d = collect_consumer(&mut state.buffer, recorder_id);
+            collect_preview(&mut state.buffer, preview_id);
+            d
+        } else {
+            Vec::new()
+        };
+
+        // Release the lock before any cloning / heavy work.
+        drop(state);
+
+        // Clone block data outside the critical section.
+        for block in drained {
+            recorded_blocks.push((*block).clone());
+        }
         if first_block_time.is_none() && !recorded_blocks.is_empty() {
             first_block_time = Some(Instant::now());
         }
-        drain_preview(&mut state.buffer, preview_id);
+        for block in drained_final {
+            recorded_blocks.push((*block).clone());
+        }
 
-        if state.producer_done {
-            drain_consumer(&mut state.buffer, recorder_id, &mut recorded_blocks);
-            drain_preview(&mut state.buffer, preview_id);
-
-            if let Some(ref error) = state.producer_error {
-                return Err(PipelineError::ProducerFailed(error.clone()));
+        if done {
+            if let Some(error) = error {
+                return Err(PipelineError::ProducerFailed(error));
             }
             break;
         }
@@ -231,7 +255,13 @@ where
         match source.read_block() {
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
-                state.buffer.push(block);
+                if let Some(overflow) = state.buffer.push(block) {
+                    log::warn!(
+                        "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
+                        overflow.dropped_blocks,
+                        overflow.buffer_occupancy * 100.0
+                    );
+                }
                 cvar.notify_all();
             }
             Err(error) => {
@@ -249,17 +279,21 @@ where
     cvar.notify_all();
 }
 
-fn drain_consumer(
+/// Collect Arc pointers from a consumer queue without cloning the data.
+/// The caller is responsible for cloning or processing the blocks outside
+/// the critical section.
+fn collect_consumer(
     buffer: &mut FanoutBlockBuffer,
     consumer_id: kv_buffer::BufferConsumerId,
-    destination: &mut Vec<SampleBlock>,
-) {
+) -> Vec<Arc<SampleBlock>> {
+    let mut collected = Vec::new();
     while let Ok(Some(block)) = buffer.pop(consumer_id) {
-        destination.push((*block).clone());
+        collected.push(block);
     }
+    collected
 }
 
-fn drain_preview(buffer: &mut FanoutBlockBuffer, consumer_id: kv_buffer::BufferConsumerId) {
+fn collect_preview(buffer: &mut FanoutBlockBuffer, consumer_id: kv_buffer::BufferConsumerId) {
     while let Ok(Some(_)) = buffer.pop(consumer_id) {}
 }
 
@@ -316,28 +350,43 @@ where
             state = cvar.wait(state).expect("condvar wait failed");
         }
 
-        drain_streaming(
-            &mut state.buffer,
-            recorder_id,
-            &mut recorder,
-            &mut integrity,
-        )?;
+        // Collect Arc pointers inside the lock, then release before I/O.
+        let drained = collect_consumer(&mut state.buffer, recorder_id);
+        let done = state.producer_done;
+        let error = if done {
+            state.producer_error.clone()
+        } else {
+            None
+        };
+        collect_preview(&mut state.buffer, preview_id);
+
+        let drained_final = if done {
+            let d = collect_consumer(&mut state.buffer, recorder_id);
+            collect_preview(&mut state.buffer, preview_id);
+            d
+        } else {
+            Vec::new()
+        };
+
+        // Release the lock before performing disk I/O.
+        drop(state);
+
+        // Write blocks to disk and check integrity outside the critical section.
+        for block in &drained {
+            integrity.push(block)?;
+            recorder.write_block(block)?;
+        }
         if first_block_time.is_none() && recorder.block_count() > 0 {
             first_block_time = Some(Instant::now());
         }
-        drain_preview(&mut state.buffer, preview_id);
+        for block in &drained_final {
+            integrity.push(block)?;
+            recorder.write_block(block)?;
+        }
 
-        if state.producer_done {
-            drain_streaming(
-                &mut state.buffer,
-                recorder_id,
-                &mut recorder,
-                &mut integrity,
-            )?;
-            drain_preview(&mut state.buffer, preview_id);
-
-            if let Some(ref error) = state.producer_error {
-                return Err(PipelineError::ProducerFailed(error.clone()));
+        if done {
+            if let Some(error) = error {
+                return Err(PipelineError::ProducerFailed(error));
             }
             break;
         }
@@ -372,17 +421,4 @@ where
         max_write_latency_us: streaming_summary.max_write_latency_us,
         latency_distribution: streaming_summary.latency_distribution,
     })
-}
-
-fn drain_streaming(
-    buffer: &mut FanoutBlockBuffer,
-    consumer_id: kv_buffer::BufferConsumerId,
-    recorder: &mut StreamingRecorder,
-    integrity: &mut IncrementalIntegrity,
-) -> Result<(), PipelineError> {
-    while let Ok(Some(block)) = buffer.pop(consumer_id) {
-        integrity.push(&block)?;
-        recorder.write_block(&block)?;
-    }
-    Ok(())
 }

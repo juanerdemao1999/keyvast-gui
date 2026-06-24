@@ -34,7 +34,11 @@ pub fn parse_rhythm_data_block(
 
     // Auxiliary data: [stream][aux_ch][sample]
     let mut aux_data: Vec<Vec<Vec<u16>>> = (0..streams)
-        .map(|_| (0..AUX_CHANNELS_PER_STREAM).map(|_| Vec::with_capacity(samples)).collect())
+        .map(|_| {
+            (0..AUX_CHANNELS_PER_STREAM)
+                .map(|_| Vec::with_capacity(samples))
+                .collect()
+        })
         .collect();
 
     // Board ADC: [adc_ch][sample]

@@ -3,8 +3,30 @@
 use std::{
     fmt, fs,
     path::PathBuf,
+    sync::atomic::{AtomicBool, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+/// Global cancellation flag set by the Ctrl-C handler.
+static CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Install a Ctrl-C handler that sets the global cancellation flag.
+/// Call once at program start; subsequent Ctrl-C presses are no-ops.
+pub fn install_ctrlc_handler() {
+    ctrlc::set_handler(move || {
+        if CANCELLED.swap(true, Ordering::SeqCst) {
+            // Second Ctrl-C: force exit immediately.
+            std::process::exit(130);
+        }
+        eprintln!("\nCtrl-C received — stopping acquisition gracefully…");
+    })
+    .expect("failed to install Ctrl-C handler");
+}
+
+/// Returns `true` if Ctrl-C has been received.
+pub fn is_cancelled() -> bool {
+    CANCELLED.load(Ordering::Relaxed)
+}
 
 use kv_core::pipeline::{
     PipelineConfig, PipelineError, PipelineResult, PipelineTiming, StreamingPipelineConfig,
@@ -21,7 +43,7 @@ use kv_rhd::{
     DEFAULT_RHD_SAMPLE_RATE, RhdHardwareBackend, RhdHardwareOptions, RhdReadError,
     RhythmDataConfig, SAMPLES_PER_USB_BLOCK, bytes_per_block, parse_rhythm_data_block,
 };
-use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError, SimulatorError};
+use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError};
 use kv_types::{
     AcquisitionEvent, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET,
     DeviceConfig,
@@ -345,7 +367,12 @@ pub fn run_simulator_recording(
     let mut simulator = SimulatorBackend::new(simulator_config)?;
 
     let acquisition = run_fixed_blocks(&device_config, options.blocks, &mut || {
-        simulator.next_block().map_err(SimulatorReadError)
+        if is_cancelled() {
+            return Err(SimulatorReadError("cancelled by Ctrl-C".to_string()));
+        }
+        simulator
+            .next_block()
+            .map_err(|e| SimulatorReadError(e.to_string()))
     })?;
     let recording = write_recording(&options.output_dir, &acquisition.blocks)?;
     write_integrity_summary(&options.output_dir, &acquisition.integrity.summary)?;
@@ -391,7 +418,12 @@ pub fn run_simulator_pipeline(
 
     let source = {
         let mut sim = simulator;
-        move || sim.next_block().map_err(|e| e.to_string())
+        move || {
+            if is_cancelled() {
+                return Err("cancelled by Ctrl-C".to_string());
+            }
+            sim.next_block().map_err(|e| e.to_string())
+        }
     };
 
     let pipeline_result = run_threaded_pipeline(&pipeline_config, source)?;
@@ -441,7 +473,12 @@ pub fn run_simulator_stream(
 
     let source = {
         let mut sim = simulator;
-        move || sim.next_block().map_err(|e| e.to_string())
+        move || {
+            if is_cancelled() {
+                return Err("cancelled by Ctrl-C".to_string());
+            }
+            sim.next_block().map_err(|e| e.to_string())
+        }
     };
 
     let result = run_streaming_pipeline(&streaming_config, source)?;
@@ -520,7 +557,12 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
 
     let source = {
         let mut sim = simulator;
-        move || sim.next_block().map_err(|e| e.to_string())
+        move || {
+            if is_cancelled() {
+                return Err("cancelled by Ctrl-C".to_string());
+            }
+            sim.next_block().map_err(|e| e.to_string())
+        }
     };
 
     let metrics_collector = ProcessMetricsCollector::start();
@@ -586,6 +628,9 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
 
         let mut next_packet_id = 0_u64;
         run_fixed_blocks(&device_config, options.blocks, &mut || {
+            if is_cancelled() {
+                return Err(RhdReadError::Cancelled);
+            }
             let start = next_packet_id as usize * block_bytes;
             let end = start + block_bytes;
             let block = parse_rhythm_data_block(next_packet_id, &raw[start..end], &data_config)
@@ -602,7 +647,12 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             cable_length_meters: 0.9144,
         })?;
 
-        run_fixed_blocks(&device_config, options.blocks, &mut || backend.read_block())?
+        run_fixed_blocks(&device_config, options.blocks, &mut || {
+            if is_cancelled() {
+                return Err(RhdReadError::Cancelled);
+            }
+            backend.read_block()
+        })?
     };
 
     let recording =
@@ -1293,7 +1343,7 @@ fn parse_u64(flag: &'static str, value: &str) -> Result<u64, CliError> {
 }
 
 #[derive(Debug)]
-struct SimulatorReadError(SimulatorError);
+struct SimulatorReadError(String);
 
 impl fmt::Display for SimulatorReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

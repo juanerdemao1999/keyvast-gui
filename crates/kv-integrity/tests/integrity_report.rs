@@ -268,7 +268,7 @@ fn check_blocks_detects_backwards_packet_id() {
 
 #[test]
 fn incremental_detects_backwards_packet_id() {
-    let blocks = vec![
+    let blocks = [
         sample_block(5, 0, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
         sample_block(
             0,

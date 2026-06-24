@@ -1,3 +1,7 @@
+// `from_register63` literals are grouped as `2-bit chip field | 6-bit revision`
+// for readability, which deliberately uses uneven byte groups.
+#![allow(clippy::unusual_byte_groupings)]
+
 use kv_rhd::{
     AuxCommandSlot, BoardPort, RHD_COMMAND_LIST_LEN, Rhd2000CommandType, Rhd2000Registers,
     RhdChipType, create_rhd2000_command,

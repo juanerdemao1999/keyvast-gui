@@ -488,11 +488,11 @@ mod tests {
 
     #[test]
     fn extract_helpers() {
-        let json = r#"{"name": "test", "count": 42, "enabled": true, "rate": 3.14}"#;
+        let json = r#"{"name": "test", "count": 42, "enabled": true, "rate": 2.5}"#;
         assert_eq!(extract_string(json, "name"), Some("test".to_string()));
         assert_eq!(extract_usize(json, "count"), Some(42));
         assert_eq!(extract_bool(json, "enabled"), Some(true));
-        assert!((extract_f64(json, "rate").unwrap() - 3.14).abs() < 0.001);
+        assert!((extract_f64(json, "rate").unwrap() - 2.5).abs() < 0.001);
     }
 
     #[test]

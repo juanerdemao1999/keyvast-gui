@@ -35,6 +35,10 @@ pub fn free_bytes(path: &str) -> Option<u64> {
         .collect();
 
     let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 Vec kept alive for the
+    // duration of the call. `free_to_caller` is a valid stack-allocated u64
+    // written by the callee. The two null pointers are permitted by the
+    // Win32 API for unused output parameters (total bytes, total free bytes).
     let ok = unsafe {
         GetDiskFreeSpaceExW(
             wide.as_ptr(),

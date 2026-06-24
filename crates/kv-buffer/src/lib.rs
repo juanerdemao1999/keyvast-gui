@@ -18,6 +18,7 @@ pub struct BlockBuffer {
 }
 
 impl BlockBuffer {
+    /// Create a new buffer with the given maximum capacity (in blocks).
     pub fn new(capacity_blocks: usize) -> Result<Self, BufferError> {
         if capacity_blocks == 0 {
             return Err(BufferError::ZeroCapacity);
@@ -46,22 +47,27 @@ impl BlockBuffer {
         overflowed
     }
 
+    /// Remove and return the oldest block, or `None` if the buffer is empty.
     pub fn pop(&mut self) -> Option<SampleBlock> {
         self.blocks.pop_front()
     }
 
+    /// Number of blocks currently buffered.
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
+    /// Returns `true` if the buffer contains no blocks.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
 
+    /// Maximum number of blocks the buffer can hold before evicting.
     pub fn capacity_blocks(&self) -> usize {
         self.capacity_blocks
     }
 
+    /// Snapshot of occupancy and throughput counters.
     pub fn status(&self) -> BufferStatus {
         BufferStatus {
             capacity_blocks: self.capacity_blocks,
@@ -84,10 +90,13 @@ pub struct FanoutBlockBuffer {
 }
 
 impl FanoutBlockBuffer {
+    /// Create an empty fanout buffer with no consumers.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Register a new consumer with the given name and per-consumer capacity.
+    /// Returns the consumer's unique ID for subsequent `pop` / `status` calls.
     pub fn add_consumer(
         &mut self,
         name: impl Into<String>,
@@ -151,6 +160,8 @@ impl FanoutBlockBuffer {
         }
     }
 
+    /// Pop the oldest block for a specific consumer, or `None` if that
+    /// consumer's queue is empty.  Returns `Err` if the ID is unknown.
     pub fn pop(
         &mut self,
         consumer_id: BufferConsumerId,
@@ -170,6 +181,7 @@ impl FanoutBlockBuffer {
         Ok(block)
     }
 
+    /// Aggregate buffer status (consumer count and total pushes).
     pub fn status(&self) -> FanoutBufferStatus {
         FanoutBufferStatus {
             consumer_count: self.consumers.len(),
@@ -177,6 +189,7 @@ impl FanoutBlockBuffer {
         }
     }
 
+    /// Per-consumer status snapshot.  Returns `Err` if the ID is unknown.
     pub fn consumer_status(
         &self,
         consumer_id: BufferConsumerId,
@@ -189,6 +202,7 @@ impl FanoutBlockBuffer {
             })
     }
 
+    /// Status snapshots for all registered consumers.
     pub fn consumer_statuses(&self) -> Vec<ConsumerBufferStatus> {
         self.consumers.values().map(ConsumerQueue::status).collect()
     }
@@ -245,6 +259,7 @@ impl ConsumerQueue {
 pub struct BufferConsumerId(u64);
 
 impl BufferConsumerId {
+    /// Return the underlying numeric ID.
     pub fn as_u64(self) -> u64 {
         self.0
     }

@@ -1,0 +1,17 @@
+okFrontPanel.dll
+=================
+
+Vendor:  Opal Kelly Incorporated (https://opalkelly.com)
+Product: FrontPanel SDK — USB/FPGA interface library
+Version: Bundled for convenience; see Opal Kelly documentation for version details.
+
+This DLL is a proprietary binary redistributed under the terms of the Opal Kelly
+FrontPanel SDK license agreement.  It is NOT covered by this project's own license.
+
+Users must independently accept the Opal Kelly SDK license before deploying
+applications that link against this library.  The SDK license is available from:
+
+    https://opalkelly.com/tools/frontpanel/
+
+This file is included solely to simplify the build/run process for developers who
+already hold a valid Opal Kelly license.

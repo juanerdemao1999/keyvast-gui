@@ -1,6 +1,6 @@
 use std::fmt;
 
-use kv_types::{DeviceBackendKind, DeviceConfig};
+use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig};
 
 pub const RHYTHM_HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 pub const RHYTHM_BOARD_ID: u32 = 700;
@@ -118,7 +118,7 @@ impl RhythmDataConfig {
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
             ttl_enabled: true,
-            ttl_line_count: 16,
+            ttl_line_count: DEFAULT_TTL_LINE_COUNT,
         })
     }
 

@@ -130,7 +130,13 @@ impl SimulatorBackend {
 
 impl Default for SimulatorBackend {
     fn default() -> Self {
-        Self::new(SimulatorConfig::default()).expect("default simulator config is valid")
+        // SAFETY: SimulatorConfig::default() always passes validate_device_config().
+        // Use unwrap_or_else to avoid a bare `expect` in library code while
+        // still documenting the invariant with a clear message.
+        match Self::new(SimulatorConfig::default()) {
+            Ok(backend) => backend,
+            Err(e) => unreachable!("default SimulatorConfig must be valid: {e}"),
+        }
     }
 }
 

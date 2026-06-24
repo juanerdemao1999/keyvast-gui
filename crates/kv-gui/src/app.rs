@@ -212,6 +212,8 @@ pub struct KvApp {
     ui_scale: f32,
     /// Set once after the first frame restores the saved window size (#15).
     window_restored: bool,
+    /// Saved window dimensions from config, applied on first frame.
+    saved_window_size: (f32, f32),
 }
 
 impl KvApp {
@@ -223,6 +225,10 @@ impl KvApp {
         // files fall back to defaults, so this never blocks launch.
         let saved = config_persist::load_or_default();
         let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let saved_window_size = (
+            saved.window_width.clamp(640.0, 7680.0),
+            saved.window_height.clamp(480.0, 4320.0),
+        );
         let start_source = match saved.last_source.as_str() {
             "device" => DataSource::Device,
             "playback" => DataSource::Playback,
@@ -292,6 +298,7 @@ impl KvApp {
             config_persist: ConfigPersistState::default(),
             ui_scale,
             window_restored: false,
+            saved_window_size,
         };
 
         // Apply the persisted display/filter/recording settings to live state.
@@ -1503,9 +1510,7 @@ impl eframe::App for KvApp {
         // config the rest of the settings come from.
         if !self.window_restored {
             self.window_restored = true;
-            let saved = config_persist::load_or_default();
-            let w = saved.window_width.clamp(640.0, 7680.0);
-            let h = saved.window_height.clamp(480.0, 4320.0);
+            let (w, h) = self.saved_window_size;
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
 

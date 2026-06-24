@@ -117,6 +117,7 @@ impl ImpedanceResult {
 /// Returns `(magnitude_ohms, phase_degrees)`.
 ///
 /// Port of Intan `measureComplexAmplitude` + `approximateSaturationVoltage`.
+#[must_use]
 pub fn compute_impedance(
     amplifier_data: &[i16],
     sample_rate: f64,
@@ -182,6 +183,7 @@ pub fn compute_impedance(
 
 /// Select the best capacitor scale for a given impedance magnitude.
 /// Mirrors Intan's auto-range logic.
+#[must_use]
 pub fn auto_select_scale(magnitude_ohms: f64) -> ZcheckScale {
     if magnitude_ohms > 1_000_000.0 {
         ZcheckScale::Cs100fF

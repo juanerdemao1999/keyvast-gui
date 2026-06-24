@@ -736,6 +736,11 @@ impl RhythmFrontPanelBoard {
         const PROBE_SAMPLES: usize = 128;
         const PORT_LETTERS: [char; 8] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
+        if enabled_streams == 0 || enabled_streams > 4 {
+            return Err(RhdReadError::InvalidStreamCount {
+                count: enabled_streams,
+            });
+        }
         let stream_bits = (1_u32 << enabled_streams) - 1;
 
         // (port index, chosen delay, has_chip_id)
@@ -1184,6 +1189,7 @@ pub enum RhdReadError {
     DataClockTimeout,
     UnsupportedSampleRate(f64),
     FifoFlushFailed,
+    InvalidStreamCount { count: usize },
 }
 
 impl fmt::Display for RhdReadError {
@@ -1217,6 +1223,12 @@ impl fmt::Display for RhdReadError {
                 write!(formatter, "unsupported sample rate: {rate} Hz")
             }
             Self::FifoFlushFailed => write!(formatter, "FIFO flush did not fully drain"),
+            Self::InvalidStreamCount { count } => {
+                write!(
+                    formatter,
+                    "invalid enabled_streams count for port scan: {count}"
+                )
+            }
         }
     }
 }
@@ -1236,7 +1248,8 @@ impl std::error::Error for RhdReadError {
             | Self::DcmTimeout
             | Self::DataClockTimeout
             | Self::UnsupportedSampleRate(_)
-            | Self::FifoFlushFailed => None,
+            | Self::FifoFlushFailed
+            | Self::InvalidStreamCount { .. } => None,
         }
     }
 }

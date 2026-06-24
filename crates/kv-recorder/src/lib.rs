@@ -666,14 +666,14 @@ impl StreamingRecorder {
 
         let start = std::time::Instant::now();
 
-        for sample in &block.data {
-            self.writer
-                .write_all(&sample.to_le_bytes())
-                .map_err(|source| RecorderError::Io {
-                    path: self.raw_path.clone(),
-                    source,
-                })?;
-        }
+        // Bulk-convert to bytes and write in a single syscall for throughput.
+        let byte_buf: Vec<u8> = block.data.iter().flat_map(|s| s.to_le_bytes()).collect();
+        self.writer
+            .write_all(&byte_buf)
+            .map_err(|source| RecorderError::Io {
+                path: self.raw_path.clone(),
+                source,
+            })?;
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         self.write_latencies_us.push(elapsed_us);

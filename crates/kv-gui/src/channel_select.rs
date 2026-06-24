@@ -117,16 +117,19 @@ impl ChannelSelectState {
 pub fn filter_block_channels(block: &SampleBlock, indices: &[usize]) -> SampleBlock {
     let ch = block.channel_count;
     let spc = block.samples_per_channel;
-    let valid: Vec<usize> = indices.iter().copied().filter(|&c| c < ch).collect();
-    let mut data = Vec::with_capacity(valid.len() * spc);
+    // Count valid indices without allocating a separate Vec.
+    let valid_count = indices.iter().filter(|&&c| c < ch).count();
+    let mut data = Vec::with_capacity(valid_count * spc);
     for s in 0..spc {
-        for &c in &valid {
-            data.push(block.data[s * ch + c]);
+        for &c in indices {
+            if c < ch {
+                data.push(block.data[s * ch + c]);
+            }
         }
     }
     SampleBlock {
         data,
-        channel_count: valid.len(),
+        channel_count: valid_count,
         ..block.clone()
     }
 }

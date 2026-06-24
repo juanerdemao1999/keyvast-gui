@@ -272,45 +272,49 @@ impl Rhd2000Registers {
     pub fn register_value(&self, register: u8) -> Result<u8, RhdCommandError> {
         let value = match register {
             0 => {
-                (self.adc_reference_bw << 6)
-                    + (self.amp_fast_settle << 5)
-                    + (self.amp_vref_enable << 4)
-                    + (self.adc_comparator_bias << 2)
-                    + self.adc_comparator_select
+                ((self.adc_reference_bw & 0x03) << 6)
+                    | ((self.amp_fast_settle & 0x01) << 5)
+                    | ((self.amp_vref_enable & 0x01) << 4)
+                    | ((self.adc_comparator_bias & 0x03) << 2)
+                    | (self.adc_comparator_select & 0x03)
             }
-            1 => (self.vdd_sense_enable << 6) + self.adc_buffer_bias,
+            1 => ((self.vdd_sense_enable & 0x01) << 6) | (self.adc_buffer_bias & 0x3F),
             2 => self.mux_bias,
             3 => {
-                (self.mux_load << 5)
-                    + (self.temp_s2 << 4)
-                    + (self.temp_s1 << 3)
-                    + (self.temp_en << 2)
-                    + (self.dig_out_hi_z << 1)
-                    + self.dig_out
+                ((self.mux_load & 0x07) << 5)
+                    | ((self.temp_s2 & 0x01) << 4)
+                    | ((self.temp_s1 & 0x01) << 3)
+                    | ((self.temp_en & 0x01) << 2)
+                    | ((self.dig_out_hi_z & 0x01) << 1)
+                    | (self.dig_out & 0x01)
             }
             4 => {
-                (self.weak_miso << 7)
-                    + (self.twos_comp << 6)
-                    + (self.abs_mode << 5)
-                    + (self.dsp_en << 4)
-                    + self.dsp_cutoff_freq
+                ((self.weak_miso & 0x01) << 7)
+                    | ((self.twos_comp & 0x01) << 6)
+                    | ((self.abs_mode & 0x01) << 5)
+                    | ((self.dsp_en & 0x01) << 4)
+                    | (self.dsp_cutoff_freq & 0x0F)
             }
             5 => {
-                (self.zcheck_dac_power << 6)
-                    + (self.zcheck_load << 5)
-                    + (self.zcheck_scale << 3)
-                    + (self.zcheck_conn_all << 2)
-                    + (self.zcheck_sel_pol << 1)
-                    + self.zcheck_en
+                ((self.zcheck_dac_power & 0x01) << 6)
+                    | ((self.zcheck_load & 0x01) << 5)
+                    | ((self.zcheck_scale & 0x03) << 3)
+                    | ((self.zcheck_conn_all & 0x01) << 2)
+                    | ((self.zcheck_sel_pol & 0x01) << 1)
+                    | (self.zcheck_en & 0x01)
             }
             6 => 128,
-            7 => self.zcheck_select,
-            8 => (self.off_chip_rh1 << 7) + self.rh1_dac1,
-            9 => (self.adc_aux1_en << 7) + self.rh1_dac2,
-            10 => (self.off_chip_rh2 << 7) + self.rh2_dac1,
-            11 => (self.adc_aux2_en << 7) + self.rh2_dac2,
-            12 => (self.off_chip_rl << 7) + self.rl_dac1,
-            13 => (self.adc_aux3_en << 7) + (self.rl_dac3 << 6) + self.rl_dac2,
+            7 => self.zcheck_select & 0x3F,
+            8 => ((self.off_chip_rh1 & 0x01) << 7) | (self.rh1_dac1 & 0x7F),
+            9 => ((self.adc_aux1_en & 0x01) << 7) | (self.rh1_dac2 & 0x7F),
+            10 => ((self.off_chip_rh2 & 0x01) << 7) | (self.rh2_dac1 & 0x7F),
+            11 => ((self.adc_aux2_en & 0x01) << 7) | (self.rh2_dac2 & 0x7F),
+            12 => ((self.off_chip_rl & 0x01) << 7) | (self.rl_dac1 & 0x7F),
+            13 => {
+                ((self.adc_aux3_en & 0x01) << 7)
+                    | ((self.rl_dac3 & 0x01) << 6)
+                    | (self.rl_dac2 & 0x3F)
+            }
             14..=21 => self.amp_power_register(register),
             _ => {
                 return Err(RhdCommandError::ArgumentOutOfRange {

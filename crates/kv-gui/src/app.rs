@@ -18,6 +18,7 @@
 //! Mouse: scroll-wheel over the plot also adjusts the time window.
 
 use std::collections::VecDeque;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use eframe::egui;
@@ -860,15 +861,26 @@ impl KvApp {
             AcqMode::Device => {
                 if let Some(ref pipeline) = self.live_pipeline {
                     let path: std::path::PathBuf = self.recording.output_dir.clone().into();
-                    let _ = pipeline
+                    match pipeline
                         .recorder_cmd_tx
-                        .send(RecorderCmd::Start { path, channels });
-                    self.recording.state = RecordingState::Recording;
-                    self.recording.recorded_blocks = 0;
-                    self.recording.recorded_bytes = 0;
-                    self.recording_start_time = Some(Instant::now());
-                    self.recording_error = None;
-                    self.toasts.info("Recording started");
+                        .try_send(RecorderCmd::Start { path, channels })
+                    {
+                        Ok(()) => {
+                            self.recording.state = RecordingState::Recording;
+                            self.recording.recorded_blocks = 0;
+                            self.recording.recorded_bytes = 0;
+                            self.recording_start_time = Some(Instant::now());
+                            self.recording_error = None;
+                            self.toasts.info("Recording started");
+                        }
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            self.toasts
+                                .error("Recorder busy — command queue full, try again");
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            self.toasts.error("Recorder thread disconnected");
+                        }
+                    }
                 }
             }
             AcqMode::Demo => match StreamingRecorder::new(&self.recording.output_dir) {
@@ -899,7 +911,7 @@ impl KvApp {
         match self.mode {
             AcqMode::Device => {
                 if let Some(ref pipeline) = self.live_pipeline {
-                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
+                    let _ = pipeline.recorder_cmd_tx.try_send(RecorderCmd::Stop);
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
@@ -1312,6 +1324,12 @@ impl KvApp {
             }
             if let Some(ref handle) = self.remote_api_handle {
                 let mut resp_q = remote_api::lock_recover(&handle.responses);
+                // Evict stale responses (timed-out requests whose reply was
+                // never collected by the client thread).  Cap at 64 to prevent
+                // unbounded growth.
+                while resp_q.len() > 64 {
+                    resp_q.pop_front();
+                }
                 for r in responses {
                     resp_q.push_back(r);
                 }

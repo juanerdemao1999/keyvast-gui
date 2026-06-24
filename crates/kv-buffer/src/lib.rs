@@ -107,8 +107,14 @@ impl FanoutBlockBuffer {
     /// Push a block to all consumers.  Returns `Some(PushOverflow)` if at
     /// least one consumer was full and had to evict its oldest block.
     pub fn push(&mut self, block: SampleBlock) -> Option<PushOverflow> {
+        self.push_arc(Arc::new(block))
+    }
+
+    /// Like [`push`](Self::push), but accepts a pre-wrapped `Arc<SampleBlock>`.
+    /// Use this when the Arc allocation should happen outside a critical
+    /// section (e.g. before acquiring a Mutex).
+    pub fn push_arc(&mut self, block: Arc<SampleBlock>) -> Option<PushOverflow> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
-        let block = Arc::new(block);
 
         let mut consumers_overflowed: usize = 0;
         let mut max_occupancy: f64 = 0.0;

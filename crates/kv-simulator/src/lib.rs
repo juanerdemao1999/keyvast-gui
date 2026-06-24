@@ -128,6 +128,14 @@ impl SimulatorBackend {
     }
 }
 
+impl kv_core::AcquisitionSource for SimulatorBackend {
+    type Error = SimulatorError;
+
+    fn read_block(&mut self) -> Result<SampleBlock, Self::Error> {
+        self.next_block()
+    }
+}
+
 impl Default for SimulatorBackend {
     fn default() -> Self {
         // SAFETY: SimulatorConfig::default() always passes validate_device_config().

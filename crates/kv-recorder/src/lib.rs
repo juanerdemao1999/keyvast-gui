@@ -1195,12 +1195,34 @@ impl fmt::Debug for KvrawReader {
 /// Minimal JSON parser for KVRAW metadata.  Avoids adding serde as a
 /// dependency — the JSON is always machine-generated with a known schema.
 fn parse_kvraw_json(json: &str) -> KvrawMetadata {
+    // Find a JSON key at a proper key position (not inside a string value).
+    // Iterates through all occurrences of `"key"` and returns the one
+    // immediately followed by optional whitespace and a colon.
+    let find_key = |key: &str| -> Option<usize> {
+        let needle = format!("\"{key}\"");
+        let mut start = 0;
+        while let Some(rel) = json[start..].find(&needle) {
+            let pos = start + rel;
+            let after_key = pos + needle.len();
+            // Valid key: `"key"` must be followed by optional whitespace then `:`
+            if json[after_key..].trim_start().starts_with(':') {
+                return Some(pos);
+            }
+            start = pos + 1;
+        }
+        None
+    };
+
+    let value_after_key = |key: &str| -> Option<&str> {
+        let pos = find_key(key)?;
+        let after = &json[pos + key.len() + 2..];
+        let colon = after.find(':')?;
+        Some(after[colon + 1..].trim_start())
+    };
+
     let get_str = |key: &str| -> String {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
+        value_after_key(key)
+            .and_then(|rest| {
                 let value = rest.strip_prefix('"')?;
                 let end = value.find('"')?;
                 Some(value[..end].to_string())
@@ -1209,12 +1231,8 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_u64 = |key: &str| -> u64 {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
-                // Extract numeric chars
+        value_after_key(key)
+            .and_then(|rest| {
                 let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 num_str.parse().ok()
             })
@@ -1222,11 +1240,8 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_f64 = |key: &str| -> f64 {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
+        value_after_key(key)
+            .and_then(|rest| {
                 let num_str: String = rest
                     .chars()
                     .take_while(|c| {
@@ -1244,10 +1259,7 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_optional_u64 = |key: &str| -> Option<u64> {
-        json.find(&format!("\"{key}\"")).and_then(|pos| {
-            let after = &json[pos + key.len() + 2..];
-            let colon = after.find(':')?;
-            let rest = after[colon + 1..].trim_start();
+        value_after_key(key).and_then(|rest| {
             if rest.starts_with("null") {
                 return None;
             }
@@ -1257,17 +1269,8 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_bool = |key: &str| -> bool {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
-                if rest.starts_with("true") {
-                    Some(true)
-                } else {
-                    Some(false)
-                }
-            })
+        value_after_key(key)
+            .map(|rest| rest.starts_with("true"))
             .unwrap_or(false)
     };
 

@@ -1233,12 +1233,29 @@ fn parse_rhd_smoke_args(args: impl Iterator<Item = String>) -> Result<CliCommand
 }
 
 fn default_rhd_bitfile_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("keyvast_260607_with_UART.bit")
+    const BITFILE_NAME: &str = "keyvast_260607_with_UART.bit";
+
+    // Search order: directory of the running executable, then current working
+    // directory.  This mirrors kv-gui's runtime resolution and avoids relying
+    // on compile-time CARGO_MANIFEST_DIR which only works on the build machine.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_dir = exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let candidate = exe_dir.join(BITFILE_NAME);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(BITFILE_NAME);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    // Fallback: return the filename alone so the downstream open() produces a
+    // clear "file not found" error rather than a stale compile-time path.
+    PathBuf::from(BITFILE_NAME)
 }
 
 fn parse_benchmark_preset(name: &str) -> Result<BenchmarkPreset, CliError> {

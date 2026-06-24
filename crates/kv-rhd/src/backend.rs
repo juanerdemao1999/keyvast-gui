@@ -968,23 +968,35 @@ impl RhythmFrontPanelBoard {
     // ------------------------------------------------------------------
 
     /// Set the on-chip DAC for impedance testing waveform generation.
+    ///
+    /// # Unimplemented
+    /// Requires writing WireInDacSource1..8, WireInDacManual, and issuing
+    /// TriggerIn bits to arm the on-chip DAC.  Blocked on FPGA bitfile
+    /// register map documentation (see hardware/registers.md).
     #[allow(dead_code)]
     fn set_dac_threshold(&self, _dac_channel: u8, _threshold: u16) -> Result<(), RhdReadError> {
-        // TODO: WireInDacSource1..8 + WireInDacManual + TrigIn bits.
         Ok(())
     }
 
     /// Enable/disable an on-board LED.
+    ///
+    /// # Unimplemented
+    /// Requires writing the WireInLedDisplay register via the Opal Kelly
+    /// FrontPanel API.  Low priority — LEDs are not visible during normal
+    /// rack-mount operation.
     #[allow(dead_code)]
     fn set_led(&self, _led_index: u8, _on: bool) -> Result<(), RhdReadError> {
-        // TODO: WireInLedDisplay register.
         Ok(())
     }
 
     /// Trigger external fast-settle (blanking) via the FPGA logic line.
+    ///
+    /// # Unimplemented
+    /// Requires writing the WireInExternalFastSettle register.  Needed for
+    /// stimulation artifact blanking — will be implemented alongside the
+    /// closed-loop stimulation feature.
     #[allow(dead_code)]
     fn set_external_fast_settle_channel(&self, _channel: u8) -> Result<(), RhdReadError> {
-        // TODO: WireInExternalFastSettle.
         Ok(())
     }
 
@@ -1092,6 +1104,7 @@ impl RhythmFrontPanelBoard {
                 config.sample_rate,
                 config.frequency_hz,
                 ZcheckScale::Cs1pF,
+                config.dac_amplitude,
             );
 
             // Auto-select the best scale and re-measure if needed.
@@ -1126,6 +1139,7 @@ impl RhythmFrontPanelBoard {
                     config.sample_rate,
                     config.frequency_hz,
                     best_scale,
+                    config.dac_amplitude,
                 );
                 (mag, ph, best_scale)
             } else {

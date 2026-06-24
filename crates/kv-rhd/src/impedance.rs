@@ -123,6 +123,7 @@ pub fn compute_impedance(
     sample_rate: f64,
     frequency: f64,
     cap_scale: ZcheckScale,
+    dac_amplitude: f64,
 ) -> (f64, f64) {
     if amplifier_data.is_empty() || frequency <= 0.0 || sample_rate <= 0.0 {
         return (f64::INFINITY, 0.0);
@@ -157,8 +158,8 @@ pub fn compute_impedance(
 
     // Convert voltage amplitude to impedance.
     // V_measured = I * Z, where I = Cs * (2π*f) * V_dac.
-    // V_dac peak ≈ 128 * DAC_REFERENCE_VOLTAGE / 256 ≈ 0.6125V (half-scale DAC output).
-    let v_dac_peak = 128.0 * DAC_REFERENCE_VOLTAGE / 256.0;
+    // V_dac peak = dac_amplitude * DAC_REFERENCE_VOLTAGE / 256.
+    let v_dac_peak = dac_amplitude * DAC_REFERENCE_VOLTAGE / 256.0;
     let cap_farads = cap_scale.capacitance_farads();
     let omega = two_pi * frequency;
     let i_current = cap_farads * omega * v_dac_peak; // Amps
@@ -220,7 +221,13 @@ mod tests {
     fn test_dc_impedance() {
         // All-zero data → infinite impedance
         let data = vec![0i16; 1000];
-        let (mag, _phase) = compute_impedance(&data, 30_000.0, 1000.0, ZcheckScale::Cs1pF);
+        let (mag, _phase) = compute_impedance(
+            &data,
+            30_000.0,
+            1000.0,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        );
         assert!(
             mag > 1.0e12 || mag.is_infinite(),
             "expected very high impedance for zero signal, got {mag}"
@@ -243,7 +250,13 @@ mod tests {
             })
             .collect();
 
-        let (mag, _phase) = compute_impedance(&data, sample_rate, freq, ZcheckScale::Cs1pF);
+        let (mag, _phase) = compute_impedance(
+            &data,
+            sample_rate,
+            freq,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        );
         assert!(
             mag.is_finite() && mag > 0.0,
             "expected finite impedance, got {mag}"

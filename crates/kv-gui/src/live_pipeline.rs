@@ -90,8 +90,8 @@ pub struct LivePipelineHandle {
     pub preview_rx: mpsc::Receiver<SampleBlock>,
     /// Events sent from the recorder thread back to the GUI.
     pub event_rx: mpsc::Receiver<RecorderEvent>,
-    /// Commands GUI sends to the recorder thread.
-    pub recorder_cmd_tx: mpsc::Sender<RecorderCmd>,
+    /// Commands GUI sends to the recorder thread (bounded to 4 slots).
+    pub recorder_cmd_tx: mpsc::SyncSender<RecorderCmd>,
     /// Cumulative preview blocks received (for BlockStats computation).
     pub total_blocks: u64,
     /// Packet-ID based drop detection: expected next packet_id.
@@ -145,8 +145,8 @@ pub fn start_live_pipeline(source: PipelineSource) -> LivePipelineHandle {
     // gives ~2 s of headroom before dropping.  If the GUI can't keep up, the
     // producer will block briefly rather than accumulating unbounded memory.
     let (preview_tx, preview_rx) = mpsc::sync_channel::<SampleBlock>(1024);
-    let (cmd_tx, cmd_rx) = mpsc::channel::<RecorderCmd>();
-    let (event_tx, event_rx) = mpsc::channel::<RecorderEvent>();
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RecorderCmd>(4);
+    let (event_tx, event_rx) = mpsc::sync_channel::<RecorderEvent>(64);
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // Producer thread — reports source open/read failures via its own event sender.
@@ -201,7 +201,7 @@ fn producer_loop(
     source: PipelineSource,
     shared: SharedBuffer,
     preview_tx: mpsc::SyncSender<SampleBlock>,
-    event_tx: mpsc::Sender<RecorderEvent>,
+    event_tx: mpsc::SyncSender<RecorderEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
     // Open the backend. The simulator runs faster than real time, so it is
@@ -257,8 +257,14 @@ fn producer_loop(
                 }
                 // Push original into shared fanout (recorder gets its slot)
                 // and notify the recorder thread via condvar.
+                // Arc allocation happens BEFORE the lock to minimize critical section.
+                let block_arc = Arc::new(block);
                 {
-                    let overflow = shared.0.lock().expect("buffer lock poisoned").push(block);
+                    let overflow = shared
+                        .0
+                        .lock()
+                        .expect("buffer lock poisoned")
+                        .push_arc(block_arc);
                     shared.1.notify_one();
                     if let Some(info) = overflow {
                         log::warn!(
@@ -296,7 +302,7 @@ fn recorder_loop(
     shared: SharedBuffer,
     recorder_id: BufferConsumerId,
     cmd_rx: mpsc::Receiver<RecorderCmd>,
-    event_tx: mpsc::Sender<RecorderEvent>,
+    event_tx: mpsc::SyncSender<RecorderEvent>,
 ) {
     let mut recorder: Option<StreamingRecorder> = None;
     // Channel subset for selective save — captured at recording start so a
@@ -404,7 +410,7 @@ fn recorder_loop(
 }
 
 /// Finalize a `StreamingRecorder` and send the result as a `RecorderEvent`.
-fn finish_recording(rec: StreamingRecorder, event_tx: &mpsc::Sender<RecorderEvent>) {
+fn finish_recording(rec: StreamingRecorder, event_tx: &mpsc::SyncSender<RecorderEvent>) {
     match rec.finish() {
         Ok(summary) => {
             let _ = event_tx.send(RecorderEvent::Stopped {

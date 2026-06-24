@@ -1437,7 +1437,10 @@ impl KvApp {
                     ("G", "Toggle the waveform grid"),
                     ("F", "Toggle the performance overlay"),
                     ("[  ]", "Decrease / increase the time window"),
-                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    (
+                        "1 \u{2013} 9",
+                        "Quick-set visible channel count (\u{00D7}4)",
+                    ),
                     ("+  \u{2212}", "Increase / decrease channel spacing"),
                     ("?  /  F1", "Toggle this help (Esc to close)"),
                 ];

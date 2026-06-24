@@ -132,32 +132,30 @@ impl TriggerConfig {
         match self.state {
             TriggerState::Disabled => TriggerAction::None,
 
-            TriggerState::Armed => {
-                match self.mode {
-                    TriggerMode::Level => {
-                        let active = match self.edge {
-                            TriggerEdge::Rising => current_bit == 1,
-                            TriggerEdge::Falling => current_bit == 0,
-                        };
-                        if active {
-                            self.state = TriggerState::Triggered;
-                            self.blocks_since_trigger = 0;
-                            TriggerAction::StartRecording
-                        } else {
-                            TriggerAction::None
-                        }
-                    }
-                    TriggerMode::EdgeToggle | TriggerMode::EdgeTimed => {
-                        if edge_detected {
-                            self.state = TriggerState::Triggered;
-                            self.blocks_since_trigger = 0;
-                            TriggerAction::StartRecording
-                        } else {
-                            TriggerAction::None
-                        }
+            TriggerState::Armed => match self.mode {
+                TriggerMode::Level => {
+                    let active = match self.edge {
+                        TriggerEdge::Rising => current_bit == 1,
+                        TriggerEdge::Falling => current_bit == 0,
+                    };
+                    if active {
+                        self.state = TriggerState::Triggered;
+                        self.blocks_since_trigger = 0;
+                        TriggerAction::StartRecording
+                    } else {
+                        TriggerAction::None
                     }
                 }
-            }
+                TriggerMode::EdgeToggle | TriggerMode::EdgeTimed => {
+                    if edge_detected {
+                        self.state = TriggerState::Triggered;
+                        self.blocks_since_trigger = 0;
+                        TriggerAction::StartRecording
+                    } else {
+                        TriggerAction::None
+                    }
+                }
+            },
 
             TriggerState::Triggered => {
                 self.blocks_since_trigger += 1;
@@ -317,16 +315,16 @@ pub fn draw_trigger_section(ui: &mut egui::Ui, config: &mut TriggerConfig) {
                 && ui
                     .small_button(egui::RichText::new("Arm").size(9.0))
                     .clicked()
-                {
-                    config.arm();
-                }
+            {
+                config.arm();
+            }
             if config.state != TriggerState::Disabled
                 && ui
                     .small_button(egui::RichText::new("Disarm").size(9.0))
                     .clicked()
-                {
-                    config.disarm();
-                }
+            {
+                config.disarm();
+            }
         });
     });
 }
@@ -367,7 +365,10 @@ mod tests {
         // No edge yet (stays at 0)
         assert_eq!(config.process_block(&make_block(0)), TriggerAction::None);
         // Rising edge
-        assert_eq!(config.process_block(&make_block(1)), TriggerAction::StartRecording);
+        assert_eq!(
+            config.process_block(&make_block(1)),
+            TriggerAction::StartRecording
+        );
         assert_eq!(config.state, TriggerState::Triggered);
     }
 
@@ -384,7 +385,10 @@ mod tests {
         };
 
         // Falling edge (opposite of rising)
-        assert_eq!(config.process_block(&make_block(0)), TriggerAction::StopRecording);
+        assert_eq!(
+            config.process_block(&make_block(0)),
+            TriggerAction::StopRecording
+        );
         assert_eq!(config.state, TriggerState::Armed);
     }
 
@@ -400,13 +404,25 @@ mod tests {
         };
 
         // Bit 2 low — no trigger
-        assert_eq!(config.process_block(&make_block(0b000)), TriggerAction::None);
+        assert_eq!(
+            config.process_block(&make_block(0b000)),
+            TriggerAction::None
+        );
         // Bit 2 high — trigger
-        assert_eq!(config.process_block(&make_block(0b100)), TriggerAction::StartRecording);
+        assert_eq!(
+            config.process_block(&make_block(0b100)),
+            TriggerAction::StartRecording
+        );
         // Still high — no action
-        assert_eq!(config.process_block(&make_block(0b100)), TriggerAction::None);
+        assert_eq!(
+            config.process_block(&make_block(0b100)),
+            TriggerAction::None
+        );
         // Goes low — stop
-        assert_eq!(config.process_block(&make_block(0b000)), TriggerAction::StopRecording);
+        assert_eq!(
+            config.process_block(&make_block(0b000)),
+            TriggerAction::StopRecording
+        );
     }
 
     #[test]
@@ -422,12 +438,18 @@ mod tests {
         };
 
         // Trigger
-        assert_eq!(config.process_block(&make_block(1)), TriggerAction::StartRecording);
+        assert_eq!(
+            config.process_block(&make_block(1)),
+            TriggerAction::StartRecording
+        );
         // Count blocks (stays high, no opposite edge)
         assert_eq!(config.process_block(&make_block(1)), TriggerAction::None);
         assert_eq!(config.process_block(&make_block(1)), TriggerAction::None);
         // Third block after trigger → stop
-        assert_eq!(config.process_block(&make_block(1)), TriggerAction::StopRecording);
+        assert_eq!(
+            config.process_block(&make_block(1)),
+            TriggerAction::StopRecording
+        );
     }
 
     #[test]

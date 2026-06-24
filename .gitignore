@@ -19,6 +19,16 @@ events.csv
 integrity.json
 benchmark.json
 log.txt
+kvlog.txt
+/captures/
+
+# FPGA bitfiles (proprietary, ~2.6 MB each)
+*.bit
+
+# Python scratch / diagnostics
+__pycache__/
+*.pyc
+diag*.png
 
 # OS noise
 Thumbs.db

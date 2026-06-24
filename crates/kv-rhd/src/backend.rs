@@ -15,8 +15,9 @@ use crate::{
     impedance,
     parser::{RhythmParseError, parse_rhythm_data_block},
     protocol::{
-        CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, RHYTHM_BOARD_ID, RhythmConfigError,
-        RhythmDataConfig, SAMPLES_PER_USB_BLOCK, USB3_BLOCK_SIZE_BYTES, bytes_per_block,
+        CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID,
+        DEFAULT_RHD_SAMPLE_RATE, RHYTHM_BOARD_ID, RhythmConfigError, RhythmDataConfig,
+        SAMPLES_PER_USB_BLOCK, USB3_BLOCK_SIZE_BYTES, bytes_per_block,
     },
 };
 
@@ -65,13 +66,13 @@ impl RhdHardwareOptions {
             frontpanel_dll_path: None,
             serial: None,
             data: RhythmDataConfig {
-                device_id: "rhd-xem7310".to_string(),
+                device_id: DEFAULT_RHD_DEVICE_ID.to_string(),
                 stream_id: 0,
                 enabled_streams,
                 sample_rate: DEFAULT_RHD_SAMPLE_RATE,
                 samples_per_block: SAMPLES_PER_USB_BLOCK,
             },
-            cable_length_meters: 0.9144,
+            cable_length_meters: DEFAULT_CABLE_LENGTH_METERS,
         }
     }
 }

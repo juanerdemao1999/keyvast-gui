@@ -40,8 +40,9 @@ use kv_recorder::{
     write_integrity_summary, write_log_file, write_recording, write_recording_with_backend,
 };
 use kv_rhd::{
-    DEFAULT_RHD_SAMPLE_RATE, RhdHardwareBackend, RhdHardwareOptions, RhdReadError,
-    RhythmDataConfig, SAMPLES_PER_USB_BLOCK, bytes_per_block, parse_rhythm_data_block,
+    DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE,
+    RhdHardwareBackend, RhdHardwareOptions, RhdReadError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
+    bytes_per_block, parse_rhythm_data_block,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError};
 use kv_types::{
@@ -599,7 +600,7 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
     }
 
     let data_config = RhythmDataConfig {
-        device_id: "rhd-xem7310".to_string(),
+        device_id: DEFAULT_RHD_DEVICE_ID.to_string(),
         stream_id: 0,
         enabled_streams: options.enabled_streams,
         sample_rate: DEFAULT_RHD_SAMPLE_RATE,
@@ -644,7 +645,7 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             frontpanel_dll_path: options.frontpanel_dll_path.clone(),
             serial: options.serial.clone(),
             data: data_config.clone(),
-            cable_length_meters: 0.9144,
+            cable_length_meters: DEFAULT_CABLE_LENGTH_METERS,
         })?;
 
         run_fixed_blocks(&device_config, options.blocks, &mut || {

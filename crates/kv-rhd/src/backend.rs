@@ -1185,6 +1185,7 @@ pub enum RhdReadError {
     PllDcmTimeout,
     PllLockTimeout,
     FifoFlushIncomplete { remaining_words: u32 },
+    Cancelled,
 }
 
 impl fmt::Display for RhdReadError {
@@ -1218,6 +1219,7 @@ impl fmt::Display for RhdReadError {
                 formatter,
                 "FIFO flush incomplete: {remaining_words} words remaining"
             ),
+            Self::Cancelled => write!(formatter, "cancelled by Ctrl-C"),
         }
     }
 }
@@ -1236,7 +1238,8 @@ impl std::error::Error for RhdReadError {
             | Self::SpiStillRunning
             | Self::PllDcmTimeout
             | Self::PllLockTimeout
-            | Self::FifoFlushIncomplete { .. } => None,
+            | Self::FifoFlushIncomplete { .. }
+            | Self::Cancelled => None,
         }
     }
 }

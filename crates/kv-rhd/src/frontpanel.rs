@@ -47,6 +47,10 @@ mod imp {
         pub fn load(path: Option<PathBuf>) -> Result<Self, FrontPanelError> {
             let path = path.unwrap_or_else(default_frontpanel_dll_path);
             log::info!("loading FrontPanel DLL: {}", path.display());
+            // SAFETY: Library::new loads the DLL into the process address space.
+            // The path is a valid filesystem path. The Library is stored in
+            // Arc<FrontPanelApi>::_library, keeping the DLL loaded for the
+            // lifetime of all derived function pointers.
             let library = unsafe {
                 Library::new(&path).map_err(|source| {
                     log::error!("FrontPanel DLL load FAILED: {source}");
@@ -57,6 +61,10 @@ mod imp {
                 })?
             };
 
+            // SAFETY: Each symbol name is a NUL-terminated byte literal matching
+            // the Opal Kelly FrontPanel C API. The Library remains alive via
+            // Arc<FrontPanelApi>::_library for as long as any function pointer
+            // is reachable. Symbol types match the vendor header signatures.
             let api = unsafe {
                 FrontPanelApi {
                     construct: symbol(&library, b"okFrontPanel_Construct\0")?,
@@ -66,17 +74,11 @@ mod imp {
                         &library,
                         b"okFrontPanel_GetDeviceListSerial\0",
                     )?,
-                    get_device_list_model: symbol(
-                        &library,
-                        b"okFrontPanel_GetDeviceListModel\0",
-                    )?,
+                    get_device_list_model: symbol(&library, b"okFrontPanel_GetDeviceListModel\0")?,
                     open_by_serial: symbol(&library, b"okFrontPanel_OpenBySerial\0")?,
                     is_open: symbol(&library, b"okFrontPanel_IsOpen\0")?,
                     configure_fpga: symbol(&library, b"okFrontPanel_ConfigureFPGA\0")?,
-                    is_frontpanel_enabled: symbol(
-                        &library,
-                        b"okFrontPanel_IsFrontPanelEnabled\0",
-                    )?,
+                    is_frontpanel_enabled: symbol(&library, b"okFrontPanel_IsFrontPanelEnabled\0")?,
                     set_wire_in_value: symbol(&library, b"okFrontPanel_SetWireInValue\0")?,
                     update_wire_ins: symbol(&library, b"okFrontPanel_UpdateWireIns\0")?,
                     update_wire_outs: symbol(&library, b"okFrontPanel_UpdateWireOuts\0")?,
@@ -94,7 +96,12 @@ mod imp {
             Ok(Self { api: Arc::new(api) })
         }
 
-        pub fn open_device(&self, serial: Option<&str>) -> Result<FrontPanelDevice, FrontPanelError> {
+        pub fn open_device(
+            &self,
+            serial: Option<&str>,
+        ) -> Result<FrontPanelDevice, FrontPanelError> {
+            // SAFETY: construct() allocates a new FrontPanel handle; the
+            // returned pointer is checked for null immediately below.
             let handle = unsafe { (self.api.construct)() };
             if handle.is_null() {
                 return Err(FrontPanelError::ConstructFailed);
@@ -110,15 +117,17 @@ mod imp {
                 None => device.first_serial()?,
             };
             let serial_display = serial.clone();
-            let serial = CString::new(serial).map_err(|_| FrontPanelError::InvalidCString {
-                field: "serial",
-            })?;
+            let serial = CString::new(serial)
+                .map_err(|_| FrontPanelError::InvalidCString { field: "serial" })?;
             log::info!("opening device by serial: {serial_display}");
             device.check_error(
                 "okFrontPanel_OpenBySerial",
+                // SAFETY: handle is non-null (checked above), serial is a
+                // NUL-terminated CString kept alive for the duration of the call.
                 unsafe { (device.api.open_by_serial)(device.handle, serial.as_ptr()) },
             )?;
 
+            // SAFETY: handle is non-null and exclusively owned by `device`.
             let is_open = unsafe { (device.api.is_open)(device.handle) != 0 };
             if !is_open {
                 log::error!("device reported NOT open after OpenBySerial");
@@ -145,15 +154,16 @@ mod imp {
                      ConfigureFPGA will program nothing"
                 );
             }
-            let bitfile_c =
-                path_to_cstring(bitfile).map_err(|_| FrontPanelError::InvalidCString {
-                    field: "bitfile",
-                })?;
+            let bitfile_c = path_to_cstring(bitfile)
+                .map_err(|_| FrontPanelError::InvalidCString { field: "bitfile" })?;
             self.check_error(
                 "okFrontPanel_ConfigureFPGA",
+                // SAFETY: handle is non-null and exclusively owned; bitfile_c is a
+                // NUL-terminated CString kept alive for the duration of the call.
                 unsafe { (self.api.configure_fpga)(self.handle, bitfile_c.as_ptr()) },
             )?;
 
+            // SAFETY: handle is non-null and exclusively owned.
             let enabled = unsafe { (self.api.is_frontpanel_enabled)(self.handle) } != 0;
             log::info!("ConfigureFPGA returned OK; FrontPanel enabled = {enabled}");
             if !enabled {
@@ -171,6 +181,8 @@ mod imp {
         ) -> Result<(), FrontPanelError> {
             self.check_error(
                 "okFrontPanel_SetWireInValue",
+                // SAFETY: handle is non-null and exclusively owned; scalar
+                // arguments are passed by value.
                 unsafe {
                     (self.api.set_wire_in_value)(
                         self.handle,
@@ -183,24 +195,24 @@ mod imp {
         }
 
         pub fn update_wire_ins(&self) {
+            // SAFETY: handle is non-null and exclusively owned.
             unsafe { (self.api.update_wire_ins)(self.handle) };
         }
 
         pub fn update_wire_outs(&self) {
+            // SAFETY: handle is non-null and exclusively owned.
             unsafe { (self.api.update_wire_outs)(self.handle) };
         }
 
         pub fn get_wire_out_value(&self, endpoint: i32) -> u32 {
+            // SAFETY: handle is non-null and exclusively owned.
             unsafe { (self.api.get_wire_out_value)(self.handle, endpoint) }
         }
 
-        pub fn activate_trigger_in(
-            &self,
-            endpoint: i32,
-            bit: i32,
-        ) -> Result<(), FrontPanelError> {
+        pub fn activate_trigger_in(&self, endpoint: i32, bit: i32) -> Result<(), FrontPanelError> {
             self.check_error(
                 "okFrontPanel_ActivateTriggerIn",
+                // SAFETY: handle is non-null and exclusively owned.
                 unsafe { (self.api.activate_trigger_in)(self.handle, endpoint, bit) },
             )
         }
@@ -211,6 +223,11 @@ mod imp {
             block_size: usize,
             buffer: &mut [u8],
         ) -> Result<usize, FrontPanelError> {
+            // SAFETY: handle is non-null and exclusively owned. buffer is a
+            // valid mutable slice; buffer.len() fits in c_long for all practical
+            // block sizes (max ~100 KB). The API writes at most `len` bytes into
+            // the buffer and returns the actual byte count (or negative on error).
+            debug_assert!(buffer.len() <= c_long::MAX as usize);
             let read = unsafe {
                 (self.api.read_from_block_pipe_out)(
                     self.handle,
@@ -232,6 +249,7 @@ mod imp {
         }
 
         fn first_serial(&self) -> Result<String, FrontPanelError> {
+            // SAFETY: handle is non-null and exclusively owned.
             let count = unsafe { (self.api.get_device_count)(self.handle) };
             log::info!("FrontPanel device count: {count}");
             if count <= 0 {
@@ -245,11 +263,15 @@ mod imp {
 
             for index in 0..count {
                 let mut buffer = [0_i8; 64];
+                // SAFETY: handle is non-null; buffer is a stack-allocated
+                // [i8; 64] valid for the duration of the call. The API writes a
+                // NUL-terminated ASCII serial string into the buffer.
                 unsafe {
                     (self.api.get_device_list_serial)(self.handle, index, buffer.as_mut_ptr())
                 };
                 let serial =
                     c_buffer_to_string(&buffer).unwrap_or_else(|_| "<invalid>".to_string());
+                // SAFETY: handle is non-null and exclusively owned.
                 let model = unsafe { (self.api.get_device_list_model)(self.handle, index) };
                 log::info!(
                     "  device[{index}]: serial={serial} model={model} ({})",
@@ -258,6 +280,7 @@ mod imp {
             }
 
             let mut buffer = [0_i8; 64];
+            // SAFETY: same as above — handle is non-null, buffer is valid.
             unsafe { (self.api.get_device_list_serial)(self.handle, 0, buffer.as_mut_ptr()) };
             c_buffer_to_string(&buffer)
         }
@@ -277,17 +300,29 @@ mod imp {
 
     impl Drop for FrontPanelDevice {
         fn drop(&mut self) {
+            // SAFETY: handle is non-null (checked at construction) and exclusively
+            // owned — no aliasing is possible since FrontPanelDevice is not Clone
+            // or Copy. The Library (held by Arc<FrontPanelApi>::_library) outlives
+            // this call because Arc::clone was taken at construction time.
             unsafe { (self.api.destruct)(self.handle) };
         }
     }
 
-    unsafe fn symbol<T: Copy>(library: &Library, name: &'static [u8]) -> Result<T, FrontPanelError> {
-        let symbol = unsafe { library.get::<T>(name) }.map_err(|source| {
-            FrontPanelError::MissingSymbol {
+    /// # Safety
+    /// The caller must ensure `name` is a NUL-terminated byte literal matching
+    /// a symbol exported by the loaded `library`, and that `T` matches the
+    /// symbol's actual calling convention and signature.
+    unsafe fn symbol<T: Copy>(
+        library: &Library,
+        name: &'static [u8],
+    ) -> Result<T, FrontPanelError> {
+        // SAFETY: name is a NUL-terminated byte literal; the library is alive
+        // and will remain alive via Arc<FrontPanelApi>::_library.
+        let symbol =
+            unsafe { library.get::<T>(name) }.map_err(|source| FrontPanelError::MissingSymbol {
                 name: String::from_utf8_lossy(&name[..name.len().saturating_sub(1)]).to_string(),
                 message: source.to_string(),
-            }
-        })?;
+            })?;
         Ok(*symbol)
     }
 
@@ -323,17 +358,18 @@ mod imp {
 
         // 1. Next to the executable (deployed builds).
         if let Ok(exe) = std::env::current_exe()
-            && let Some(exe_dir) = exe.parent() {
-                let candidate = exe_dir.join(dll_name);
-                if candidate.exists() {
-                    return candidate;
-                }
-                // Also check vendor sub-path relative to exe
-                let candidate = exe_dir.join(&relative_vendor);
-                if candidate.exists() {
-                    return candidate;
-                }
+            && let Some(exe_dir) = exe.parent()
+        {
+            let candidate = exe_dir.join(dll_name);
+            if candidate.exists() {
+                return candidate;
             }
+            // Also check vendor sub-path relative to exe
+            let candidate = exe_dir.join(&relative_vendor);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
 
         // 2. Current working directory.
         if let Ok(cwd) = std::env::current_dir() {
@@ -434,32 +470,16 @@ pub use imp::{FrontPanelDevice, FrontPanelLibrary, default_frontpanel_dll_path};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FrontPanelError {
     UnsupportedPlatform,
-    DllLoad {
-        path: PathBuf,
-        message: String,
-    },
-    MissingSymbol {
-        name: String,
-        message: String,
-    },
+    DllLoad { path: PathBuf, message: String },
+    MissingSymbol { name: String, message: String },
     ConstructFailed,
     NoDevices,
     DeviceNotOpen,
-    InvalidCString {
-        field: &'static str,
-    },
-    InvalidUtf8 {
-        field: &'static str,
-    },
+    InvalidCString { field: &'static str },
+    InvalidUtf8 { field: &'static str },
     FrontPanelNotEnabled,
-    Api {
-        function: &'static str,
-        code: i32,
-    },
-    TransferFailed {
-        function: &'static str,
-        code: i32,
-    },
+    Api { function: &'static str, code: i32 },
+    TransferFailed { function: &'static str, code: i32 },
 }
 
 impl fmt::Display for FrontPanelError {
@@ -477,7 +497,10 @@ impl fmt::Display for FrontPanelError {
                 )
             }
             Self::MissingSymbol { name, message } => {
-                write!(formatter, "FrontPanel DLL is missing symbol {name}: {message}")
+                write!(
+                    formatter,
+                    "FrontPanel DLL is missing symbol {name}: {message}"
+                )
             }
             Self::ConstructFailed => write!(formatter, "failed to construct FrontPanel device"),
             Self::NoDevices => write!(formatter, "no Opal Kelly FrontPanel devices were found"),
@@ -491,7 +514,10 @@ impl fmt::Display for FrontPanelError {
                 "configured FPGA bitfile does not expose FrontPanel endpoints"
             ),
             Self::Api { function, code } => {
-                write!(formatter, "{function} returned FrontPanel error code {code}")
+                write!(
+                    formatter,
+                    "{function} returned FrontPanel error code {code}"
+                )
             }
             Self::TransferFailed { function, code } => {
                 write!(formatter, "{function} returned transfer status {code}")

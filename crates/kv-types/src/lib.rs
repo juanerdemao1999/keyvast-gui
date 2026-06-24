@@ -84,7 +84,7 @@ impl SampleBlock {
     }
 
     pub fn validate(&self) -> Result<(), SampleBlockError> {
-        if self.sample_rate <= 0.0 {
+        if !(self.sample_rate > 0.0 && self.sample_rate.is_finite()) {
             return Err(SampleBlockError::InvalidSampleRate);
         }
 

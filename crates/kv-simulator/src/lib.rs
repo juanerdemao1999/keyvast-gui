@@ -56,7 +56,10 @@ impl SimulatorBackend {
             .binary_search(&self.next_packet_id)
             .is_ok()
         {
-            self.next_packet_id = self.next_packet_id.saturating_add(1);
+            self.next_packet_id = match self.next_packet_id.checked_add(1) {
+                Some(id) => id,
+                None => break, // u64::MAX: stop skipping to avoid infinite loop
+            };
         }
 
         let packet_id = self.next_packet_id;

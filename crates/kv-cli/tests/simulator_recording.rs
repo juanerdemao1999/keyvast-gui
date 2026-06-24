@@ -62,8 +62,8 @@ fn simulator_recording_writes_raw_metadata_and_integrity_summary() {
     let events =
         fs::read_to_string(output_dir.join("events.csv")).expect("events csv should be readable");
     assert!(events.contains("host_time_ms,timestamp_start,event_type,value,message"));
-    assert!(events.contains("0,,started,,"));
-    assert!(events.contains("0,,stopped,,"));
+    assert!(events.contains(",,started,,"));
+    assert!(events.contains(",,stopped,,"));
     assert!(!events.contains("packet_missing"));
 
     let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))

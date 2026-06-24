@@ -559,7 +559,11 @@ fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
     assert_eq!(options.enabled_streams, 1);
     assert_eq!(options.raw_input, Some(PathBuf::from("capture.bin")));
     assert_eq!(options.output_dir, PathBuf::from("rhd-out"));
-    assert!(options.bitfile_path.ends_with("keyvast_260607_with_UART.bit"));
+    assert!(
+        options
+            .bitfile_path
+            .ends_with("keyvast_260607_with_UART.bit")
+    );
 }
 
 #[test]
@@ -623,7 +627,7 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
     let words_per_frame = 4
         + 2
         + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + (enabled_streams % 4)
+        + ((4 - enabled_streams % 4) % 4)
         + 8
         + 2;
     let mut raw = Vec::with_capacity(block_count * SAMPLES_PER_BLOCK * words_per_frame * 2);
@@ -647,7 +651,7 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
                 }
             }
 
-            for _ in 0..(enabled_streams % 4) {
+            for _ in 0..((4 - enabled_streams % 4) % 4) {
                 raw.extend_from_slice(&0_u16.to_le_bytes());
             }
             for _ in 0..8 {

@@ -6,8 +6,7 @@ use kv_rhd::{
 #[test]
 fn encodes_rhd2000_spi_commands_like_intan() {
     assert_eq!(
-        create_rhd2000_command(Rhd2000CommandType::Convert, Some(12), None)
-            .expect("valid convert"),
+        create_rhd2000_command(Rhd2000CommandType::Convert, Some(12), None).expect("valid convert"),
         0x0c00
     );
     assert_eq!(
@@ -21,8 +20,7 @@ fn encodes_rhd2000_spi_commands_like_intan() {
         0x849c
     );
     assert_eq!(
-        create_rhd2000_command(Rhd2000CommandType::Calibrate, None, None)
-            .expect("valid calibrate"),
+        create_rhd2000_command(Rhd2000CommandType::Calibrate, None, None).expect("valid calibrate"),
         0x5500
     );
     assert_eq!(

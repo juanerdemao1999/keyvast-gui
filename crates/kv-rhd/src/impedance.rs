@@ -18,6 +18,9 @@ pub const DEFAULT_TEST_FREQUENCY: f64 = 1000.0;
 /// Number of periods of the test waveform to acquire for impedance measurement.
 pub const DEFAULT_NUM_PERIODS: usize = 20;
 
+/// RHD2000 on-chip DAC reference voltage (Volts).
+const DAC_REFERENCE_VOLTAGE: f64 = 1.225;
+
 /// DAC amplitude (0..128).  Intan default = 128 (full scale).
 pub const DEFAULT_DAC_AMPLITUDE: f64 = 128.0;
 
@@ -64,8 +67,7 @@ impl ImpedanceTestConfig {
 
     /// Total samples needed for the measurement (num_periods complete cycles).
     pub fn total_samples(&self) -> usize {
-        self.samples_per_period()
-            .saturating_mul(self.num_periods)
+        self.samples_per_period().saturating_mul(self.num_periods)
     }
 }
 
@@ -93,13 +95,13 @@ impl ImpedanceResult {
     /// RGBA color for the impedance magnitude (green→yellow→red→gray).
     pub fn quality_color(magnitude: f64) -> [u8; 4] {
         if magnitude < 100_000.0 {
-            [0, 200, 0, 255]       // green
+            [0, 200, 0, 255] // green
         } else if magnitude < 500_000.0 {
-            [200, 200, 0, 255]     // yellow
+            [200, 200, 0, 255] // yellow
         } else if magnitude < 5_000_000.0 {
-            [220, 80, 0, 255]      // orange/red
+            [220, 80, 0, 255] // orange/red
         } else {
-            [180, 0, 0, 255]       // dark red
+            [180, 0, 0, 255] // dark red
         }
     }
 }
@@ -154,8 +156,8 @@ pub fn compute_impedance(
 
     // Convert voltage amplitude to impedance.
     // V_measured = I * Z, where I = Cs * (2π*f) * V_dac.
-    // V_dac peak ≈ 128 * 1.225V / 256 ≈ 0.6125V (half-scale DAC output).
-    let v_dac_peak = 128.0 * 1.225 / 256.0; // ~0.6125 V
+    // V_dac peak ≈ 128 * DAC_REFERENCE_VOLTAGE / 256 ≈ 0.6125V (half-scale DAC output).
+    let v_dac_peak = 128.0 * DAC_REFERENCE_VOLTAGE / 256.0;
     let cap_farads = cap_scale.capacitance_farads();
     let omega = two_pi * frequency;
     let i_current = cap_farads * omega * v_dac_peak; // Amps
@@ -240,7 +242,10 @@ mod tests {
             .collect();
 
         let (mag, _phase) = compute_impedance(&data, sample_rate, freq, ZcheckScale::Cs1pF);
-        assert!(mag.is_finite() && mag > 0.0, "expected finite impedance, got {mag}");
+        assert!(
+            mag.is_finite() && mag > 0.0,
+            "expected finite impedance, got {mag}"
+        );
     }
 
     #[test]

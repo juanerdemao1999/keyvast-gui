@@ -2,9 +2,7 @@
 
 use std::fmt;
 
-use kv_types::{
-    DEFAULT_SAMPLES_PER_PACKET, DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError,
-};
+use kv_types::{DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError};
 
 pub const DEFAULT_SIMULATOR_SEED: u64 = 0x4b56_5354_0000_0001;
 
@@ -246,15 +244,17 @@ fn mix_u64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
+/// Slow triangle wave simulating an LFP-like oscillation (~7.5 Hz at 30 kHz).
 fn triangle_wave(sample_index: u64) -> i32 {
-    let period = (DEFAULT_SAMPLES_PER_PACKET as u64).saturating_mul(4);
-    let phase = (sample_index % period) as i32;
-    let half_period = (period / 2) as i32;
+    // Period in samples: 30000 / 7.5 = 4000 samples ≈ 7.5 Hz LFP at 30 kHz.
+    const LFP_PERIOD: u64 = 4000;
+    let phase = (sample_index % LFP_PERIOD) as i32;
+    let half_period = (LFP_PERIOD / 2) as i32;
 
     if phase < half_period {
         phase - (half_period / 2)
     } else {
-        (period as i32 - phase) - (half_period / 2)
+        (LFP_PERIOD as i32 - phase) - (half_period / 2)
     }
 }
 
@@ -263,11 +263,13 @@ fn spike_component(seed: u64, sample_index: u64, channel: usize) -> i32 {
     // Modulus controls rarity — higher modulus = fewer spikes.
     let rarity = 512 + (channel as u64 % 8) * 128;
 
-    let event_seed =
-        seed ^ (sample_index / DEFAULT_SAMPLES_PER_PACKET as u64) ^ (channel as u64 * 17);
-    if mix_u64(event_seed).is_multiple_of(rarity) && sample_index % 6 <= 2 {
+    // Use per-sample seed so spikes don't burst across an entire packet.
+    let spike_phase = sample_index % 3;
+    let spike_start = sample_index - spike_phase;
+    let event_seed = seed ^ spike_start ^ (channel as u64 * 17);
+    if mix_u64(event_seed).is_multiple_of(rarity) && spike_phase <= 2 {
         // 3-sample biphasic spike template
-        match sample_index % 6 {
+        match spike_phase {
             0 => -180,
             1 => 260,
             2 => -80,

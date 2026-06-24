@@ -886,14 +886,17 @@ impl KvApp {
 
     /// Stop recording (used by the toggle, triggers, and the remote API).
     fn stop_recording(&mut self) {
+        if self.recording.state != RecordingState::Recording {
+            return;
+        }
         match self.mode {
             AcqMode::Device => {
-                // Recorder thread finalizes; state goes Idle via RecorderEvent::Stopped.
                 if let Some(ref pipeline) = self.live_pipeline {
                     let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
+                self.recording.state = RecordingState::Idle;
             }
             AcqMode::Demo => {
                 if let Some(rec) = self.active_recorder.take() {
@@ -1262,6 +1265,16 @@ impl KvApp {
                 RecorderEvent::BufferStatus { occupancy } => {
                     self.recorder_buffer_occupancy = occupancy;
                 }
+                RecorderEvent::BufferOverflow {
+                    dropped_blocks,
+                    occupancy,
+                } => {
+                    self.recorder_buffer_occupancy = occupancy;
+                    self.toasts.warning(format!(
+                        "Buffer overflow: {dropped_blocks} blocks dropped ({:.0}% full)",
+                        occupancy * 100.0,
+                    ));
+                }
                 RecorderEvent::SourceError(e) => {
                     // The producer (device) thread has stopped. Surface the
                     // error and tear down the pipeline so the UI shows
@@ -1437,7 +1450,10 @@ impl KvApp {
                     ("G", "Toggle the waveform grid"),
                     ("F", "Toggle the performance overlay"),
                     ("[  ]", "Decrease / increase the time window"),
-                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    (
+                        "1 \u{2013} 9",
+                        "Quick-set visible channel count (\u{00D7}4)",
+                    ),
                     ("+  \u{2212}", "Increase / decrease channel spacing"),
                     ("?  /  F1", "Toggle this help (Esc to close)"),
                 ];
@@ -1890,7 +1906,12 @@ impl eframe::App for KvApp {
         // ── Device error banner ─────────────────────────────────
         // Surfaced when the acquisition source fails to open or read.
         // Dismissible; the GUI and any other mode keep running regardless.
-        if let Some(err) = self.device_error.clone() {
+        if self.device_error.is_some() {
+            let err_text = format!(
+                "\u{26A0} Device error: {}",
+                self.device_error.as_deref().unwrap_or("")
+            );
+            let mut dismiss = false;
             egui::TopBottomPanel::top("device_error_banner")
                 .frame(
                     egui::Frame::new()
@@ -1900,18 +1921,21 @@ impl eframe::App for KvApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            egui::RichText::new(format!("\u{26A0} Device error: {err}"))
+                            egui::RichText::new(&err_text)
                                 .size(12.0)
                                 .strong()
                                 .color(egui::Color32::WHITE),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Dismiss").clicked() {
-                                self.device_error = None;
+                                dismiss = true;
                             }
                         });
                     });
                 });
+            if dismiss {
+                self.device_error = None;
+            }
         }
 
         // ── Bottom status bar ───────────────────────────────────
@@ -2342,7 +2366,7 @@ fn export_kvraw(
     format: kv_recorder::export_formats::ExportFormat,
 ) -> Result<std::path::PathBuf, String> {
     use kv_recorder::KvrawReader;
-    use kv_recorder::export_formats::{self, ExportFormat};
+    use kv_recorder::export_formats::{ExportFormat, FlatBinaryStreamWriter, IntanRhdStreamWriter};
 
     let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
     let meta = reader.metadata().clone();
@@ -2350,54 +2374,94 @@ fn export_kvraw(
         return Err("kvraw file has no channels".to_string());
     }
     let total_frames = reader.total_frames();
-
-    // Read in ~1 s chunks; the exporters re-chunk internally as needed.
-    const FRAMES_PER_CHUNK: usize = 30_000;
-    let mut blocks: Vec<SampleBlock> = Vec::new();
-    let mut frame: u64 = 0;
-    let mut packet_id: u64 = 0;
-    while frame < total_frames {
-        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
-        let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
-        if data.is_empty() {
-            break;
-        }
-        let frames_read = data.len() / meta.channel_count;
-        blocks.push(SampleBlock {
-            device_id: meta.device_id.clone(),
-            stream_id: 0,
-            packet_id,
-            timestamp_start: frame,
-            sample_rate: meta.sample_rate,
-            channel_count: meta.channel_count,
-            samples_per_channel: frames_read,
-            ttl_bits: 0,
-            data,
-            aux_data: None,
-            board_adc_data: None,
-            ttl_in_per_sample: None,
-            ttl_out_per_sample: None,
-        });
-        packet_id += 1;
-        frame += frames_read as u64;
-    }
-    if blocks.is_empty() {
+    if total_frames == 0 {
         return Err("no data to export".to_string());
     }
 
     let notes = format!("exported from {}", source.display());
+
+    // Stream through the file in bounded chunks (~1 s each) so that peak
+    // memory is O(chunk_size) instead of O(file_size).
+    const FRAMES_PER_CHUNK: usize = 30_000; // ~1 s at 30 kHz
+
     match format {
         ExportFormat::IntanRhd => {
             let output = source.with_extension(format.extension());
-            export_formats::export_intan_rhd(&output, &blocks, &notes)
+            let mut writer =
+                IntanRhdStreamWriter::new(&output, meta.sample_rate, meta.channel_count, &notes)
+                    .map_err(|e| e.to_string())?;
+
+            let mut frame: u64 = 0;
+            let mut packet_id: u64 = 0;
+            while frame < total_frames {
+                let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+                let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
+                if data.is_empty() {
+                    break;
+                }
+                let frames_read = data.len() / meta.channel_count;
+                let block = SampleBlock {
+                    device_id: meta.device_id.clone(),
+                    stream_id: 0,
+                    packet_id,
+                    timestamp_start: frame,
+                    sample_rate: meta.sample_rate,
+                    channel_count: meta.channel_count,
+                    samples_per_channel: frames_read,
+                    ttl_bits: 0,
+                    data,
+                    aux_data: None,
+                    board_adc_data: None,
+                    ttl_in_per_sample: None,
+                    ttl_out_per_sample: None,
+                };
+                writer.write_blocks(&[block]).map_err(|e| e.to_string())?;
+                packet_id += 1;
+                frame += frames_read as u64;
+            }
+            writer.finish().map_err(|e| e.to_string())
         }
         ExportFormat::FlatBinary => {
-            // Flat binary writes recording.bin + recording.meta.json into a directory.
             let output_dir = source.with_extension("export");
-            export_formats::export_flat_binary(&output_dir, &blocks, &notes)
+            let mut writer = FlatBinaryStreamWriter::new(
+                &output_dir,
+                meta.sample_rate,
+                meta.channel_count,
+                &notes,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut frame: u64 = 0;
+            let mut packet_id: u64 = 0;
+            while frame < total_frames {
+                let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+                let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
+                if data.is_empty() {
+                    break;
+                }
+                let frames_read = data.len() / meta.channel_count;
+                let block = SampleBlock {
+                    device_id: meta.device_id.clone(),
+                    stream_id: 0,
+                    packet_id,
+                    timestamp_start: frame,
+                    sample_rate: meta.sample_rate,
+                    channel_count: meta.channel_count,
+                    samples_per_channel: frames_read,
+                    ttl_bits: 0,
+                    data,
+                    aux_data: None,
+                    board_adc_data: None,
+                    ttl_in_per_sample: None,
+                    ttl_out_per_sample: None,
+                };
+                writer.write_blocks(&[block]).map_err(|e| e.to_string())?;
+                packet_id += 1;
+                frame += frames_read as u64;
+            }
+            writer.finish().map_err(|e| e.to_string())
         }
     }
-    .map_err(|e| e.to_string())
 }
 
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

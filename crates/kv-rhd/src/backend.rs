@@ -148,7 +148,8 @@ impl RhdHardwareBackend {
             };
             log::info!(
                 "first block OK: {} channels x {} samples, raw amplifier i16 min={min} max={max}{note}",
-                block.channel_count, block.samples_per_channel
+                block.channel_count,
+                block.samples_per_channel
             );
         }
 
@@ -224,7 +225,7 @@ impl RhythmFrontPanelBoard {
         board.initialize_rhd_chips(enabled_streams)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
-        board.flush_fifo();
+        board.flush_fifo()?;
         log::info!("board configured and armed for continuous acquisition");
 
         Ok(board)
@@ -241,7 +242,11 @@ impl RhythmFrontPanelBoard {
         self.device.update_wire_ins();
 
         self.device
-            .set_wire_in_value(WIRE_IN_MULTI_USE, (USB3_BLOCK_SIZE_BYTES / 4) as u32, u32::MAX)
+            .set_wire_in_value(
+                WIRE_IN_MULTI_USE,
+                (USB3_BLOCK_SIZE_BYTES / 4) as u32,
+                u32::MAX,
+            )
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
         self.device
@@ -301,7 +306,7 @@ impl RhythmFrontPanelBoard {
             return Ok(false);
         };
 
-        self.wait_for_dcm_done();
+        self.wait_for_dcm_done()?;
         self.device
             .set_wire_in_value(WIRE_IN_DATA_FREQ_PLL, 256 * m + d, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;
@@ -309,13 +314,15 @@ impl RhythmFrontPanelBoard {
         self.device
             .activate_trigger_in(TRIG_IN_CONFIG, 0)
             .map_err(RhdReadError::FrontPanel)?;
-        self.wait_for_data_clock_locked();
+        self.wait_for_data_clock_locked()?;
 
         Ok(true)
     }
 
     fn set_sample_rate_30khz(&self) -> Result<(), RhdReadError> {
-        self.set_sample_rate(30000.0)?;
+        if !self.set_sample_rate(30000.0)? {
+            return Err(RhdReadError::UnsupportedSampleRate(30000.0));
+        }
         Ok(())
     }
 
@@ -334,11 +341,7 @@ impl RhythmFrontPanelBoard {
 
     fn set_continuous_run_mode(&self, enabled: bool) -> Result<(), RhdReadError> {
         self.device
-            .set_wire_in_value(
-                WIRE_IN_RESET_RUN,
-                if enabled { 0x02 } else { 0x00 },
-                0x02,
-            )
+            .set_wire_in_value(WIRE_IN_RESET_RUN, if enabled { 0x02 } else { 0x00 }, 0x02)
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
         Ok(())
@@ -389,7 +392,11 @@ impl RhythmFrontPanelBoard {
             13 => (WIRE_IN_DATA_STREAM_SEL_5678, 20),
             14 => (WIRE_IN_DATA_STREAM_SEL_5678, 24),
             15 => (WIRE_IN_DATA_STREAM_SEL_5678, 28),
-            _ => return Err(RhdReadError::InvalidPort { port_index: stream as usize }),
+            _ => {
+                return Err(RhdReadError::InvalidPort {
+                    port_index: stream as usize,
+                });
+            }
         };
         self.device
             .set_wire_in_value(endpoint, source << bit_shift, 0x000f << bit_shift)
@@ -417,11 +424,7 @@ impl RhythmFrontPanelBoard {
 
     fn set_dsp_settle(&self, enabled: bool) -> Result<(), RhdReadError> {
         self.device
-            .set_wire_in_value(
-                WIRE_IN_RESET_RUN,
-                if enabled { 0x04 } else { 0x00 },
-                0x04,
-            )
+            .set_wire_in_value(WIRE_IN_RESET_RUN, if enabled { 0x04 } else { 0x00 }, 0x04)
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
         Ok(())
@@ -477,9 +480,7 @@ impl RhythmFrontPanelBoard {
         // primary stream pair over all 16 delays and enable whichever port actually
         // has a responding chip. AuxCmd3 bank 0 (register config + ADC calibrate) is
         // selected, so each probe run also configures/calibrates the chip found.
-        log::info!(
-            "scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage..."
-        );
+        log::info!("scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage...");
         let (stream_mask, delay) = self.scan_ports_for_headstage(enabled_streams)?;
         self.enable_stream_mask(stream_mask)?;
         self.set_cable_delay_all_ports(delay)?;
@@ -784,7 +785,11 @@ impl RhythmFrontPanelBoard {
                 continue;
             };
 
-            let method = if validated_by_id { "chip ID" } else { "railed fraction" };
+            let method = if validated_by_id {
+                "chip ID"
+            } else {
+                "railed fraction"
+            };
             log::info!(
                 "port {} ({}): {} good delays ({} verified) @ chosen delay {}  <- responding",
                 port_letter,
@@ -795,8 +800,14 @@ impl RhythmFrontPanelBoard {
             );
 
             // Prefer chip-ID-verified ports over railed-fraction-only ports.
-            let dominated = best.as_ref().is_some_and(|&(_, _, prev_id)| prev_id && !validated_by_id);
-            if !dominated && best.as_ref().is_none_or(|&(_, _, prev_id)| validated_by_id >= prev_id) {
+            let dominated = best
+                .as_ref()
+                .is_some_and(|&(_, _, prev_id)| prev_id && !validated_by_id);
+            if !dominated
+                && best
+                    .as_ref()
+                    .is_none_or(|&(_, _, prev_id)| validated_by_id >= prev_id)
+            {
                 best = Some((port, chosen_delay, validated_by_id));
             }
         }
@@ -841,12 +852,12 @@ impl RhythmFrontPanelBoard {
         })
     }
 
-    fn flush_fifo(&self) {
+    fn flush_fifo(&self) -> Result<(), RhdReadError> {
         // Set USB3 pipeout block-throttle override (bit 16 of WireInResetRun)
         // so the FPGA allows reads of any size during flush.
-        let _ = self
-            .device
-            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16);
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16)
+            .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
 
         // Phase A: bulk drain with large reads (up to 256 KB per iteration).
@@ -857,9 +868,9 @@ impl RhythmFrontPanelBoard {
                 break;
             }
             let mut buffer = vec![0_u8; FLUSH_CHUNK];
-            let _ = self
-                .device
-                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
+            self.device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer)
+                .map_err(RhdReadError::FrontPanel)?;
         }
 
         // Phase B: drain remaining with appropriately-sized reads.
@@ -870,24 +881,23 @@ impl RhythmFrontPanelBoard {
             }
             let byte_count = (available_words as usize).saturating_mul(2);
             // Round up to USB3_BLOCK_SIZE_BYTES boundary.
-            let aligned = byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES)
-                .max(1)
-                * USB3_BLOCK_SIZE_BYTES;
+            let aligned = byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES).max(1) * USB3_BLOCK_SIZE_BYTES;
             let mut buffer = vec![0_u8; aligned];
-            let _ = self
-                .device
-                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
+            self.device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer)
+                .map_err(RhdReadError::FrontPanel)?;
         }
 
         // Release throttle override.
-        let _ = self
-            .device
-            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16);
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16)
+            .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
 
         if self.num_words_in_fifo() > 0 {
             log::warn!("flush_fifo did not fully drain");
         }
+        Ok(())
     }
 
     fn num_words_in_fifo(&self) -> u32 {
@@ -897,24 +907,26 @@ impl RhythmFrontPanelBoard {
         (msb << 16) | (lsb & 0xFFFF)
     }
 
-    fn wait_for_dcm_done(&self) {
+    fn wait_for_dcm_done(&self) -> Result<(), RhdReadError> {
         for _ in 0..100 {
             self.device.update_wire_outs();
             if self.device.get_wire_out_value(WIRE_OUT_DATA_CLK_LOCKED) & 0x02 != 0 {
-                return;
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(1));
         }
+        Err(RhdReadError::DcmTimeout)
     }
 
-    fn wait_for_data_clock_locked(&self) {
+    fn wait_for_data_clock_locked(&self) -> Result<(), RhdReadError> {
         for _ in 0..100 {
             self.device.update_wire_outs();
             if self.device.get_wire_out_value(WIRE_OUT_DATA_CLK_LOCKED) & 0x01 != 0 {
-                return;
+                return Ok(());
             }
             thread::sleep(Duration::from_millis(1));
         }
+        Err(RhdReadError::DataClockTimeout)
     }
 
     fn wait_until_not_running(&self) -> Result<(), RhdReadError> {
@@ -990,7 +1002,9 @@ impl RhythmFrontPanelBoard {
 
         log::info!(
             "starting impedance test: freq={:.0} Hz, {} channels, {} periods",
-            config.frequency_hz, config.channel_count, config.num_periods
+            config.frequency_hz,
+            config.channel_count,
+            config.num_periods
         );
 
         let mut registers = Rhd2000Registers::open_ephys_default();
@@ -1001,16 +1015,11 @@ impl RhythmFrontPanelBoard {
             .create_command_list_zcheck_dac(0.0, 0.0)
             .map_err(RhdReadError::Command)?;
         self.upload_command_list(&dc_dac, AuxCommandSlot::AuxCmd1, 0)?;
-        self.select_aux_command_length(
-            AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1,
-        )?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1)?;
 
         // Bank 1: sine wave at the test frequency.
         let sine_dac = registers
-            .create_command_list_zcheck_dac(
-                config.frequency_hz,
-                config.dac_amplitude,
-            )
+            .create_command_list_zcheck_dac(config.frequency_hz, config.dac_amplitude)
             .map_err(RhdReadError::Command)?;
         self.upload_command_list(&sine_dac, AuxCommandSlot::AuxCmd1, 1)?;
 
@@ -1038,17 +1047,15 @@ impl RhythmFrontPanelBoard {
 
         // ── Step 3: Measure each channel ─────────────────────────
         let samples_needed = config.total_samples();
-        let channels =
-            config.channel_count.min(CHANNELS_PER_STREAM * enabled_streams);
+        let channels = config
+            .channel_count
+            .min(CHANNELS_PER_STREAM * enabled_streams);
 
-        let mut results: Vec<impedance::ChannelImpedance> =
-            Vec::with_capacity(channels);
+        let mut results: Vec<impedance::ChannelImpedance> = Vec::with_capacity(channels);
 
         // Start with sine wave on AuxCmd1 Bank 1.
         self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 1)?;
-        self.select_aux_command_length(
-            AuxCommandSlot::AuxCmd1, 0, sine_dac.len() - 1,
-        )?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, sine_dac.len() - 1)?;
 
         for ch in 0..channels {
             if let Some(cb) = progress_callback {
@@ -1063,24 +1070,17 @@ impl RhythmFrontPanelBoard {
             let updated_cfg = registers
                 .create_command_list_register_config(false)
                 .map_err(RhdReadError::Command)?;
-            self.upload_command_list(
-                &updated_cfg, AuxCommandSlot::AuxCmd3, 3,
-            )?;
-            self.select_aux_command_bank_all_ports(
-                AuxCommandSlot::AuxCmd3, 3,
-            )?;
+            self.upload_command_list(&updated_cfg, AuxCommandSlot::AuxCmd3, 3)?;
+            self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, 3)?;
 
-            self.flush_fifo();
+            self.flush_fifo()?;
             self.set_max_time_step(samples_needed as u32)?;
             self.set_continuous_run_mode(false)?;
             self.run()?;
             self.wait_until_not_running()?;
 
-            let raw =
-                self.read_pipe_block(enabled_streams, samples_needed)?;
-            let amp_data = extract_channel_from_raw(
-                &raw, enabled_streams, samples_needed, ch,
-            );
+            let raw = self.read_pipe_block(enabled_streams, samples_needed)?;
+            let amp_data = extract_channel_from_raw(&raw, enabled_streams, samples_needed, ch);
 
             let (mag_1pf, phase_1pf) = impedance::compute_impedance(
                 &amp_data,
@@ -1092,49 +1092,40 @@ impl RhythmFrontPanelBoard {
             // Auto-select the best scale and re-measure if needed.
             let best_scale = impedance::auto_select_scale(mag_1pf);
 
-            let (magnitude, phase, scale) =
-                if best_scale != ZcheckScale::Cs1pF {
-                    registers.set_zcheck_scale(best_scale);
-                    let re_cfg = registers
-                        .create_command_list_register_config(false)
-                        .map_err(RhdReadError::Command)?;
+            let (magnitude, phase, scale) = if best_scale != ZcheckScale::Cs1pF {
+                registers.set_zcheck_scale(best_scale);
+                let re_cfg = registers
+                    .create_command_list_register_config(false)
+                    .map_err(RhdReadError::Command)?;
 
-                    let bank = match best_scale {
-                        ZcheckScale::Cs100fF => 2,
-                        ZcheckScale::Cs1pF => 3,
-                        ZcheckScale::Cs10pF => 4,
-                    };
-
-                    self.upload_command_list(
-                        &re_cfg, AuxCommandSlot::AuxCmd3, bank,
-                    )?;
-                    self.select_aux_command_bank_all_ports(
-                        AuxCommandSlot::AuxCmd3, bank,
-                    )?;
-
-                    self.flush_fifo();
-                    self.set_max_time_step(samples_needed as u32)?;
-                    self.set_continuous_run_mode(false)?;
-                    self.run()?;
-                    self.wait_until_not_running()?;
-
-                    let raw2 = self.read_pipe_block(
-                        enabled_streams, samples_needed,
-                    )?;
-                    let amp2 = extract_channel_from_raw(
-                        &raw2, enabled_streams, samples_needed, ch,
-                    );
-
-                    let (mag, ph) = impedance::compute_impedance(
-                        &amp2,
-                        config.sample_rate,
-                        config.frequency_hz,
-                        best_scale,
-                    );
-                    (mag, ph, best_scale)
-                } else {
-                    (mag_1pf, phase_1pf, ZcheckScale::Cs1pF)
+                let bank = match best_scale {
+                    ZcheckScale::Cs100fF => 2,
+                    ZcheckScale::Cs1pF => 3,
+                    ZcheckScale::Cs10pF => 4,
                 };
+
+                self.upload_command_list(&re_cfg, AuxCommandSlot::AuxCmd3, bank)?;
+                self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, bank)?;
+
+                self.flush_fifo()?;
+                self.set_max_time_step(samples_needed as u32)?;
+                self.set_continuous_run_mode(false)?;
+                self.run()?;
+                self.wait_until_not_running()?;
+
+                let raw2 = self.read_pipe_block(enabled_streams, samples_needed)?;
+                let amp2 = extract_channel_from_raw(&raw2, enabled_streams, samples_needed, ch);
+
+                let (mag, ph) = impedance::compute_impedance(
+                    &amp2,
+                    config.sample_rate,
+                    config.frequency_hz,
+                    best_scale,
+                );
+                (mag, ph, best_scale)
+            } else {
+                (mag_1pf, phase_1pf, ZcheckScale::Cs1pF)
+            };
 
             results.push(impedance::ChannelImpedance {
                 channel: ch,
@@ -1146,39 +1137,25 @@ impl RhythmFrontPanelBoard {
         }
 
         // ── Step 4: Restore normal operation ─────────────────────
-        self.select_aux_command_bank_all_ports(
-            AuxCommandSlot::AuxCmd1, 0,
-        )?;
-        self.select_aux_command_length(
-            AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1,
-        )?;
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 0)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1)?;
 
         registers.enable_zcheck(false);
         let normal_cfg = registers
             .create_command_list_register_config(false)
             .map_err(RhdReadError::Command)?;
-        self.upload_command_list(
-            &normal_cfg, AuxCommandSlot::AuxCmd3, 1,
-        )?;
-        self.select_aux_command_bank_all_ports(
-            AuxCommandSlot::AuxCmd3, 1,
-        )?;
+        self.upload_command_list(&normal_cfg, AuxCommandSlot::AuxCmd3, 1)?;
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, 1)?;
 
         registers.set_dig_out_low();
         let dig_out = registers
             .create_command_list_update_dig_out()
             .map_err(RhdReadError::Command)?;
-        self.upload_command_list(
-            &dig_out, AuxCommandSlot::AuxCmd1, 0,
-        )?;
-        self.select_aux_command_length(
-            AuxCommandSlot::AuxCmd1, 0, dig_out.len() - 1,
-        )?;
-        self.select_aux_command_bank_all_ports(
-            AuxCommandSlot::AuxCmd1, 0,
-        )?;
+        self.upload_command_list(&dig_out, AuxCommandSlot::AuxCmd1, 0)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dig_out.len() - 1)?;
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 0)?;
 
-        self.flush_fifo();
+        self.flush_fifo()?;
 
         log::info!(
             "impedance test complete: {} channels measured",
@@ -1203,6 +1180,10 @@ pub enum RhdReadError {
     NotEnoughFifoWords { needed: u32, available: u32 },
     ShortPipeRead { expected: usize, observed: usize },
     SpiStillRunning,
+    DcmTimeout,
+    DataClockTimeout,
+    UnsupportedSampleRate(f64),
+    FifoFlushFailed,
 }
 
 impl fmt::Display for RhdReadError {
@@ -1227,7 +1208,15 @@ impl fmt::Display for RhdReadError {
                 formatter,
                 "short Rhythm pipe read: expected {expected} bytes, observed {observed}"
             ),
-            Self::SpiStillRunning => write!(formatter, "Rhythm SPI run did not stop before timeout"),
+            Self::SpiStillRunning => {
+                write!(formatter, "Rhythm SPI run did not stop before timeout")
+            }
+            Self::DcmTimeout => write!(formatter, "DCM did not complete within timeout"),
+            Self::DataClockTimeout => write!(formatter, "data clock did not lock within timeout"),
+            Self::UnsupportedSampleRate(rate) => {
+                write!(formatter, "unsupported sample rate: {rate} Hz")
+            }
+            Self::FifoFlushFailed => write!(formatter, "FIFO flush did not fully drain"),
         }
     }
 }
@@ -1243,7 +1232,11 @@ impl std::error::Error for RhdReadError {
             | Self::InvalidPort { .. }
             | Self::NotEnoughFifoWords { .. }
             | Self::ShortPipeRead { .. }
-            | Self::SpiStillRunning => None,
+            | Self::SpiStillRunning
+            | Self::DcmTimeout
+            | Self::DataClockTimeout
+            | Self::UnsupportedSampleRate(_)
+            | Self::FifoFlushFailed => None,
         }
     }
 }
@@ -1288,10 +1281,11 @@ fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, samples: usize) -
     // Frame layout per sample (in bytes):
     //   8 (magic) + 4 (timestamp) + 3*enabled_streams*2 (aux results)
     //   + CHANNELS_PER_STREAM*enabled_streams*2 (amplifier)
-    //   + (enabled_streams%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
-    let frame_bytes = (4 + 2
+    //   + ((4-enabled_streams%4)%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
+    let frame_bytes = (4
+        + 2
         + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + (enabled_streams % 4)
+        + ((4 - enabled_streams % 4) % 4)
         + 8
         + 2)
         * 2;
@@ -1352,7 +1346,7 @@ fn min_stream_railed_fraction(raw: &[u8], enabled_streams: usize, samples: usize
                 }
             }
         }
-        offset += (enabled_streams % 4) * 2; // alignment padding
+        offset += ((4 - enabled_streams % 4) % 4) * 2; // alignment padding
         offset += 8 * 2; // auxiliary ADC slots
         offset += 2; // TTL in
         offset += 2; // TTL out
@@ -1386,9 +1380,13 @@ fn extract_channel_from_raw(
 
     // Frame layout (in u16 words): 4 (magic) + 2 (timestamp)
     // + 3*enabled_streams (aux) + CHANNELS_PER_STREAM*enabled_streams (amp)
-    // + (enabled_streams%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
-    let frame_words =
-        4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2;
+    // + ((4-enabled_streams%4)%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
+    let frame_words = 4
+        + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + ((4 - enabled_streams % 4) % 4)
+        + 8
+        + 2;
     let frame_bytes = frame_words * 2;
 
     // Amplifier data starts after magic(4w) + timestamp(2w) + aux(3*streams w).

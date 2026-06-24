@@ -200,11 +200,6 @@ fn server_loop(
     responses: ResponseQueue,
     client_count: Arc<Mutex<usize>>,
 ) {
-    // Set a timeout so we can check the stop flag periodically
-    listener
-        .set_nonblocking(false)
-        .ok();
-
     for stream in listener.incoming() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -240,7 +235,9 @@ fn handle_client(
     responses: ResponseQueue,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let Ok(reader_stream) = stream.try_clone() else { return; };
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
 
@@ -286,8 +283,9 @@ fn handle_client(
                     let _ = writer.flush();
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue;
             }
@@ -314,7 +312,8 @@ fn parse_jsonrpc_request(line: &str) -> Option<(u64, RemoteCommand)> {
         "get_status" => RemoteCommand::GetStatus,
         "get_channel_count" => RemoteCommand::GetChannelCount,
         "start_acquisition" => {
-            let mode = extract_string_from_params(line, "mode").unwrap_or_else(|| "demo".to_string());
+            let mode =
+                extract_string_from_params(line, "mode").unwrap_or_else(|| "demo".to_string());
             RemoteCommand::StartAcquisition { mode }
         }
         "stop_acquisition" => RemoteCommand::StopAcquisition,
@@ -324,7 +323,8 @@ fn parse_jsonrpc_request(line: &str) -> Option<(u64, RemoteCommand)> {
         }
         "stop_recording" => RemoteCommand::StopRecording,
         "set_display_mode" => {
-            let mode = extract_string_from_params(line, "mode").unwrap_or_else(|| "sweep".to_string());
+            let mode =
+                extract_string_from_params(line, "mode").unwrap_or_else(|| "sweep".to_string());
             RemoteCommand::SetDisplayMode { mode }
         }
         _ => return None,
@@ -342,7 +342,9 @@ fn extract_u64_field(json: &str, field: &str) -> Option<u64> {
     let after_colon = after_key.trim_start().strip_prefix(':')?;
     let num_start = after_colon.trim_start();
     // Parse number
-    let end = num_start.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_start.len());
+    let end = num_start
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(num_start.len());
     num_start[..end].parse().ok()
 }
 
@@ -372,10 +374,7 @@ fn extract_string_from_params(json: &str, field: &str) -> Option<String> {
 /// Format a JSON-RPC 2.0 response.
 fn format_jsonrpc_response(id: u64, result: &Result<String, String>) -> String {
     match result {
-        Ok(value) => format!(
-            r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#,
-            value, id
-        ),
+        Ok(value) => format!(r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#, value, id),
         Err(msg) => format!(
             r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"{}"}},"id":{}}}"#,
             msg.replace('"', "\\\""),
@@ -456,7 +455,8 @@ pub fn draw_remote_api_section(ui: &mut egui::Ui, state: &mut RemoteApiState) {
         let (color, text) = if state.running {
             (
                 theme::ACCENT_GREEN,
-                format!("Listening on :{} ({} client{})",
+                format!(
+                    "Listening on :{} ({} client{})",
                     state.port,
                     state.client_count,
                     if state.client_count == 1 { "" } else { "s" }
@@ -496,7 +496,8 @@ mod tests {
 
     #[test]
     fn parse_start_acquisition() {
-        let req = r#"{"jsonrpc":"2.0","method":"start_acquisition","params":{"mode":"demo"},"id":42}"#;
+        let req =
+            r#"{"jsonrpc":"2.0","method":"start_acquisition","params":{"mode":"demo"},"id":42}"#;
         let (id, cmd) = parse_jsonrpc_request(req).unwrap();
         assert_eq!(id, 42);
         if let RemoteCommand::StartAcquisition { mode } = cmd {

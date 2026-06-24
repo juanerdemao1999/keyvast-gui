@@ -26,15 +26,19 @@ impl BlockBuffer {
         })
     }
 
-    pub fn push(&mut self, block: SampleBlock) {
+    /// Push a block into the buffer.  Returns `true` if the buffer was full
+    /// and the oldest block was evicted (overflow).
+    pub fn push(&mut self, block: SampleBlock) -> bool {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
 
-        if self.blocks.len() == self.capacity_blocks {
+        let overflowed = self.blocks.len() == self.capacity_blocks;
+        if overflowed {
             self.blocks.pop_front();
             self.dropped_blocks = self.dropped_blocks.saturating_add(1);
         }
 
         self.blocks.push_back(block);
+        overflowed
     }
 
     pub fn pop(&mut self) -> Option<SampleBlock> {
@@ -100,12 +104,33 @@ impl FanoutBlockBuffer {
         Ok(id)
     }
 
-    pub fn push(&mut self, block: SampleBlock) {
+    /// Push a block to all consumers.  Returns `Some(PushOverflow)` if at
+    /// least one consumer was full and had to evict its oldest block.
+    pub fn push(&mut self, block: SampleBlock) -> Option<PushOverflow> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
         let block = Arc::new(block);
 
+        let mut consumers_overflowed: usize = 0;
+        let mut max_occupancy: f64 = 0.0;
+
         for consumer in &mut self.consumers {
-            consumer.push(Arc::clone(&block));
+            if consumer.push(Arc::clone(&block)) {
+                consumers_overflowed += 1;
+            }
+            let occ = consumer.occupancy();
+            if occ > max_occupancy {
+                max_occupancy = occ;
+            }
+        }
+
+        if consumers_overflowed > 0 {
+            Some(PushOverflow {
+                consumers_overflowed,
+                total_dropped_blocks: self.consumers.iter().map(|c| c.dropped_blocks).sum(),
+                max_occupancy,
+            })
+        } else {
+            None
         }
     }
 
@@ -175,15 +200,24 @@ struct ConsumerQueue {
 }
 
 impl ConsumerQueue {
-    fn push(&mut self, block: Arc<SampleBlock>) {
+    fn push(&mut self, block: Arc<SampleBlock>) -> bool {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
 
-        if self.blocks.len() == self.capacity_blocks {
+        let overflowed = self.blocks.len() == self.capacity_blocks;
+        if overflowed {
             self.blocks.pop_front();
             self.dropped_blocks = self.dropped_blocks.saturating_add(1);
         }
 
         self.blocks.push_back(block);
+        overflowed
+    }
+
+    fn occupancy(&self) -> f64 {
+        if self.capacity_blocks == 0 {
+            return 0.0;
+        }
+        self.blocks.len() as f64 / self.capacity_blocks as f64
     }
 
     fn status(&self) -> ConsumerBufferStatus {
@@ -260,3 +294,15 @@ impl fmt::Display for BufferError {
 }
 
 impl std::error::Error for BufferError {}
+
+/// Information returned when a [`FanoutBlockBuffer::push`] causes at least
+/// one consumer to overflow (evict its oldest block).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PushOverflow {
+    /// How many consumers overflowed on this push.
+    pub consumers_overflowed: usize,
+    /// Cumulative dropped blocks across all consumers.
+    pub total_dropped_blocks: u64,
+    /// Highest occupancy among all consumers after the push.
+    pub max_occupancy: f64,
+}

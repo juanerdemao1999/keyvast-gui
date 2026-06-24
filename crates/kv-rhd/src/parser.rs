@@ -34,7 +34,11 @@ pub fn parse_rhythm_data_block(
 
     // Auxiliary data: [stream][aux_ch][sample]
     let mut aux_data: Vec<Vec<Vec<u16>>> = (0..streams)
-        .map(|_| (0..AUX_CHANNELS_PER_STREAM).map(|_| Vec::with_capacity(samples)).collect())
+        .map(|_| {
+            (0..AUX_CHANNELS_PER_STREAM)
+                .map(|_| Vec::with_capacity(samples))
+                .collect()
+        })
         .collect();
 
     // Board ADC: [adc_ch][sample]
@@ -87,7 +91,7 @@ pub fn parse_rhythm_data_block(
         data.extend_from_slice(&frame_samples);
 
         // Skip filler word(s) that align each frame to a 4-stream boundary.
-        offset = offset.saturating_add((streams % 4) * 2);
+        offset = offset.saturating_add(((4 - streams % 4) % 4) * 2);
 
         // Parse 8 board ADC channels.
         for adc_ch in 0..BOARD_ADC_CHANNELS {

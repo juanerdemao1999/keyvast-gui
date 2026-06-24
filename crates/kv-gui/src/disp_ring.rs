@@ -170,8 +170,7 @@ impl DisplayRing {
         if self.len == 0 || !self.ready {
             return 0.0;
         }
-        (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0
-            / self.sample_rate
+        (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0 / self.sample_rate
     }
 
     /// Extract the last `n` ring samples for `ch` as i16 values (de-normalized).

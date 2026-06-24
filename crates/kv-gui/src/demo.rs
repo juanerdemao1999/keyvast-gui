@@ -128,9 +128,9 @@ impl DemoGenerator {
         }
 
         let timestamp_start = self.global_sample;
-        self.global_sample += spc as u64;
+        self.global_sample = self.global_sample.saturating_add(spc as u64);
         let pid = self.packet_id;
-        self.packet_id += 1;
+        self.packet_id = self.packet_id.saturating_add(1);
 
         SampleBlock {
             device_id: "demo-neural".to_string(),
@@ -224,10 +224,10 @@ fn generate_sample(
         let offset = global_s.saturating_sub(spike_start);
         let spike_val = match offset {
             0 => -0.3 * cg.spike_amplitude,  // onset
-            1 => -cg.spike_amplitude,  // negative trough
-            2 =>  0.5 * cg.spike_amplitude,  // positive overshoot
+            1 => -cg.spike_amplitude,        // negative trough
+            2 => 0.5 * cg.spike_amplitude,   // positive overshoot
             3 => -0.15 * cg.spike_amplitude, // AHP
-            4 =>  0.0,                        // recovery
+            4 => 0.0,                        // recovery
             _ => 0.0,
         };
         value += spike_val;

@@ -612,16 +612,20 @@ impl StreamingRecorder {
         let mut writer = BufWriter::new(file);
 
         // Write placeholder header (overwritten with real metadata on finish())
-        writer.write_all(KVRAW_MAGIC).map_err(|source| RecorderError::Io {
-            path: raw_path.clone(),
-            source,
-        })?;
+        writer
+            .write_all(KVRAW_MAGIC)
+            .map_err(|source| RecorderError::Io {
+                path: raw_path.clone(),
+                source,
+            })?;
         // json_len placeholder (4 bytes) + json_block placeholder (512 bytes)
         let placeholder = [0u8; 4 + KVRAW_JSON_RESERVED];
-        writer.write_all(&placeholder).map_err(|source| RecorderError::Io {
-            path: raw_path.clone(),
-            source,
-        })?;
+        writer
+            .write_all(&placeholder)
+            .map_err(|source| RecorderError::Io {
+                path: raw_path.clone(),
+                source,
+            })?;
 
         Ok(Self {
             output_dir,
@@ -712,25 +716,34 @@ impl StreamingRecorder {
         })?;
 
         // 4. Seek back to byte 8 (right after the 8-byte magic)
-        file.seek(SeekFrom::Start(8)).map_err(|source| RecorderError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        file.seek(SeekFrom::Start(8))
+            .map_err(|source| RecorderError::Io {
+                path: path.clone(),
+                source,
+            })?;
 
         // 5. Write json_len + padded json_block
         let json_bytes = metadata.as_bytes();
         let json_len = json_bytes.len().min(KVRAW_JSON_RESERVED);
 
         file.write_all(&(json_len as u32).to_le_bytes())
-            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
+            .map_err(|source| RecorderError::Io {
+                path: path.clone(),
+                source,
+            })?;
 
         let mut json_block = [0u8; KVRAW_JSON_RESERVED];
         json_block[..json_len].copy_from_slice(&json_bytes[..json_len]);
         file.write_all(&json_block)
-            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
+            .map_err(|source| RecorderError::Io {
+                path: path.clone(),
+                source,
+            })?;
 
-        file.flush()
-            .map_err(|source| RecorderError::Io { path: path.clone(), source })?;
+        file.flush().map_err(|source| RecorderError::Io {
+            path: path.clone(),
+            source,
+        })?;
 
         let max_write_latency_us = self.write_latencies_us.iter().copied().max();
         let latency_distribution = LatencyDistribution::from_samples(&self.write_latencies_us);
@@ -990,7 +1003,8 @@ impl KvrawReader {
             path: path.to_path_buf(),
             source,
         })?;
-        let file_size = file.metadata()
+        let file_size = file
+            .metadata()
             .map_err(|source| RecorderError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -1001,30 +1015,35 @@ impl KvrawReader {
 
         // Read magic
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic).map_err(|source| RecorderError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        reader
+            .read_exact(&mut magic)
+            .map_err(|source| RecorderError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
 
         // Check for KVRAW v2 (embedded header) vs v1 (external JSON)
         let (metadata, data_start) = if &magic == KVRAW_MAGIC {
             // v2: embedded JSON header
             let mut json_len_bytes = [0u8; 4];
-            reader.read_exact(&mut json_len_bytes).map_err(|source| RecorderError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            reader
+                .read_exact(&mut json_len_bytes)
+                .map_err(|source| RecorderError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
             let json_len = u32::from_le_bytes(json_len_bytes) as usize;
             let json_len = json_len.min(KVRAW_JSON_RESERVED);
 
             let mut json_block = vec![0u8; KVRAW_JSON_RESERVED];
-            reader.read_exact(&mut json_block).map_err(|source| RecorderError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            reader
+                .read_exact(&mut json_block)
+                .map_err(|source| RecorderError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
 
-            let json_str = std::str::from_utf8(&json_block[..json_len])
-                .unwrap_or("{}");
+            let json_str = std::str::from_utf8(&json_block[..json_len]).unwrap_or("{}");
             let meta = parse_kvraw_json(json_str);
             let data_offset = meta.data_offset_bytes;
             (meta, data_offset)
@@ -1032,21 +1051,25 @@ impl KvrawReader {
             // v1: no embedded header — try loading companion .json file
             let json_path = path.with_extension("json");
             let meta = if json_path.exists() {
-                let json_str = fs::read_to_string(&json_path)
-                    .map_err(|source| RecorderError::Io {
+                let json_str =
+                    fs::read_to_string(&json_path).map_err(|source| RecorderError::Io {
                         path: json_path,
                         source,
                     })?;
                 parse_kvraw_json(&json_str)
             } else {
-                // Minimal fallback
+                eprintln!(
+                    "[kv-recorder] warning: no companion .json metadata for v1 KVRAW file {:?}; \
+                     sample_rate and channel_count are unknown — using 0 as sentinel",
+                    path
+                );
                 KvrawMetadata {
                     format_version: 1,
                     data_offset_bytes: 0,
                     device_id: String::new(),
                     backend: String::new(),
-                    sample_rate: 30_000.0,
-                    channel_count: 64,
+                    sample_rate: 0.0,
+                    channel_count: 0,
                     samples_per_channel: 0,
                     written_samples: 0,
                     block_count: 0,
@@ -1104,10 +1127,12 @@ impl KvrawReader {
             return Ok(Vec::new());
         }
 
-        let sample_offset = start_frame * ch as u64;
-        let byte_offset = self.data_start + sample_offset * 2;
-        let total_samples = ch * num_frames;
-        let byte_count = total_samples * 2;
+        let sample_offset = start_frame.saturating_mul(ch as u64);
+        let byte_offset = self
+            .data_start
+            .saturating_add(sample_offset.saturating_mul(2));
+        let total_samples = ch.saturating_mul(num_frames);
+        let byte_count = total_samples.saturating_mul(2);
 
         self.reader
             .seek(SeekFrom::Start(byte_offset))
@@ -1143,9 +1168,8 @@ impl KvrawReader {
         let interleaved = self.read_frames(start_frame, num_frames)?;
         let actual_frames = interleaved.len() / ch.max(1);
 
-        let mut channels: Vec<Vec<i16>> = (0..ch)
-            .map(|_| Vec::with_capacity(actual_frames))
-            .collect();
+        let mut channels: Vec<Vec<i16>> =
+            (0..ch).map(|_| Vec::with_capacity(actual_frames)).collect();
 
         for frame in interleaved.chunks_exact(ch) {
             for (c, &sample) in frame.iter().enumerate() {
@@ -1190,9 +1214,7 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
                 let colon = after.find(':')?;
                 let rest = after[colon + 1..].trim_start();
                 // Extract numeric chars
-                let num_str: String = rest.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
+                let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 num_str.parse().ok()
             })
             .unwrap_or(0)
@@ -1204,8 +1226,16 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
                 let after = &json[pos + key.len() + 2..];
                 let colon = after.find(':')?;
                 let rest = after[colon + 1..].trim_start();
-                let num_str: String = rest.chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == 'e' || *c == 'E' || *c == '+')
+                let num_str: String = rest
+                    .chars()
+                    .take_while(|c| {
+                        c.is_ascii_digit()
+                            || *c == '.'
+                            || *c == '-'
+                            || *c == 'e'
+                            || *c == 'E'
+                            || *c == '+'
+                    })
                     .collect();
                 num_str.parse().ok()
             })
@@ -1213,19 +1243,16 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_optional_u64 = |key: &str| -> Option<u64> {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
-                if rest.starts_with("null") {
-                    return None;
-                }
-                let num_str: String = rest.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                num_str.parse().ok()
-            })
+        json.find(&format!("\"{key}\"")).and_then(|pos| {
+            let after = &json[pos + key.len() + 2..];
+            let colon = after.find(':')?;
+            let rest = after[colon + 1..].trim_start();
+            if rest.starts_with("null") {
+                return None;
+            }
+            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            num_str.parse().ok()
+        })
     };
 
     let get_bool = |key: &str| -> bool {

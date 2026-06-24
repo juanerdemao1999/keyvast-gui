@@ -75,6 +75,8 @@ pub enum RecorderEvent {
     /// Periodic buffer health report (sent ~5/s while running).
     /// `occupancy` is 0.0..=1.0 (buffered / capacity).
     BufferStatus { occupancy: f64 },
+    /// At least one consumer overflowed (oldest block evicted).
+    BufferOverflow { dropped_blocks: u64, occupancy: f64 },
     /// The acquisition source (simulator or hardware) failed to open or to
     /// produce a block. Carries a human-readable message for the GUI banner.
     /// The producer thread has stopped by the time this is sent.
@@ -217,8 +219,9 @@ fn producer_loop(
             match SimulatorBackend::new(config) {
                 Ok(sim) => (ActiveSource::Simulator(sim), sleep_dur),
                 Err(e) => {
-                    let _ = event_tx
-                        .send(RecorderEvent::SourceError(format!("simulator init failed: {e}")));
+                    let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                        "simulator init failed: {e}"
+                    )));
                     return;
                 }
             }
@@ -226,8 +229,9 @@ fn producer_loop(
         PipelineSource::Rhd(options) => match RhdHardwareBackend::open(*options) {
             Ok(backend) => (ActiveSource::Rhd(backend), Duration::ZERO),
             Err(e) => {
-                let _ = event_tx
-                    .send(RecorderEvent::SourceError(format!("RHD device open failed: {e}")));
+                let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                    "RHD device open failed: {e}"
+                )));
                 return;
             }
         },
@@ -254,8 +258,20 @@ fn producer_loop(
                 // Push original into shared fanout (recorder gets its slot)
                 // and notify the recorder thread via condvar.
                 {
-                    shared.0.lock().expect("buffer lock poisoned").push(block);
+                    let overflow = shared.0.lock().expect("buffer lock poisoned").push(block);
                     shared.1.notify_one();
+                    if let Some(info) = overflow {
+                        log::warn!(
+                            "buffer overflow: {} consumers dropped blocks (total dropped: {}, occupancy: {:.1}%)",
+                            info.consumers_overflowed,
+                            info.total_dropped_blocks,
+                            info.max_occupancy * 100.0,
+                        );
+                        let _ = event_tx.send(RecorderEvent::BufferOverflow {
+                            dropped_blocks: info.total_dropped_blocks,
+                            occupancy: info.max_occupancy,
+                        });
+                    }
                 }
             }
             Err(message) => {

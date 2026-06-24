@@ -87,7 +87,7 @@ pub enum RecorderEvent {
 
 pub struct LivePipelineHandle {
     /// GUI receives one SampleBlock per real-time packet via this channel.
-    pub preview_rx: mpsc::Receiver<SampleBlock>,
+    pub preview_rx: mpsc::Receiver<Arc<SampleBlock>>,
     /// Events sent from the recorder thread back to the GUI.
     pub event_rx: mpsc::Receiver<RecorderEvent>,
     /// Commands GUI sends to the recorder thread (bounded to 4 slots).
@@ -144,7 +144,7 @@ pub fn start_live_pipeline(source: PipelineSource) -> LivePipelineHandle {
     // Bounded preview channel: at 30 kHz / 64 spp ≈ 469 blocks/s, 1024 slots
     // gives ~2 s of headroom before dropping.  If the GUI can't keep up, the
     // producer will block briefly rather than accumulating unbounded memory.
-    let (preview_tx, preview_rx) = mpsc::sync_channel::<SampleBlock>(1024);
+    let (preview_tx, preview_rx) = mpsc::sync_channel::<Arc<SampleBlock>>(1024);
     let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RecorderCmd>(4);
     let (event_tx, event_rx) = mpsc::sync_channel::<RecorderEvent>(64);
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -200,7 +200,7 @@ impl ActiveSource {
 fn producer_loop(
     source: PipelineSource,
     shared: SharedBuffer,
-    preview_tx: mpsc::SyncSender<SampleBlock>,
+    preview_tx: mpsc::SyncSender<Arc<SampleBlock>>,
     event_tx: mpsc::SyncSender<RecorderEvent>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -244,21 +244,22 @@ fn producer_loop(
 
         match active.read_block() {
             Ok(block) => {
+                // Wrap in Arc ONCE — shared cheaply between preview and
+                // recorder without deep-cloning the sample data.
+                let block_arc = Arc::new(block);
+
                 // Send preview copy to GUI.  try_send avoids blocking the
                 // producer when the GUI falls behind — dropped preview frames
                 // are acceptable, but stalling the acquisition is not.
-                // If the receiver is disconnected, stop the producer.
-                match preview_tx.try_send(block.clone()) {
+                match preview_tx.try_send(Arc::clone(&block_arc)) {
                     Ok(()) => {}
                     Err(mpsc::TrySendError::Full(_)) => {
                         // GUI too slow — skip this preview frame
                     }
                     Err(mpsc::TrySendError::Disconnected(_)) => break,
                 }
-                // Push original into shared fanout (recorder gets its slot)
+                // Push into shared fanout (recorder gets its slot)
                 // and notify the recorder thread via condvar.
-                // Arc allocation happens BEFORE the lock to minimize critical section.
-                let block_arc = Arc::new(block);
                 {
                     let overflow = shared
                         .0

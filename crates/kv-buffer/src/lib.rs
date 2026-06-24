@@ -1,6 +1,10 @@
 //! Bounded sample block buffering for acquisition consumers.
 
-use std::{collections::VecDeque, fmt, sync::Arc};
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt,
+    sync::Arc,
+};
 
 use kv_types::SampleBlock;
 
@@ -71,7 +75,7 @@ impl BlockBuffer {
 #[derive(Debug, Clone, Default)]
 pub struct FanoutBlockBuffer {
     next_consumer_id: u64,
-    consumers: Vec<ConsumerQueue>,
+    consumers: HashMap<BufferConsumerId, ConsumerQueue>,
     pushed_blocks: u64,
 }
 
@@ -91,15 +95,18 @@ impl FanoutBlockBuffer {
 
         let id = BufferConsumerId(self.next_consumer_id);
         self.next_consumer_id = self.next_consumer_id.saturating_add(1);
-        self.consumers.push(ConsumerQueue {
+        self.consumers.insert(
             id,
-            name: name.into(),
-            capacity_blocks,
-            blocks: VecDeque::with_capacity(capacity_blocks),
-            pushed_blocks: 0,
-            dropped_blocks: 0,
-            popped_blocks: 0,
-        });
+            ConsumerQueue {
+                id,
+                name: name.into(),
+                capacity_blocks,
+                blocks: VecDeque::with_capacity(capacity_blocks),
+                pushed_blocks: 0,
+                dropped_blocks: 0,
+                popped_blocks: 0,
+            },
+        );
 
         Ok(id)
     }
@@ -119,7 +126,7 @@ impl FanoutBlockBuffer {
         let mut consumers_overflowed: usize = 0;
         let mut max_occupancy: f64 = 0.0;
 
-        for consumer in &mut self.consumers {
+        for consumer in self.consumers.values_mut() {
             if consumer.push(Arc::clone(&block)) {
                 consumers_overflowed += 1;
             }
@@ -132,7 +139,7 @@ impl FanoutBlockBuffer {
         if consumers_overflowed > 0 {
             Some(PushOverflow {
                 consumers_overflowed,
-                total_dropped_blocks: self.consumers.iter().map(|c| c.dropped_blocks).sum(),
+                total_dropped_blocks: self.consumers.values().map(|c| c.dropped_blocks).sum(),
                 max_occupancy,
             })
         } else {
@@ -144,7 +151,12 @@ impl FanoutBlockBuffer {
         &mut self,
         consumer_id: BufferConsumerId,
     ) -> Result<Option<Arc<SampleBlock>>, BufferError> {
-        let consumer = self.consumer_mut(consumer_id)?;
+        let consumer =
+            self.consumers
+                .get_mut(&consumer_id)
+                .ok_or(BufferError::UnknownConsumer {
+                    id: consumer_id.as_u64(),
+                })?;
         let block = consumer.blocks.pop_front();
 
         if block.is_some() {
@@ -165,32 +177,16 @@ impl FanoutBlockBuffer {
         &self,
         consumer_id: BufferConsumerId,
     ) -> Result<ConsumerBufferStatus, BufferError> {
-        Ok(self.consumer(consumer_id)?.status())
+        self.consumers
+            .get(&consumer_id)
+            .map(|c| c.status())
+            .ok_or(BufferError::UnknownConsumer {
+                id: consumer_id.as_u64(),
+            })
     }
 
     pub fn consumer_statuses(&self) -> Vec<ConsumerBufferStatus> {
-        self.consumers.iter().map(ConsumerQueue::status).collect()
-    }
-
-    fn consumer(&self, consumer_id: BufferConsumerId) -> Result<&ConsumerQueue, BufferError> {
-        self.consumers
-            .iter()
-            .find(|consumer| consumer.id == consumer_id)
-            .ok_or(BufferError::UnknownConsumer {
-                id: consumer_id.as_u64(),
-            })
-    }
-
-    fn consumer_mut(
-        &mut self,
-        consumer_id: BufferConsumerId,
-    ) -> Result<&mut ConsumerQueue, BufferError> {
-        self.consumers
-            .iter_mut()
-            .find(|consumer| consumer.id == consumer_id)
-            .ok_or(BufferError::UnknownConsumer {
-                id: consumer_id.as_u64(),
-            })
+        self.consumers.values().map(ConsumerQueue::status).collect()
     }
 }
 

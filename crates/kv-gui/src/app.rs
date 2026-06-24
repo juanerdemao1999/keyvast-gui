@@ -18,7 +18,7 @@
 //! Mouse: scroll-wheel over the plot also adjusts the time window.
 
 use std::collections::VecDeque;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use eframe::egui;
@@ -1244,15 +1244,17 @@ impl KvApp {
                 recorder_events.push(event);
             }
 
-            while let Ok(block) = pipeline.preview_rx.try_recv() {
+            while let Ok(arc_block) = pipeline.preview_rx.try_recv() {
                 pipeline.total_blocks += 1;
                 // Detect dropped blocks via packet-ID discontinuity
                 if let Some(expected) = pipeline.expected_next_packet_id
-                    && block.packet_id > expected
+                    && arc_block.packet_id > expected
                 {
-                    pipeline.dropped_blocks += block.packet_id - expected;
+                    pipeline.dropped_blocks += arc_block.packet_id - expected;
                 }
-                pipeline.expected_next_packet_id = Some(block.packet_id + 1);
+                pipeline.expected_next_packet_id = Some(arc_block.packet_id + 1);
+                // Unwrap Arc — we are the sole consumer of preview blocks.
+                let block = Arc::try_unwrap(arc_block).unwrap_or_else(|arc| (*arc).clone());
                 preview_blocks.push(block);
             }
         } // borrow released here

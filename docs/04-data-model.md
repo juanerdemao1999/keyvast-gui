@@ -17,6 +17,14 @@ pub struct SampleBlock {
     pub samples_per_channel: usize,
     pub ttl_bits: u32,
     pub data: Vec<i16>,
+    /// Per-sample auxiliary ADC data, indexed by [stream][aux_channel][sample].
+    pub aux_data: Option<Vec<Vec<Vec<u16>>>>,
+    /// Per-sample board ADC data, indexed by [sample].
+    pub board_adc_data: Option<Vec<u16>>,
+    /// Per-sample TTL input words (one u32 per sample).
+    pub ttl_in_per_sample: Option<Vec<u32>>,
+    /// Per-sample TTL output words (one u32 per sample).
+    pub ttl_out_per_sample: Option<Vec<u32>>,
 }
 ```
 

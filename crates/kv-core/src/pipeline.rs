@@ -279,8 +279,11 @@ fn drain_consumer(
     consumer_id: kv_buffer::BufferConsumerId,
     destination: &mut Vec<SampleBlock>,
 ) {
-    while let Ok(Some(block)) = buffer.pop(consumer_id) {
-        destination.push((*block).clone());
+    while let Ok(Some(arc)) = buffer.pop(consumer_id) {
+        // Avoid cloning when this is the last Arc reference (common case
+        // after the producer and other consumers have moved on).
+        let block = Arc::try_unwrap(arc).unwrap_or_else(|a| (*a).clone());
+        destination.push(block);
     }
 }
 

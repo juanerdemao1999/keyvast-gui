@@ -1,6 +1,7 @@
 //! Simulator backend for hardware-independent acquisition tests.
 
 use std::fmt;
+use std::time::Instant;
 
 use kv_types::{DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError};
 
@@ -12,6 +13,9 @@ pub struct SimulatorConfig {
     pub seed: u64,
     pub stream_id: u32,
     pub drop_packet_ids: Vec<u64>,
+    /// When true, `next_block()` sleeps to produce blocks at the rate implied
+    /// by `device.sample_rate / device.samples_per_packet`.
+    pub paced: bool,
 }
 
 impl Default for SimulatorConfig {
@@ -21,6 +25,7 @@ impl Default for SimulatorConfig {
             seed: DEFAULT_SIMULATOR_SEED,
             stream_id: 0,
             drop_packet_ids: Vec::new(),
+            paced: false,
         }
     }
 }
@@ -29,6 +34,8 @@ impl Default for SimulatorConfig {
 pub struct SimulatorBackend {
     config: SimulatorConfig,
     next_packet_id: u64,
+    /// Wall-clock origin for pacing (set on first `next_block()` call).
+    start_time: Option<Instant>,
 }
 
 impl SimulatorBackend {
@@ -40,6 +47,7 @@ impl SimulatorBackend {
         Ok(Self {
             config,
             next_packet_id: 0,
+            start_time: None,
         })
     }
 
@@ -48,6 +56,21 @@ impl SimulatorBackend {
     }
 
     pub fn next_block(&mut self) -> Result<SampleBlock, SimulatorError> {
+        // Real-time pacing: sleep until the deadline for this packet.
+        if self.config.paced {
+            let start = *self.start_time.get_or_insert_with(Instant::now);
+            let spp = self.config.device.samples_per_packet as f64;
+            let sr = self.config.device.sample_rate;
+            if sr > 0.0 {
+                let deadline_secs = self.next_packet_id as f64 * spp / sr;
+                let deadline = start + std::time::Duration::from_secs_f64(deadline_secs);
+                let now = Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline - now);
+                }
+            }
+        }
+
         while self
             .config
             .drop_packet_ids
@@ -72,8 +95,8 @@ impl SimulatorBackend {
             data: self.samples_for_packet(packet_id, timestamp_start),
             aux_data: None,
             board_adc_data: None,
-            ttl_in_per_sample: None,
-            ttl_out_per_sample: None,
+            ttl_in_per_sample: self.ttl_per_sample(packet_id, true),
+            ttl_out_per_sample: self.ttl_per_sample(packet_id, false),
         };
 
         block
@@ -111,6 +134,31 @@ impl SimulatorBackend {
         let lfp = triangle_wave(sample_index.saturating_add((channel as u64).saturating_mul(3)));
         let spike = spike_component(self.config.seed, sample_index, channel);
         clamp_i16(noise + lfp + spike)
+    }
+
+    /// Generate per-sample TTL words when TTL is enabled, exercising code
+    /// paths that consume `ttl_in_per_sample` / `ttl_out_per_sample`.
+    fn ttl_per_sample(&self, packet_id: u64, is_input: bool) -> Option<Vec<u32>> {
+        if !self.config.device.ttl_enabled || self.config.device.ttl_line_count == 0 {
+            return None;
+        }
+        let mask = if self.config.device.ttl_line_count == u32::BITS as usize {
+            u32::MAX
+        } else {
+            (1_u32 << self.config.device.ttl_line_count) - 1
+        };
+        let dir_seed: u64 = if is_input { 0x_A5A5 } else { 0x_5A5A };
+        let spp = self.config.device.samples_per_packet;
+        Some(
+            (0..spp)
+                .map(|s| {
+                    let idx = packet_id
+                        .saturating_mul(spp as u64)
+                        .saturating_add(s as u64);
+                    (mix_u64(self.config.seed ^ idx ^ dir_seed) as u32) & mask
+                })
+                .collect(),
+        )
     }
 
     fn ttl_bits(&self, packet_id: u64) -> u32 {

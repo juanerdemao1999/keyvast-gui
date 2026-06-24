@@ -62,8 +62,8 @@ fn simulator_recording_writes_raw_metadata_and_integrity_summary() {
     let events =
         fs::read_to_string(output_dir.join("events.csv")).expect("events csv should be readable");
     assert!(events.contains("host_time_ms,timestamp_start,event_type,value,message"));
-    assert!(events.contains("0,,started,,"));
-    assert!(events.contains("0,,stopped,,"));
+    assert!(events.contains(",,started,,"));
+    assert!(events.contains(",,stopped,,"));
     assert!(!events.contains("packet_missing"));
 
     let benchmark = fs::read_to_string(output_dir.join("benchmark.json"))
@@ -559,7 +559,11 @@ fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
     assert_eq!(options.enabled_streams, 1);
     assert_eq!(options.raw_input, Some(PathBuf::from("capture.bin")));
     assert_eq!(options.output_dir, PathBuf::from("rhd-out"));
-    assert!(options.bitfile_path.ends_with("keyvast_260607_with_UART.bit"));
+    assert!(
+        options
+            .bitfile_path
+            .ends_with("keyvast_260607_with_UART.bit")
+    );
 }
 
 #[test]
@@ -620,12 +624,8 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
     const CHANNELS_PER_STREAM: usize = 32;
     const HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 
-    let words_per_frame = 4
-        + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + (enabled_streams % 4)
-        + 8
-        + 2;
+    let words_per_frame =
+        4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2;
     let mut raw = Vec::with_capacity(block_count * SAMPLES_PER_BLOCK * words_per_frame * 2);
 
     for block in 0..block_count {

@@ -80,12 +80,19 @@ fn parse_custom_mapping(text: &str, total_channels: usize) -> Result<Vec<usize>,
     }
     let parts: Vec<&str> = text.split(',').map(|s| s.trim()).collect();
     let mut order = Vec::with_capacity(parts.len());
+    let mut seen = std::collections::HashSet::new();
     for (i, part) in parts.iter().enumerate() {
         let ch: usize = part
             .parse()
             .map_err(|_| format!("Invalid number at position {}: '{part}'", i + 1))?;
         if ch >= total_channels {
-            return Err(format!("Channel {ch} out of range (max {})", total_channels - 1));
+            return Err(format!(
+                "Channel {ch} out of range (max {})",
+                total_channels - 1
+            ));
+        }
+        if !seen.insert(ch) {
+            return Err(format!("Duplicate channel {ch} at position {}", i + 1));
         }
         order.push(ch);
     }
@@ -166,7 +173,11 @@ pub fn draw_channel_map_section(
                 .map(|c| c.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            let suffix = if display.channel_order.len() > 12 { ",..." } else { "" };
+            let suffix = if display.channel_order.len() > 12 {
+                ",..."
+            } else {
+                ""
+            };
             ui.label(
                 egui::RichText::new(format!("Map: {preview}{suffix}"))
                     .size(9.0)

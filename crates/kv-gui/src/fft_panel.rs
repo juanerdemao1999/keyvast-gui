@@ -115,7 +115,9 @@ pub fn compute_spectrum(
 /// In-place radix-2 Cooley-Tukey FFT. `real` and `imag` must have power-of-2 length.
 fn fft_radix2(real: &mut [f64], imag: &mut [f64]) {
     let n = real.len();
-    debug_assert!(n.is_power_of_two() && imag.len() == n);
+    if n == 0 || !n.is_power_of_two() || imag.len() != n {
+        return;
+    }
 
     // Bit-reversal permutation.
     let mut j = 0;

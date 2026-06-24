@@ -1,5 +1,6 @@
 //! Integrity checks for Keyvast sample blocks.
 
+use std::collections::HashMap;
 use std::fmt;
 
 use kv_types::{IntegritySummary, SampleBlock, SampleBlockError};
@@ -99,11 +100,24 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
         .summary
         .observed_packets
         .saturating_add(report.summary.missing_packets);
+
+    // Build O(1) lookup for samples-per-block by packet_id.
+    let samples_by_id: HashMap<u64, u64> = blocks
+        .iter()
+        .map(|b| (b.packet_id, b.expected_sample_values() as u64))
+        .collect();
     report.summary.expected_samples = report.summary.written_samples.saturating_add(
         report
             .packet_gaps
             .iter()
-            .map(|gap| expected_missing_samples(blocks, gap))
+            .map(|gap| {
+                let preceding_id = gap.expected_packet_id.saturating_sub(1);
+                samples_by_id
+                    .get(&preceding_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_mul(gap.missing_count)
+            })
             .sum::<u64>(),
     );
 
@@ -162,15 +176,6 @@ fn check_timestamp_continuity(
                 observed_timestamp_start: current.timestamp_start,
             });
     }
-}
-
-fn expected_missing_samples(blocks: &[SampleBlock], gap: &PacketGap) -> u64 {
-    blocks
-        .iter()
-        .find(|block| block.packet_id.wrapping_add(1) == gap.expected_packet_id)
-        .map(|block| block.expected_sample_values() as u64)
-        .unwrap_or_default()
-        .saturating_mul(gap.missing_count)
 }
 
 /// Incremental integrity checker that processes blocks one at a time.

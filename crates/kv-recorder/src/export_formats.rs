@@ -60,14 +60,10 @@ const INTAN_VERSION_MINOR: i16 = 0;
 /// Number of samples per data block in .rhd format.
 const RHD_SAMPLES_PER_BLOCK: usize = 128;
 
-/// Export blocks to Intan .rhd format (streaming, bounded memory).
+/// Export blocks to Intan .rhd format.
 ///
 /// Creates a single `.rhd` file containing a header followed by data blocks.
 /// Each data block contains 128 timestamps + 128 amplifier samples per channel.
-///
-/// Trailing samples that do not fill a complete 128-sample RHD block are
-/// zero-padded to form a final complete block, ensuring no data is silently
-/// discarded.
 pub fn export_intan_rhd(
     output_path: &Path,
     blocks: &[SampleBlock],
@@ -93,95 +89,277 @@ pub fn export_intan_rhd(
     // Write header
     write_rhd_header(&mut w, sample_rate, channel_count, notes, output_path)?;
 
-    // Stream blocks through a fixed-size accumulator (128 samples × channels).
-    // Memory usage is O(RHD_SAMPLES_PER_BLOCK * channel_count), not O(total).
-    let rhd_block_len = RHD_SAMPLES_PER_BLOCK * channel_count;
-    let mut buf_samples: Vec<i16> = Vec::with_capacity(rhd_block_len);
-    let mut buf_timestamps: Vec<u32> = Vec::with_capacity(RHD_SAMPLES_PER_BLOCK);
-    let mut ts = 0u32;
+    // Stream blocks into RHD data blocks (128 samples each) without
+    // accumulating all samples in memory.
+    let e = |source| RecorderError::Io {
+        path: output_path.to_path_buf(),
+        source,
+    };
+
+    // Fixed-size staging buffer for one RHD data block (128 samples × channel_count).
+    let mut staging: Vec<i16> = vec![0i16; RHD_SAMPLES_PER_BLOCK * channel_count];
+    let mut staging_len: usize = 0; // samples filled so far
+    let mut ts: u32 = 0;
+    let mut ts_buf: Vec<u32> = vec![0u32; RHD_SAMPLES_PER_BLOCK];
 
     for block in blocks {
-        for s in 0..block.samples_per_channel {
-            buf_timestamps.push(ts);
-            for ch in 0..block.channel_count {
-                buf_samples.push(block.data[s * block.channel_count + ch]);
+        let spc = block.samples_per_channel;
+        let ch = block.channel_count.min(channel_count);
+        for s in 0..spc {
+            // Append one sample to staging
+            ts_buf[staging_len] = ts;
+            for c in 0..ch {
+                staging[staging_len * channel_count + c] = block.data[s * block.channel_count + c];
             }
+            staging_len += 1;
             ts = ts.wrapping_add(1);
 
-            if buf_timestamps.len() == RHD_SAMPLES_PER_BLOCK {
-                write_rhd_data_block(
-                    &mut w,
-                    &buf_timestamps,
-                    &buf_samples,
-                    channel_count,
-                    RHD_SAMPLES_PER_BLOCK,
-                    output_path,
-                )?;
-                buf_samples.clear();
-                buf_timestamps.clear();
+            if staging_len == RHD_SAMPLES_PER_BLOCK {
+                // Flush one RHD data block
+                write_rhd_data_block(&mut w, &ts_buf, &staging, channel_count, &e)?;
+                staging_len = 0;
             }
         }
     }
-
-    // Zero-pad any trailing samples into a final complete RHD block.
-    if !buf_timestamps.is_empty() {
-        let valid = buf_timestamps.len();
-        let pad_samples = RHD_SAMPLES_PER_BLOCK - valid;
-        buf_timestamps.extend((0..pad_samples).map(|i| ts.wrapping_add(i as u32)));
-        buf_samples.extend(std::iter::repeat_n(0i16, pad_samples * channel_count));
-        write_rhd_data_block(
-            &mut w,
-            &buf_timestamps,
-            &buf_samples,
-            channel_count,
-            RHD_SAMPLES_PER_BLOCK,
-            output_path,
-        )?;
-        eprintln!(
-            "RHD export: zero-padded final block ({valid}/{RHD_SAMPLES_PER_BLOCK} samples valid)"
-        );
+    // Remaining samples < 128: pad with zeros and write final block
+    if staging_len > 0 {
+        for i in staging_len..RHD_SAMPLES_PER_BLOCK {
+            ts_buf[i] = ts;
+            ts = ts.wrapping_add(1);
+            for c in 0..channel_count {
+                staging[i * channel_count + c] = 0;
+            }
+        }
+        write_rhd_data_block(&mut w, &ts_buf, &staging, channel_count, &e)?;
     }
 
-    w.flush().map_err(|source| RecorderError::Io {
-        path: output_path.to_path_buf(),
-        source,
-    })?;
+    w.flush().map_err(e)?;
 
     Ok(output_path.to_path_buf())
 }
 
-/// Write one RHD data block (timestamps + channel-major amplifier data).
 fn write_rhd_data_block(
     w: &mut BufWriter<File>,
     timestamps: &[u32],
     samples: &[i16],
     channel_count: usize,
-    block_size: usize,
-    path: &Path,
+    e: &dyn Fn(std::io::Error) -> RecorderError,
 ) -> Result<(), RecorderError> {
-    // Timestamps
-    for &ts in &timestamps[..block_size] {
-        w.write_all(&(ts as i32).to_le_bytes())
-            .map_err(|source| RecorderError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
+    // Timestamps (128 × i32 LE)
+    for &t in &timestamps[..RHD_SAMPLES_PER_BLOCK] {
+        w.write_all(&(t as i32).to_le_bytes()).map_err(e)?;
     }
-
-    // Amplifier data (channel-major: all samples for ch0, then ch1, ...)
+    // Amplifier data (channel_count × 128 × u16 LE)
     for ch in 0..channel_count {
-        for i in 0..block_size {
-            let sample_idx = i * channel_count + ch;
-            let unsigned = (samples[sample_idx] as i32 + 32768) as u16;
-            w.write_all(&unsigned.to_le_bytes())
-                .map_err(|source| RecorderError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
+        for i in 0..RHD_SAMPLES_PER_BLOCK {
+            let unsigned = (samples[i * channel_count + ch] as i32 + 32768) as u16;
+            w.write_all(&unsigned.to_le_bytes()).map_err(e)?;
         }
     }
-
     Ok(())
+}
+
+// ── Streaming RHD writer ────────────────────────────────────────────
+//
+// Allows callers to feed blocks incrementally without holding the entire
+// recording in memory.  Used by the GUI export path for large .kvraw files.
+
+/// Streaming Intan .rhd writer.  Call [`Self::new`] to open and write the
+/// header, then [`Self::write_blocks`] one or more times, and finally
+/// [`Self::finish`] to flush and pad any trailing samples.
+pub struct IntanRhdStreamWriter {
+    w: BufWriter<File>,
+    path: PathBuf,
+    channel_count: usize,
+    staging: Vec<i16>,
+    ts_buf: Vec<u32>,
+    staging_len: usize,
+    ts: u32,
+}
+
+impl IntanRhdStreamWriter {
+    /// Create a new streaming writer, writing the header immediately.
+    pub fn new(
+        output_path: &Path,
+        sample_rate: f64,
+        channel_count: usize,
+        notes: &str,
+    ) -> Result<Self, RecorderError> {
+        let file = File::create(output_path).map_err(|source| RecorderError::Io {
+            path: output_path.to_path_buf(),
+            source,
+        })?;
+        let mut w = BufWriter::new(file);
+        write_rhd_header(&mut w, sample_rate, channel_count, notes, output_path)?;
+        Ok(Self {
+            w,
+            path: output_path.to_path_buf(),
+            channel_count,
+            staging: vec![0i16; RHD_SAMPLES_PER_BLOCK * channel_count],
+            ts_buf: vec![0u32; RHD_SAMPLES_PER_BLOCK],
+            staging_len: 0,
+            ts: 0,
+        })
+    }
+
+    /// Feed one batch of blocks into the writer.  Can be called repeatedly.
+    pub fn write_blocks(&mut self, blocks: &[SampleBlock]) -> Result<(), RecorderError> {
+        let e = |source: std::io::Error| RecorderError::Io {
+            path: self.path.clone(),
+            source,
+        };
+        for block in blocks {
+            let ch = block.channel_count.min(self.channel_count);
+            for s in 0..block.samples_per_channel {
+                self.ts_buf[self.staging_len] = self.ts;
+                for c in 0..ch {
+                    self.staging[self.staging_len * self.channel_count + c] =
+                        block.data[s * block.channel_count + c];
+                }
+                self.staging_len += 1;
+                self.ts = self.ts.wrapping_add(1);
+
+                if self.staging_len == RHD_SAMPLES_PER_BLOCK {
+                    write_rhd_data_block(
+                        &mut self.w,
+                        &self.ts_buf,
+                        &self.staging,
+                        self.channel_count,
+                        &e,
+                    )?;
+                    self.staging_len = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush remaining samples (zero-padded to a full 128-sample block).
+    pub fn finish(mut self) -> Result<PathBuf, RecorderError> {
+        if self.staging_len > 0 {
+            for i in self.staging_len..RHD_SAMPLES_PER_BLOCK {
+                self.ts_buf[i] = self.ts;
+                self.ts = self.ts.wrapping_add(1);
+                for c in 0..self.channel_count {
+                    self.staging[i * self.channel_count + c] = 0;
+                }
+            }
+            let e = |source: std::io::Error| RecorderError::Io {
+                path: self.path.clone(),
+                source,
+            };
+            write_rhd_data_block(
+                &mut self.w,
+                &self.ts_buf,
+                &self.staging,
+                self.channel_count,
+                &e,
+            )?;
+        }
+        self.w.flush().map_err(|source| RecorderError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(self.path)
+    }
+}
+
+// ── Streaming Flat Binary writer ────────────────────────────────────
+
+/// Streaming flat binary writer for large recordings.
+pub struct FlatBinaryStreamWriter {
+    w: BufWriter<File>,
+    bin_path: PathBuf,
+    output_dir: PathBuf,
+    sample_rate: f64,
+    channel_count: usize,
+    total_samples: u64,
+    notes: String,
+}
+
+impl FlatBinaryStreamWriter {
+    /// Create writer; the output directory and .bin file are created immediately.
+    pub fn new(
+        output_dir: &Path,
+        sample_rate: f64,
+        channel_count: usize,
+        notes: &str,
+    ) -> Result<Self, RecorderError> {
+        fs::create_dir_all(output_dir).map_err(|source| RecorderError::Io {
+            path: output_dir.to_path_buf(),
+            source,
+        })?;
+        let bin_path = output_dir.join("recording.bin");
+        let file = File::create(&bin_path).map_err(|source| RecorderError::Io {
+            path: bin_path.clone(),
+            source,
+        })?;
+        let w = BufWriter::new(file);
+        Ok(Self {
+            w,
+            bin_path,
+            output_dir: output_dir.to_path_buf(),
+            sample_rate,
+            channel_count,
+            total_samples: 0,
+            notes: notes.to_string(),
+        })
+    }
+
+    /// Append blocks to the flat binary file.
+    pub fn write_blocks(&mut self, blocks: &[SampleBlock]) -> Result<(), RecorderError> {
+        for block in blocks {
+            for sample in &block.data {
+                self.w
+                    .write_all(&sample.to_le_bytes())
+                    .map_err(|source| RecorderError::Io {
+                        path: self.bin_path.clone(),
+                        source,
+                    })?;
+            }
+            self.total_samples += block.data.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Flush and write the companion metadata JSON.
+    pub fn finish(mut self) -> Result<PathBuf, RecorderError> {
+        self.w.flush().map_err(|source| RecorderError::Io {
+            path: self.bin_path.clone(),
+            source,
+        })?;
+
+        let meta_path = self.output_dir.join("recording.meta.json");
+        let total_time_s =
+            self.total_samples as f64 / (self.channel_count as f64 * self.sample_rate);
+        let meta = format!(
+            concat!(
+                "{{\n",
+                "  \"format\": \"flat_binary\",\n",
+                "  \"sample_type\": \"int16\",\n",
+                "  \"endianness\": \"little\",\n",
+                "  \"layout\": \"interleaved_by_sample\",\n",
+                "  \"sample_rate_hz\": {},\n",
+                "  \"channel_count\": {},\n",
+                "  \"total_samples\": {},\n",
+                "  \"duration_seconds\": {:.6},\n",
+                "  \"notes\": \"{}\",\n",
+                "  \"data_file\": \"recording.bin\"\n",
+                "}}\n"
+            ),
+            self.sample_rate,
+            self.channel_count,
+            self.total_samples,
+            total_time_s,
+            escape_json_string(&self.notes),
+        );
+        fs::write(&meta_path, meta).map_err(|source| RecorderError::Io {
+            path: meta_path.clone(),
+            source,
+        })?;
+
+        Ok(self.bin_path)
+    }
 }
 
 fn write_rhd_header(

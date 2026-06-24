@@ -128,9 +128,9 @@ impl DemoGenerator {
         }
 
         let timestamp_start = self.global_sample;
-        self.global_sample += spc as u64;
+        self.global_sample = self.global_sample.saturating_add(spc as u64);
         let pid = self.packet_id;
-        self.packet_id += 1;
+        self.packet_id = self.packet_id.saturating_add(1);
 
         SampleBlock {
             device_id: "demo-neural".to_string(),

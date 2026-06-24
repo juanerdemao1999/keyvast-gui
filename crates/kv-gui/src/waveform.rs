@@ -695,8 +695,9 @@ fn collect_from_ring(
             let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
             let sig = var.sqrt();
             let thresh = -filters.spike_threshold_sigma * sig;
-            let ring_sr = sample_rate / RING_DWNSP as f64;
-            let refractory = (ring_sr * 0.001).max(1.0) as usize;
+            // The ring is decimated by RING_DWNSP, so use ring effective rate.
+            let ring_rate = sample_rate / ring.dwnsp as f64;
+            let refractory = (ring_rate * 0.001).max(1.0) as usize;
             let mut count = 0u32;
             let mut last_cross: Option<usize> = None;
             let mut prev = 0.0_f64;

@@ -143,7 +143,7 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
             }
         }
 
-        for _ in 0..(config.enabled_streams % 4) {
+        for _ in 0..((4 - config.enabled_streams % 4) % 4) {
             raw.extend_from_slice(&0_u16.to_le_bytes());
         }
 

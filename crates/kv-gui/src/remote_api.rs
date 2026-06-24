@@ -209,9 +209,6 @@ fn server_loop(
     responses: ResponseQueue,
     client_count: Arc<Mutex<usize>>,
 ) {
-    // Set a timeout so we can check the stop flag periodically
-    listener.set_nonblocking(false).ok();
-
     for stream in listener.incoming() {
         if stop.load(Ordering::Relaxed) {
             break;

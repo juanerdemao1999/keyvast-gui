@@ -224,6 +224,9 @@ pub enum CliError {
         expected_bytes: usize,
         observed_bytes: usize,
     },
+    ConflictingArguments {
+        message: &'static str,
+    },
 }
 
 impl fmt::Display for CliError {
@@ -279,6 +282,9 @@ impl fmt::Display for CliError {
                 "raw RHD input {} is too short: expected at least {expected_bytes} bytes, observed {observed_bytes}",
                 path.display()
             ),
+            Self::ConflictingArguments { message } => {
+                write!(formatter, "conflicting arguments: {message}")
+            }
         }
     }
 }
@@ -302,7 +308,8 @@ impl std::error::Error for CliError {
             | Self::InvalidDuration { .. }
             | Self::UnknownPreset { .. }
             | Self::SystemTimeBeforeUnixEpoch
-            | Self::RawInputTooShort { .. } => None,
+            | Self::RawInputTooShort { .. }
+            | Self::ConflictingArguments { .. } => None,
         }
     }
 }
@@ -1177,7 +1184,11 @@ fn parse_benchmark_args(args: impl Iterator<Item = String>) -> Result<CliCommand
     let duration_seconds = match (&preset, duration) {
         (Some(p), None) => p.duration_seconds(),
         (None, Some(d)) => d,
-        (Some(p), Some(_)) => p.duration_seconds(),
+        (Some(_), Some(_)) => {
+            return Err(CliError::ConflictingArguments {
+                message: "--preset and --duration cannot be used together",
+            });
+        }
         (None, None) => 10.0,
     };
 

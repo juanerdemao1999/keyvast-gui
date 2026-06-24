@@ -320,8 +320,11 @@ impl RhythmFrontPanelBoard {
         Ok(true)
     }
 
-    fn set_sample_rate_30khz(&self) -> Result<bool, RhdReadError> {
-        self.set_sample_rate(30000.0)
+    fn set_sample_rate_30khz(&self) -> Result<(), RhdReadError> {
+        if !self.set_sample_rate(30000.0)? {
+            return Err(RhdReadError::UnsupportedSampleRate(30000.0));
+        }
+        Ok(())
     }
 
     fn set_max_time_step(&self, max_time_step: u32) -> Result<(), RhdReadError> {
@@ -853,9 +856,9 @@ impl RhythmFrontPanelBoard {
     fn flush_fifo(&self) -> Result<(), RhdReadError> {
         // Set USB3 pipeout block-throttle override (bit 16 of WireInResetRun)
         // so the FPGA allows reads of any size during flush.
-        let _ = self
-            .device
-            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16);
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16)
+            .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
 
         // Phase A: bulk drain with large reads (up to 256 KB per iteration).
@@ -866,11 +869,9 @@ impl RhythmFrontPanelBoard {
                 break;
             }
             let mut buffer = vec![0_u8; FLUSH_CHUNK];
-            let _ = self.device.read_from_block_pipe_out(
-                PIPE_OUT_DATA,
-                USB3_BLOCK_SIZE_BYTES,
-                &mut buffer,
-            );
+            self.device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer)
+                .map_err(RhdReadError::FrontPanel)?;
         }
 
         // Phase B: drain remaining with appropriately-sized reads.
@@ -883,15 +884,15 @@ impl RhythmFrontPanelBoard {
             // Round up to USB3_BLOCK_SIZE_BYTES boundary.
             let aligned = byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES).max(1) * USB3_BLOCK_SIZE_BYTES;
             let mut buffer = vec![0_u8; aligned];
-            let _ = self.device.read_from_block_pipe_out(
-                PIPE_OUT_DATA,
-                USB3_BLOCK_SIZE_BYTES,
-                &mut buffer,
-            );
+            self.device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer)
+                .map_err(RhdReadError::FrontPanel)?;
         }
 
         // Release throttle override.
-        let _ = self.device.set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16);
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16)
+            .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
 
         let remaining = self.num_words_in_fifo();
@@ -1187,6 +1188,7 @@ pub enum RhdReadError {
     PllLockTimeout,
     FifoFlushIncomplete { remaining_words: u32 },
     Cancelled,
+    UnsupportedSampleRate(f64),
 }
 
 impl fmt::Display for RhdReadError {
@@ -1221,6 +1223,9 @@ impl fmt::Display for RhdReadError {
                 "FIFO flush incomplete: {remaining_words} words remaining"
             ),
             Self::Cancelled => write!(formatter, "cancelled by Ctrl-C"),
+            Self::UnsupportedSampleRate(rate) => {
+                write!(formatter, "unsupported sample rate: {rate} Hz")
+            }
         }
     }
 }
@@ -1240,7 +1245,8 @@ impl std::error::Error for RhdReadError {
             | Self::PllDcmTimeout
             | Self::PllLockTimeout
             | Self::FifoFlushIncomplete { .. }
-            | Self::Cancelled => None,
+            | Self::Cancelled
+            | Self::UnsupportedSampleRate(_) => None,
         }
     }
 }
@@ -1285,9 +1291,14 @@ fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, samples: usize) -
     // Frame layout per sample (in bytes):
     //   8 (magic) + 4 (timestamp) + 3*enabled_streams*2 (aux results)
     //   + CHANNELS_PER_STREAM*enabled_streams*2 (amplifier)
-    //   + (enabled_streams%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
-    let frame_bytes =
-        (4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2) * 2;
+    //   + ((4-enabled_streams%4)%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
+    let frame_bytes = (4
+        + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + ((4 - enabled_streams % 4) % 4)
+        + 8
+        + 2)
+        * 2;
 
     // AuxCmd3 results start after magic(8) + timestamp(4) + AuxCmd1(streams*2) + AuxCmd2(streams*2)
     let auxcmd3_base = 12 + 2 * enabled_streams * 2;
@@ -1345,7 +1356,7 @@ fn min_stream_railed_fraction(raw: &[u8], enabled_streams: usize, samples: usize
                 }
             }
         }
-        offset += (enabled_streams % 4) * 2; // alignment padding
+        offset += ((4 - enabled_streams % 4) % 4) * 2; // alignment padding
         offset += 8 * 2; // auxiliary ADC slots
         offset += 2; // TTL in
         offset += 2; // TTL out
@@ -1379,9 +1390,13 @@ fn extract_channel_from_raw(
 
     // Frame layout (in u16 words): 4 (magic) + 2 (timestamp)
     // + 3*enabled_streams (aux) + CHANNELS_PER_STREAM*enabled_streams (amp)
-    // + (enabled_streams%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
-    let frame_words =
-        4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2;
+    // + ((4-enabled_streams%4)%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
+    let frame_words = 4
+        + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + ((4 - enabled_streams % 4) % 4)
+        + 8
+        + 2;
     let frame_bytes = frame_words * 2;
 
     // Amplifier data starts after magic(4w) + timestamp(2w) + aux(3*streams w).

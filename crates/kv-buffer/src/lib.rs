@@ -119,31 +119,30 @@ impl FanoutBlockBuffer {
         Ok(id)
     }
 
-    /// Push a block to all consumers. Returns overflow info for any consumer
-    /// that dropped a block, along with the total dropped blocks across all
-    /// consumers.
-    pub fn push(&mut self, block: SampleBlock) -> Option<OverflowInfo> {
+    /// Push a block to all consumers.  Returns `Some(PushOverflow)` if at
+    /// least one consumer was full and had to evict its oldest block.
+    pub fn push(&mut self, block: SampleBlock) -> Option<PushOverflow> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
         let block = Arc::new(block);
 
-        let mut total_dropped: u64 = 0;
-        let mut any_overflow = false;
+        let mut consumers_overflowed: usize = 0;
+        let mut max_occupancy: f64 = 0.0;
+
         for consumer in &mut self.consumers {
             if consumer.push(Arc::clone(&block)) {
-                any_overflow = true;
+                consumers_overflowed += 1;
             }
-            total_dropped = total_dropped.saturating_add(consumer.dropped_blocks);
+            let occ = consumer.occupancy();
+            if occ > max_occupancy {
+                max_occupancy = occ;
+            }
         }
 
-        if any_overflow {
-            let max_occupancy = self
-                .consumers
-                .iter()
-                .map(|c| c.blocks.len() as f64 / c.capacity_blocks as f64)
-                .fold(0.0_f64, f64::max);
-            Some(OverflowInfo {
-                dropped_blocks: total_dropped,
-                buffer_occupancy: max_occupancy,
+        if consumers_overflowed > 0 {
+            Some(PushOverflow {
+                consumers_overflowed,
+                total_dropped_blocks: self.consumers.iter().map(|c| c.dropped_blocks).sum(),
+                max_occupancy,
             })
         } else {
             None
@@ -232,6 +231,13 @@ impl ConsumerQueue {
         overflowed
     }
 
+    fn occupancy(&self) -> f64 {
+        if self.capacity_blocks == 0 {
+            return 0.0;
+        }
+        self.blocks.len() as f64 / self.capacity_blocks as f64
+    }
+
     fn status(&self) -> ConsumerBufferStatus {
         ConsumerBufferStatus {
             consumer_id: self.id,
@@ -306,3 +312,15 @@ impl fmt::Display for BufferError {
 }
 
 impl std::error::Error for BufferError {}
+
+/// Information returned when a [`FanoutBlockBuffer::push`] causes at least
+/// one consumer to overflow (evict its oldest block).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PushOverflow {
+    /// How many consumers overflowed on this push.
+    pub consumers_overflowed: usize,
+    /// Cumulative dropped blocks across all consumers.
+    pub total_dropped_blocks: u64,
+    /// Highest occupancy among all consumers after the push.
+    pub max_occupancy: f64,
+}

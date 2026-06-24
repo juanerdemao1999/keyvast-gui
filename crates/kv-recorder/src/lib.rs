@@ -1081,14 +1081,18 @@ impl KvrawReader {
                     })?;
                 parse_kvraw_json(&json_str)
             } else {
-                // Minimal fallback
+                eprintln!(
+                    "[kv-recorder] warning: no companion .json metadata for v1 KVRAW file {:?}; \
+                     sample_rate and channel_count are unknown — using 0 as sentinel",
+                    path
+                );
                 KvrawMetadata {
                     format_version: 1,
                     data_offset_bytes: 0,
                     device_id: String::new(),
                     backend: String::new(),
-                    sample_rate: 30_000.0,
-                    channel_count: 64,
+                    sample_rate: 0.0,
+                    channel_count: 0,
                     samples_per_channel: 0,
                     written_samples: 0,
                     block_count: 0,
@@ -1146,10 +1150,12 @@ impl KvrawReader {
             return Ok(Vec::new());
         }
 
-        let sample_offset = start_frame * ch as u64;
-        let byte_offset = self.data_start + sample_offset * 2;
-        let total_samples = ch * num_frames;
-        let byte_count = total_samples * 2;
+        let sample_offset = start_frame.saturating_mul(ch as u64);
+        let byte_offset = self
+            .data_start
+            .saturating_add(sample_offset.saturating_mul(2));
+        let total_samples = ch.saturating_mul(num_frames);
+        let byte_count = total_samples.saturating_mul(2);
 
         self.reader
             .seek(SeekFrom::Start(byte_offset))

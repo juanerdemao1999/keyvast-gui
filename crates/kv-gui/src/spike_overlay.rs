@@ -359,12 +359,13 @@ pub fn draw_spike_overlay(
                 continue;
             }
             let total = snippet.samples.len().max(1);
+            let divisor = if total <= 1 { 1.0 } else { (total - 1) as f64 };
             let pts: Vec<[f64; 2]> = snippet
                 .samples
                 .iter()
                 .enumerate()
                 .map(|(i, &v)| {
-                    let t_ms = x_left + (i as f64 / (total - 1) as f64) * (x_right - x_left);
+                    let t_ms = x_left + (i as f64 / divisor) * (x_right - x_left);
                     let y = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
                         - (disp_pos as f64) * ch_spacing;
                     [t_ms, y]

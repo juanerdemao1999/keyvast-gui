@@ -188,7 +188,11 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2)
+    Ok(4 + 2
+        + enabled_streams * (CHANNELS_PER_STREAM + 3)
+        + ((4 - enabled_streams % 4) % 4)
+        + 8
+        + 2)
 }
 
 pub fn bytes_per_block(

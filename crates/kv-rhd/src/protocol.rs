@@ -53,15 +53,14 @@ pub enum RhdChipType {
 
 #[allow(dead_code)] // hardware bring-up reference
 impl RhdChipType {
-    /// Identify the chip type from the register-63 chip-ID readback. The
-    /// RHD2000 ROM register 63 holds the chip ID as a literal value (matching
-    /// Open Ephys `getDeviceId`): 1 = RHD2132 (32ch), 2 = RHD2216 (16ch),
-    /// 4 = RHD2164 (64ch).
+    /// Identify the chip type from the register-63 chip-ID readback.
+    /// Bits 7:6 encode the amplifier count; lower bits carry revision data.
     pub fn from_register63(reg63: u16) -> Option<Self> {
-        match reg63 & 0xff {
+        let num_amps = (reg63 >> 6) & 0x03;
+        match num_amps {
+            0 => Some(Self::Rhd2216),
             1 => Some(Self::Rhd2132),
-            2 => Some(Self::Rhd2216),
-            4 => Some(Self::Rhd2164),
+            2 => Some(Self::Rhd2164),
             _ => None,
         }
     }

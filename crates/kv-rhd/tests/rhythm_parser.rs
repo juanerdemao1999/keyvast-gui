@@ -7,10 +7,7 @@ use kv_rhd::{
 #[test]
 fn calculates_usb_block_size_for_two_32_channel_streams() {
     assert_eq!(words_per_frame(2).expect("valid stream count"), 88);
-    assert_eq!(
-        bytes_per_block(2, 256).expect("valid block size"),
-        45_056
-    );
+    assert_eq!(bytes_per_block(2, 256).expect("valid block size"), 45_056);
 }
 
 #[test]
@@ -62,10 +59,16 @@ fn rejects_bad_magic() {
     let mut raw = build_raw_block(&config, 0, 0);
     raw[0] = 0;
 
-    let error = parse_rhythm_data_block(0, &raw, &config)
-        .expect_err("corrupt magic should be rejected");
+    let error =
+        parse_rhythm_data_block(0, &raw, &config).expect_err("corrupt magic should be rejected");
 
-    assert!(matches!(error, RhythmParseError::BadMagic { sample_index: 0, .. }));
+    assert!(matches!(
+        error,
+        RhythmParseError::BadMagic {
+            sample_index: 0,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -73,8 +76,8 @@ fn rejects_short_buffers() {
     let config = test_config(2, 2);
     let raw = vec![0_u8; bytes_per_block(2, 2).expect("valid block size") - 1];
 
-    let error = parse_rhythm_data_block(0, &raw, &config)
-        .expect_err("short block should be rejected");
+    let error =
+        parse_rhythm_data_block(0, &raw, &config).expect_err("short block should be rejected");
 
     assert!(matches!(
         error,
@@ -93,8 +96,8 @@ fn rejects_in_frame_timestamp_gap() {
     raw[second_frame_timestamp_offset..second_frame_timestamp_offset + 4]
         .copy_from_slice(&99_u32.to_le_bytes());
 
-    let error = parse_rhythm_data_block(0, &raw, &config)
-        .expect_err("timestamp gap should be rejected");
+    let error =
+        parse_rhythm_data_block(0, &raw, &config).expect_err("timestamp gap should be rejected");
 
     assert!(matches!(
         error,
@@ -154,4 +157,3 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
 
     raw
 }
-

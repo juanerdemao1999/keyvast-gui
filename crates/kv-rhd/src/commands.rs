@@ -349,8 +349,9 @@ impl Rhd2000Registers {
             commands.push(reg_write(register, self.register_value(register)?)?);
         }
 
-        for register in [63, 62, 61, 60, 59, 48, 49, 50, 51, 52, 53, 54, 55, 40, 41, 42, 43, 44]
-        {
+        for register in [
+            63, 62, 61, 60, 59, 48, 49, 50, 51, 52, 53, 54, 55, 40, 41, 42, 43, 44,
+        ] {
             commands.push(reg_read(register)?);
         }
         for register in 0..=17 {
@@ -648,7 +649,10 @@ impl fmt::Display for RhdCommandError {
                 "{command_type:?} {argument} value {value} exceeds maximum {max}"
             ),
             Self::InvalidArgumentShape { command_type } => {
-                write!(formatter, "{command_type:?} was called with invalid arguments")
+                write!(
+                    formatter,
+                    "{command_type:?} was called with invalid arguments"
+                )
             }
         }
     }

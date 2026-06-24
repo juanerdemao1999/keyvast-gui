@@ -83,7 +83,11 @@ pub fn compute_spectrum(
         let freq = k as f64 * bin_width;
         let power = (real[k] * real[k] + imag[k] * imag[k]) / (n as f64 * sample_rate);
         // Double one-sided bins (except DC and Nyquist).
-        let power = if k > 0 && k < n / 2 { power * 2.0 } else { power };
+        let power = if k > 0 && k < n / 2 {
+            power * 2.0
+        } else {
+            power
+        };
         let db = 10.0 * (power.max(1e-20)).log10();
         spectrum.push([freq, db]);
     }
@@ -160,10 +164,7 @@ pub fn draw_fft_section(
     .default_open(false)
     .show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut state.enabled,
-                egui::RichText::new("Enable").size(10.0),
-            );
+            ui.checkbox(&mut state.enabled, egui::RichText::new("Enable").size(10.0));
         });
 
         if !state.enabled {
@@ -267,7 +268,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         .allow_scroll(false)
         .auto_bounds(egui::Vec2b::new(true, true))
         .x_axis_label("Frequency (Hz)")
-        .y_axis_label(if state.log_scale { "Power (dB)" } else { "Power (µV²/Hz)" })
+        .y_axis_label(if state.log_scale {
+            "Power (dB)"
+        } else {
+            "Power (µV²/Hz)"
+        })
         .set_margin_fraction(egui::vec2(0.02, 0.05));
 
     let ch = state.selected_channel;
@@ -285,14 +290,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         for &freq in &[50.0, 60.0] {
             if freq >= state.freq_min && freq <= state.freq_max {
                 plot_ui.line(
-                    Line::new(PlotPoints::from(vec![
-                        [freq, -200.0],
-                        [freq, 100.0],
-                    ]))
-                    .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
-                    .width(0.8)
-                    .style(egui_plot::LineStyle::dashed_dense())
-                    .name(format!("{freq} Hz")),
+                    Line::new(PlotPoints::from(vec![[freq, -200.0], [freq, 100.0]]))
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
+                        .width(0.8)
+                        .style(egui_plot::LineStyle::dashed_dense())
+                        .name(format!("{freq} Hz")),
                 );
             }
         }
@@ -301,14 +303,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         let nyquist = sample_rate / 2.0;
         if nyquist >= state.freq_min && nyquist <= state.freq_max {
             plot_ui.line(
-                Line::new(PlotPoints::from(vec![
-                    [nyquist, -200.0],
-                    [nyquist, 100.0],
-                ]))
-                .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
-                .width(0.8)
-                .style(egui_plot::LineStyle::dashed_dense())
-                .name("Nyquist"),
+                Line::new(PlotPoints::from(vec![[nyquist, -200.0], [nyquist, 100.0]]))
+                    .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
+                    .width(0.8)
+                    .style(egui_plot::LineStyle::dashed_dense())
+                    .name("Nyquist"),
             );
         }
     });

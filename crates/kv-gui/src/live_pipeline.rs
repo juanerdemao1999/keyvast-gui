@@ -217,8 +217,9 @@ fn producer_loop(
             match SimulatorBackend::new(config) {
                 Ok(sim) => (ActiveSource::Simulator(sim), sleep_dur),
                 Err(e) => {
-                    let _ = event_tx
-                        .send(RecorderEvent::SourceError(format!("simulator init failed: {e}")));
+                    let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                        "simulator init failed: {e}"
+                    )));
                     return;
                 }
             }
@@ -226,8 +227,9 @@ fn producer_loop(
         PipelineSource::Rhd(options) => match RhdHardwareBackend::open(*options) {
             Ok(backend) => (ActiveSource::Rhd(backend), Duration::ZERO),
             Err(e) => {
-                let _ = event_tx
-                    .send(RecorderEvent::SourceError(format!("RHD device open failed: {e}")));
+                let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                    "RHD device open failed: {e}"
+                )));
                 return;
             }
         },

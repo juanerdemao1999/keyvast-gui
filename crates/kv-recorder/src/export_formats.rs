@@ -149,7 +149,10 @@ fn write_rhd_header(
     path: &Path,
 ) -> Result<(), RecorderError> {
     let p = path.to_path_buf();
-    let e = |source| RecorderError::Io { path: p.clone(), source };
+    let e = |source| RecorderError::Io {
+        path: p.clone(),
+        source,
+    };
 
     // Magic number
     w.write_all(&INTAN_MAGIC.to_le_bytes()).map_err(e)?;
@@ -157,7 +160,8 @@ fn write_rhd_header(
     w.write_all(&INTAN_VERSION_MAJOR.to_le_bytes()).map_err(e)?;
     w.write_all(&INTAN_VERSION_MINOR.to_le_bytes()).map_err(e)?;
     // Sample rate (f32)
-    w.write_all(&(sample_rate as f32).to_le_bytes()).map_err(e)?;
+    w.write_all(&(sample_rate as f32).to_le_bytes())
+        .map_err(e)?;
     // DSP enabled (i16: 1 = yes)
     w.write_all(&1_i16.to_le_bytes()).map_err(e)?;
     // DSP cutoff frequency (f32)
@@ -165,11 +169,13 @@ fn write_rhd_header(
     // Lower bandwidth (f32)
     w.write_all(&0.1_f32.to_le_bytes()).map_err(e)?;
     // Upper bandwidth (f32)
-    w.write_all(&(sample_rate as f32 / 2.0).to_le_bytes()).map_err(e)?;
+    w.write_all(&(sample_rate as f32 / 2.0).to_le_bytes())
+        .map_err(e)?;
     // Desired lower bandwidth (f32)
     w.write_all(&0.1_f32.to_le_bytes()).map_err(e)?;
     // Desired upper bandwidth (f32)
-    w.write_all(&((sample_rate / 2.0) as f32).to_le_bytes()).map_err(e)?;
+    w.write_all(&((sample_rate / 2.0) as f32).to_le_bytes())
+        .map_err(e)?;
     // Notch filter mode (i16: 0 = none)
     w.write_all(&0_i16.to_le_bytes()).map_err(e)?;
     // Desired impedance test frequency (f32)
@@ -194,30 +200,32 @@ fn write_rhd_header(
     w.write_all(&1_i16.to_le_bytes()).map_err(e)?;
 
     // Signal group header
-    write_qstring(w, "Port A", path)?;   // group name
-    write_qstring(w, "A", path)?;         // group prefix
-    w.write_all(&1_i16.to_le_bytes()).map_err(e)?;     // enabled
-    w.write_all(&(channel_count as i16).to_le_bytes()).map_err(e)?;  // num channels
-    w.write_all(&(channel_count as i16).to_le_bytes()).map_err(e)?;  // num amp channels
+    write_qstring(w, "Port A", path)?; // group name
+    write_qstring(w, "A", path)?; // group prefix
+    w.write_all(&1_i16.to_le_bytes()).map_err(e)?; // enabled
+    w.write_all(&(channel_count as i16).to_le_bytes())
+        .map_err(e)?; // num channels
+    w.write_all(&(channel_count as i16).to_le_bytes())
+        .map_err(e)?; // num amp channels
 
     // Channel headers
     for ch in 0..channel_count {
         let name = format!("A-{:03}", ch);
-        write_qstring(w, &name, path)?;          // native channel name
-        write_qstring(w, &name, path)?;          // custom channel name
-        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?;   // native order
-        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?;   // custom order
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // signal type (0 = amp)
-        w.write_all(&1_i16.to_le_bytes()).map_err(e)?;          // channel enabled
-        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?;   // chip channel
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // board stream
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // spike scope trigger
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // voltage trigger mode
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // voltage threshold
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // digital trigger channel
-        w.write_all(&0_i16.to_le_bytes()).map_err(e)?;          // digital edge polarity
-        w.write_all(&0.0_f32.to_le_bytes()).map_err(e)?;        // electrode impedance mag
-        w.write_all(&0.0_f32.to_le_bytes()).map_err(e)?;        // electrode impedance phase
+        write_qstring(w, &name, path)?; // native channel name
+        write_qstring(w, &name, path)?; // custom channel name
+        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?; // native order
+        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?; // custom order
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // signal type (0 = amp)
+        w.write_all(&1_i16.to_le_bytes()).map_err(e)?; // channel enabled
+        w.write_all(&(ch as i16).to_le_bytes()).map_err(e)?; // chip channel
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // board stream
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // spike scope trigger
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // voltage trigger mode
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // voltage threshold
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // digital trigger channel
+        w.write_all(&0_i16.to_le_bytes()).map_err(e)?; // digital edge polarity
+        w.write_all(&0.0_f32.to_le_bytes()).map_err(e)?; // electrode impedance mag
+        w.write_all(&0.0_f32.to_le_bytes()).map_err(e)?; // electrode impedance phase
     }
 
     Ok(())
@@ -228,10 +236,16 @@ fn write_qstring(w: &mut BufWriter<File>, s: &str, path: &Path) -> Result<(), Re
     let utf16: Vec<u16> = s.encode_utf16().collect();
     let byte_len = (utf16.len() * 2) as u32;
     w.write_all(&byte_len.to_le_bytes())
-        .map_err(|source| RecorderError::Io { path: path.to_path_buf(), source })?;
+        .map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
     for code_unit in &utf16 {
         w.write_all(&code_unit.to_le_bytes())
-            .map_err(|source| RecorderError::Io { path: path.to_path_buf(), source })?;
+            .map_err(|source| RecorderError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
     }
     Ok(())
 }
@@ -326,27 +340,33 @@ pub fn export_flat_binary(
 mod tests {
     use super::*;
 
-    fn make_test_blocks(channels: usize, samples_per_ch: usize, n_blocks: usize) -> Vec<SampleBlock> {
-        (0..n_blocks).map(|i| {
-            let data: Vec<i16> = (0..(channels * samples_per_ch))
-                .map(|s| ((s as i32 + i as i32 * 100) % 32767) as i16)
-                .collect();
-            SampleBlock {
-                device_id: "test".to_string(),
-                stream_id: 0,
-                packet_id: i as u64,
-                timestamp_start: (i * samples_per_ch) as u64,
-                sample_rate: 30000.0,
-                channel_count: channels,
-                samples_per_channel: samples_per_ch,
-                ttl_bits: 0,
-                data,
-                aux_data: None,
-                board_adc_data: None,
-                ttl_in_per_sample: None,
-                ttl_out_per_sample: None,
-            }
-        }).collect()
+    fn make_test_blocks(
+        channels: usize,
+        samples_per_ch: usize,
+        n_blocks: usize,
+    ) -> Vec<SampleBlock> {
+        (0..n_blocks)
+            .map(|i| {
+                let data: Vec<i16> = (0..(channels * samples_per_ch))
+                    .map(|s| ((s as i32 + i as i32 * 100) % 32767) as i16)
+                    .collect();
+                SampleBlock {
+                    device_id: "test".to_string(),
+                    stream_id: 0,
+                    packet_id: i as u64,
+                    timestamp_start: (i * samples_per_ch) as u64,
+                    sample_rate: 30000.0,
+                    channel_count: channels,
+                    samples_per_channel: samples_per_ch,
+                    ttl_bits: 0,
+                    data,
+                    aux_data: None,
+                    board_adc_data: None,
+                    ttl_in_per_sample: None,
+                    ttl_out_per_sample: None,
+                }
+            })
+            .collect()
     }
 
     #[test]

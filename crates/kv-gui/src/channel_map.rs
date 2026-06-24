@@ -85,7 +85,10 @@ fn parse_custom_mapping(text: &str, total_channels: usize) -> Result<Vec<usize>,
             .parse()
             .map_err(|_| format!("Invalid number at position {}: '{part}'", i + 1))?;
         if ch >= total_channels {
-            return Err(format!("Channel {ch} out of range (max {})", total_channels - 1));
+            return Err(format!(
+                "Channel {ch} out of range (max {})",
+                total_channels - 1
+            ));
         }
         order.push(ch);
     }
@@ -166,7 +169,11 @@ pub fn draw_channel_map_section(
                 .map(|c| c.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            let suffix = if display.channel_order.len() > 12 { ",..." } else { "" };
+            let suffix = if display.channel_order.len() > 12 {
+                ",..."
+            } else {
+                ""
+            };
             ui.label(
                 egui::RichText::new(format!("Map: {preview}{suffix}"))
                     .size(9.0)

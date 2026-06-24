@@ -103,10 +103,7 @@ pub fn draw_impedance_section(
             } else {
                 0.0
             };
-            ui.add(
-                egui::ProgressBar::new(progress)
-                    .text(format!("Channel {cur}/{total}")),
-            );
+            ui.add(egui::ProgressBar::new(progress).text(format!("Channel {cur}/{total}")));
         } else {
             let enabled = can_measure;
             let tooltip = if !can_measure {
@@ -115,10 +112,7 @@ pub fn draw_impedance_section(
                 "Measure impedance on all channels (stops acquisition during the test)"
             };
             if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new("Measure Impedance"),
-                )
+                .add_enabled(enabled, egui::Button::new("Measure Impedance"))
                 .on_hover_text(tooltip)
                 .clicked()
             {
@@ -199,9 +193,8 @@ fn draw_impedance_table(ui: &mut egui::Ui, channels: &[ChannelImpedance]) {
 
                 let mag_text = format_impedance(ch.magnitude_ohms);
                 let rgba = ImpedanceResult::quality_color(ch.magnitude_ohms);
-                let color = egui::Color32::from_rgba_premultiplied(
-                    rgba[0], rgba[1], rgba[2], rgba[3],
-                );
+                let color =
+                    egui::Color32::from_rgba_premultiplied(rgba[0], rgba[1], rgba[2], rgba[3]);
 
                 ui.label(
                     egui::RichText::new(&mag_text)
@@ -217,11 +210,7 @@ fn draw_impedance_table(ui: &mut egui::Ui, channels: &[ChannelImpedance]) {
                 );
 
                 let quality = ImpedanceResult::quality_label(ch.magnitude_ohms);
-                ui.label(
-                    egui::RichText::new(quality)
-                        .size(10.0)
-                        .color(color),
-                );
+                ui.label(egui::RichText::new(quality).size(10.0).color(color));
 
                 ui.end_row();
             }

@@ -79,6 +79,14 @@ impl PlaybackManager {
         match KvrawReader::open(&path) {
             Ok(reader) => {
                 let meta = reader.metadata().clone();
+                if !meta.sample_rate.is_finite() || meta.sample_rate <= 0.0 {
+                    self.error = Some(format!(
+                        "Invalid sample_rate ({}) in file metadata",
+                        meta.sample_rate
+                    ));
+                    self.state = PlaybackState::Idle;
+                    return;
+                }
                 self.metadata = Some(meta);
                 self.reader = Some(reader);
                 self.file_path = Some(path);
@@ -158,8 +166,7 @@ impl PlaybackManager {
             let dt = now.duration_since(self.last_tick).as_secs_f64();
             self.last_tick = now;
 
-            let frames_to_advance =
-                (dt * sample_rate * self.speed).round() as u64;
+            let frames_to_advance = (dt * sample_rate * self.speed).round() as u64;
             self.cursor_frame = self
                 .cursor_frame
                 .saturating_add(frames_to_advance)
@@ -334,12 +341,9 @@ pub fn draw_playback_section(
                     let time_s = playback.cursor_frame as f64 / meta.sample_rate;
                     let total_s = meta.duration_seconds();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{:.2}s / {:.2}s",
-                            time_s, total_s,
-                        ))
-                        .size(10.0)
-                        .color(theme::TEXT_DIM),
+                        egui::RichText::new(format!("{:.2}s / {:.2}s", time_s, total_s,))
+                            .size(10.0)
+                            .color(theme::TEXT_DIM),
                     );
                 }
             }

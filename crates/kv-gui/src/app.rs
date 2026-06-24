@@ -1204,10 +1204,6 @@ impl KvApp {
 
     /// Poll the live pipeline for new blocks and recorder events.
     fn tick_device(&mut self) {
-        if self.live_pipeline.is_none() {
-            return;
-        }
-
         // ── Collect recorder events and preview blocks while holding the borrow ──
         // We must release the borrow before calling self.ingest_block() or
         // mutating other self fields, so collect into locals first.
@@ -1216,7 +1212,9 @@ impl KvApp {
         let mut preview_blocks: Vec<SampleBlock> = Vec::new();
 
         {
-            let pipeline = self.live_pipeline.as_mut().unwrap();
+            let Some(pipeline) = self.live_pipeline.as_mut() else {
+                return;
+            };
 
             while let Ok(event) = pipeline.event_rx.try_recv() {
                 recorder_events.push(event);
@@ -1269,7 +1267,7 @@ impl KvApp {
                     self.toasts.error(format!("Device error: {e}"));
                     self.device_error = Some(e);
                     self.live_pipeline = None;
-                    if self.recording.state == RecordingState::Recording {
+                    if self.recording.state != RecordingState::Idle {
                         self.recording.state = RecordingState::Idle;
                         self.recording_start_time = None;
                     }
@@ -1437,7 +1435,10 @@ impl KvApp {
                     ("G", "Toggle the waveform grid"),
                     ("F", "Toggle the performance overlay"),
                     ("[  ]", "Decrease / increase the time window"),
-                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    (
+                        "1 \u{2013} 9",
+                        "Quick-set visible channel count (\u{00D7}4)",
+                    ),
                     ("+  \u{2212}", "Increase / decrease channel spacing"),
                     ("?  /  F1", "Toggle this help (Esc to close)"),
                 ];

@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use eframe::egui;
 
-use crate::panels::{DisplayMode, FilterSettings, DisplaySettings};
+use crate::panels::{DisplayMode, DisplaySettings, FilterSettings};
 use crate::theme;
 
 // ── Config data model ───────────────────────────────────────────────
@@ -111,9 +111,10 @@ impl Default for ConfigPersistState {
 /// Default config file location (next to executable or in CWD).
 fn default_config_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            return dir.join("keyvast_config.json");
-        }
+        && let Some(dir) = exe.parent()
+    {
+        return dir.join("keyvast_config.json");
+    }
     PathBuf::from("keyvast_config.json")
 }
 
@@ -176,28 +177,72 @@ impl PersistentConfig {
     pub fn from_json(json: &str) -> Self {
         let mut cfg = Self::default();
 
-        if let Some(v) = extract_usize(json, "visible_channels") { cfg.visible_channels = v; }
-        if let Some(v) = extract_usize(json, "time_scale_idx") { cfg.time_scale_idx = v; }
-        if let Some(v) = extract_usize(json, "amp_scale_idx") { cfg.amp_scale_idx = v; }
-        if let Some(v) = extract_bool(json, "show_grid") { cfg.show_grid = v; }
-        if let Some(v) = extract_f64(json, "channel_spacing") { cfg.channel_spacing = v; }
-        if let Some(v) = extract_string(json, "display_mode") { cfg.display_mode = v; }
-        if let Some(v) = extract_bool(json, "color_by_group") { cfg.color_by_group = v; }
-        if let Some(v) = extract_usize(json, "channels_per_group") { cfg.channels_per_group = v; }
-        if let Some(v) = extract_bool(json, "hp_enabled") { cfg.hp_enabled = v; }
-        if let Some(v) = extract_f64(json, "hp_cutoff_hz") { cfg.hp_cutoff_hz = v; }
-        if let Some(v) = extract_bool(json, "lp_enabled") { cfg.lp_enabled = v; }
-        if let Some(v) = extract_f64(json, "lp_cutoff_hz") { cfg.lp_cutoff_hz = v; }
-        if let Some(v) = extract_bool(json, "notch_enabled") { cfg.notch_enabled = v; }
-        if let Some(v) = extract_usize(json, "notch_idx") { cfg.notch_idx = v; }
-        if let Some(v) = extract_bool(json, "car_enabled") { cfg.car_enabled = v; }
-        if let Some(v) = extract_string(json, "output_dir") { cfg.output_dir = v; }
-        if let Some(v) = extract_string(json, "file_prefix") { cfg.file_prefix = v; }
-        if let Some(v) = extract_usize(json, "remote_port") { cfg.remote_port = v as u16; }
-        if let Some(v) = extract_f64(json, "ui_scale") { cfg.ui_scale = v as f32; }
-        if let Some(v) = extract_f64(json, "window_width") { cfg.window_width = v as f32; }
-        if let Some(v) = extract_f64(json, "window_height") { cfg.window_height = v as f32; }
-        if let Some(v) = extract_string(json, "last_source") { cfg.last_source = v; }
+        if let Some(v) = extract_usize(json, "visible_channels") {
+            cfg.visible_channels = v;
+        }
+        if let Some(v) = extract_usize(json, "time_scale_idx") {
+            cfg.time_scale_idx = v;
+        }
+        if let Some(v) = extract_usize(json, "amp_scale_idx") {
+            cfg.amp_scale_idx = v;
+        }
+        if let Some(v) = extract_bool(json, "show_grid") {
+            cfg.show_grid = v;
+        }
+        if let Some(v) = extract_f64(json, "channel_spacing") {
+            cfg.channel_spacing = v;
+        }
+        if let Some(v) = extract_string(json, "display_mode") {
+            cfg.display_mode = v;
+        }
+        if let Some(v) = extract_bool(json, "color_by_group") {
+            cfg.color_by_group = v;
+        }
+        if let Some(v) = extract_usize(json, "channels_per_group") {
+            cfg.channels_per_group = v;
+        }
+        if let Some(v) = extract_bool(json, "hp_enabled") {
+            cfg.hp_enabled = v;
+        }
+        if let Some(v) = extract_f64(json, "hp_cutoff_hz") {
+            cfg.hp_cutoff_hz = v;
+        }
+        if let Some(v) = extract_bool(json, "lp_enabled") {
+            cfg.lp_enabled = v;
+        }
+        if let Some(v) = extract_f64(json, "lp_cutoff_hz") {
+            cfg.lp_cutoff_hz = v;
+        }
+        if let Some(v) = extract_bool(json, "notch_enabled") {
+            cfg.notch_enabled = v;
+        }
+        if let Some(v) = extract_usize(json, "notch_idx") {
+            cfg.notch_idx = v;
+        }
+        if let Some(v) = extract_bool(json, "car_enabled") {
+            cfg.car_enabled = v;
+        }
+        if let Some(v) = extract_string(json, "output_dir") {
+            cfg.output_dir = v;
+        }
+        if let Some(v) = extract_string(json, "file_prefix") {
+            cfg.file_prefix = v;
+        }
+        if let Some(v) = extract_usize(json, "remote_port") {
+            cfg.remote_port = v as u16;
+        }
+        if let Some(v) = extract_f64(json, "ui_scale") {
+            cfg.ui_scale = v as f32;
+        }
+        if let Some(v) = extract_f64(json, "window_width") {
+            cfg.window_width = v as f32;
+        }
+        if let Some(v) = extract_f64(json, "window_height") {
+            cfg.window_height = v as f32;
+        }
+        if let Some(v) = extract_string(json, "last_source") {
+            cfg.last_source = v;
+        }
 
         cfg
     }
@@ -248,10 +293,14 @@ impl PersistentConfig {
         remote_port: &mut u16,
     ) {
         display.visible_channels = self.visible_channels;
-        display.time_scale_idx = self.time_scale_idx.min(crate::panels::TIME_WINDOWS.len() - 1);
+        display.time_scale_idx = self
+            .time_scale_idx
+            .min(crate::panels::TIME_WINDOWS.len() - 1);
         display.amp_scale_idx = self.amp_scale_idx.min(crate::panels::AMP_SCALES.len() - 1);
         display.show_grid = self.show_grid;
-        display.channel_spacing = self.channel_spacing;
+        display.channel_spacing = self
+            .channel_spacing
+            .clamp(crate::panels::SPACING_MIN, crate::panels::SPACING_MAX);
         display.display_mode = match self.display_mode.as_str() {
             "roll" => DisplayMode::Roll,
             _ => DisplayMode::Sweep,
@@ -264,7 +313,9 @@ impl PersistentConfig {
         filters.lp_enabled = self.lp_enabled;
         filters.lp_cutoff_hz = self.lp_cutoff_hz;
         filters.notch_enabled = self.notch_enabled;
-        filters.notch_idx = self.notch_idx;
+        filters.notch_idx = self
+            .notch_idx
+            .min(crate::panels::NOTCH_FREQS.len().saturating_sub(1));
         filters.car_enabled = self.car_enabled;
 
         *output_dir = self.output_dir.clone();
@@ -349,11 +400,7 @@ pub fn draw_config_section(
             } else {
                 theme::ACCENT_GREEN
             };
-            ui.label(
-                egui::RichText::new(msg.as_str())
-                    .size(9.0)
-                    .color(color),
-            );
+            ui.label(egui::RichText::new(msg.as_str()).size(9.0).color(color));
         }
     });
 }
@@ -382,7 +429,8 @@ fn extract_f64(json: &str, key: &str) -> Option<f64> {
     let after = after.trim_start().strip_prefix(':')?;
     let after = after.trim_start();
     // Parse until non-numeric
-    let end = after.find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+    let end = after
+        .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
         .unwrap_or(after.len());
     after[..end].parse().ok()
 }

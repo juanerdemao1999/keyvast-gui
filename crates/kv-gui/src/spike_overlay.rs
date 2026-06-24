@@ -60,7 +60,10 @@ pub struct SpikeChannel {
 
 impl SpikeChannel {
     pub fn new(ch: usize) -> Self {
-        Self { ch, y_scale: DEFAULT_Y_SCALE }
+        Self {
+            ch,
+            y_scale: DEFAULT_Y_SCALE,
+        }
     }
 }
 
@@ -88,7 +91,7 @@ struct ChannelBuf {
     /// Ring of recent AP samples for the pre-crossing window.
     pre_ring: VecDeque<f32>,
     /// When Some: snapshot of pre-window taken at crossing; collecting post.
-    pending:  Option<(Vec<f32>, Vec<f32>)>, // (pre_snapshot, post_buf)
+    pending: Option<(Vec<f32>, Vec<f32>)>, // (pre_snapshot, post_buf)
     /// Remaining refractory samples after last detection.
     refractory: usize,
     /// Previous sample value (for negative-going edge detection).
@@ -175,7 +178,10 @@ impl ChannelBuf {
             if self.snippets.len() >= max_snippets {
                 self.snippets.pop_front();
             }
-            self.snippets.push_back(SpikeSnippet { samples, age_frames: 0 });
+            self.snippets.push_back(SpikeSnippet {
+                samples,
+                age_frames: 0,
+            });
         }
     }
 
@@ -184,7 +190,11 @@ impl ChannelBuf {
             s.age_frames = s.age_frames.saturating_add(1);
         }
         // Prune fully transparent snippets
-        while self.snippets.front().is_some_and(|s| s.age_frames >= FADE_FRAMES) {
+        while self
+            .snippets
+            .front()
+            .is_some_and(|s| s.age_frames >= FADE_FRAMES)
+        {
             self.snippets.pop_front();
         }
     }
@@ -211,11 +221,13 @@ pub struct SpikeSnippetStore {
 
 impl SpikeSnippetStore {
     pub fn new(channel_count: usize, sample_rate: f64) -> Self {
-        let pre_samples  = ms_to_samples(DEFAULT_PRE_MS,  sample_rate);
+        let pre_samples = ms_to_samples(DEFAULT_PRE_MS, sample_rate);
         let post_samples = ms_to_samples(DEFAULT_POST_MS, sample_rate);
-        let refractory   = ms_to_samples(1.0,             sample_rate);
+        let refractory = ms_to_samples(1.0, sample_rate);
         Self {
-            bufs: (0..channel_count).map(|_| ChannelBuf::new(pre_samples)).collect(),
+            bufs: (0..channel_count)
+                .map(|_| ChannelBuf::new(pre_samples))
+                .collect(),
             sigma: DEFAULT_SIGMA,
             pre_samples,
             post_samples,
@@ -227,19 +239,21 @@ impl SpikeSnippetStore {
 
     /// Called when channel count or sample rate changes.
     pub fn reconfigure(&mut self, channel_count: usize, sample_rate: f64) {
-        self.sample_rate     = sample_rate;
-        self.pre_samples     = ms_to_samples(DEFAULT_PRE_MS,  sample_rate);
-        self.post_samples    = ms_to_samples(DEFAULT_POST_MS, sample_rate);
+        self.sample_rate = sample_rate;
+        self.pre_samples = ms_to_samples(DEFAULT_PRE_MS, sample_rate);
+        self.post_samples = ms_to_samples(DEFAULT_POST_MS, sample_rate);
         self.refractory_samples = ms_to_samples(1.0, sample_rate);
-        self.bufs = (0..channel_count).map(|_| ChannelBuf::new(self.pre_samples)).collect();
+        self.bufs = (0..channel_count)
+            .map(|_| ChannelBuf::new(self.pre_samples))
+            .collect();
     }
 
     /// Update pre/post window sizes from ms values (rebuilds buffers).
     pub fn set_window_ms(&mut self, pre_ms: f32, post_ms: f32) {
-        let new_pre  = ms_to_samples(pre_ms,  self.sample_rate);
+        let new_pre = ms_to_samples(pre_ms, self.sample_rate);
         let new_post = ms_to_samples(post_ms, self.sample_rate);
         if new_pre != self.pre_samples || new_post != self.post_samples {
-            self.pre_samples  = new_pre;
+            self.pre_samples = new_pre;
             self.post_samples = new_post;
             for buf in &mut self.bufs {
                 buf.pre_ring = {
@@ -259,12 +273,12 @@ impl SpikeSnippetStore {
         if self.bufs.len() != ch {
             self.reconfigure(ch, block.sample_rate);
         }
-        let sigma       = self.sigma;
-        let pre         = self.pre_samples;
-        let post        = self.post_samples;
-        let refrac      = self.refractory_samples;
-        let max         = self.max_snippets;
-        let scale       = i16::MAX as f32;
+        let sigma = self.sigma;
+        let pre = self.pre_samples;
+        let post = self.post_samples;
+        let refrac = self.refractory_samples;
+        let max = self.max_snippets;
+        let scale = i16::MAX as f32;
 
         for s in 0..spc {
             for c in 0..ch {
@@ -283,12 +297,22 @@ impl SpikeSnippetStore {
 
     /// Return reference to snippets for a specific physical channel.
     pub fn snippets_for(&self, ch: usize) -> &VecDeque<SpikeSnippet> {
-        &self.bufs[ch.min(self.bufs.len().saturating_sub(1))].snippets
+        static EMPTY: VecDeque<SpikeSnippet> = VecDeque::new();
+        if self.bufs.is_empty() {
+            return &EMPTY;
+        }
+        &self.bufs[ch.min(self.bufs.len() - 1)].snippets
     }
 
-    pub fn channel_count(&self) -> usize { self.bufs.len() }
-    pub fn pre_ms(&self)  -> f32 { samples_to_ms(self.pre_samples,  self.sample_rate) }
-    pub fn post_ms(&self) -> f32 { samples_to_ms(self.post_samples, self.sample_rate) }
+    pub fn channel_count(&self) -> usize {
+        self.bufs.len()
+    }
+    pub fn pre_ms(&self) -> f32 {
+        samples_to_ms(self.pre_samples, self.sample_rate)
+    }
+    pub fn post_ms(&self) -> f32 {
+        samples_to_ms(self.post_samples, self.sample_rate)
+    }
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────
@@ -315,10 +339,10 @@ pub fn draw_spike_overlay(
         return;
     }
 
-    let pre_ms  = store.pre_ms();
+    let pre_ms = store.pre_ms();
     let post_ms = store.post_ms();
-    let x_left  = -(pre_ms as f64);
-    let x_right =  post_ms as f64;
+    let x_left = -(pre_ms as f64);
+    let x_right = post_ms as f64;
     let ch_spacing = 2.5_f64;
     let n = channels.len();
     let y_min = -(n as f64) * ch_spacing + ch_spacing * 0.5;
@@ -341,7 +365,7 @@ pub fn draw_spike_overlay(
                 .enumerate()
                 .map(|(i, &v)| {
                     let t_ms = x_left + (i as f64 / (total - 1) as f64) * (x_right - x_left);
-                    let y    = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
+                    let y = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
                         - (disp_pos as f64) * ch_spacing;
                     [t_ms, y]
                 })

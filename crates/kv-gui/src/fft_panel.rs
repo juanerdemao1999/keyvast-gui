@@ -6,7 +6,7 @@
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::disp_ring::DisplayRing;
+use crate::disp_ring::{DisplayRing, RING_DWNSP};
 use crate::theme;
 
 /// FFT analysis state.
@@ -45,16 +45,29 @@ impl Default for FftState {
 /// Available FFT sizes.
 const FFT_SIZES: &[usize] = &[256, 512, 1024, 2048, 4096];
 
+/// ADC µV-per-count conversion factor.
+///
+/// TODO(hardware): Replace this constant with the device-specific factor
+/// from `DeviceConfig` once the real ADC calibration is available.
+const ADC_UV_PER_COUNT: f64 = 0.195;
+
 /// Compute the PSD from the display ring for a given channel.
+///
+/// `hardware_sample_rate` is the raw device rate (e.g. 30 000 Hz). The
+/// effective ring sample rate is `hardware_sample_rate / RING_DWNSP`.
 pub fn compute_spectrum(
     ring: &DisplayRing,
     channel: usize,
     fft_size: usize,
-    sample_rate: f64,
+    hardware_sample_rate: f64,
 ) -> Vec<[f64; 2]> {
-    if !ring.ready || sample_rate <= 0.0 {
+    if !ring.ready || hardware_sample_rate <= 0.0 {
         return Vec::new();
     }
+
+    // The ring stores decimated data — use the decimated rate for frequency
+    // axis calculations.
+    let ring_sr = hardware_sample_rate / RING_DWNSP as f64;
 
     // Extract the most recent `fft_size` samples for this channel from the ring.
     let raw = ring.last_n_samples(channel, fft_size);
@@ -67,23 +80,37 @@ pub fn compute_spectrum(
     let mut real = Vec::with_capacity(n);
     let mut imag = vec![0.0_f64; n];
     let pi2_over_n = 2.0 * std::f64::consts::PI / n as f64;
+
+    // Compute coherent gain of Hann window for amplitude correction.
+    let mut win_sum = 0.0_f64;
+    for i in 0..n {
+        win_sum += 0.5 * (1.0 - (pi2_over_n * i as f64).cos());
+    }
+    let win_norm = win_sum / n as f64;
+
     for (i, &sample) in raw.iter().enumerate().take(n) {
-        let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
-        real.push(sample as f64 * 0.195 * w); // convert to µV
+        let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos());
+        real.push(sample as f64 * ADC_UV_PER_COUNT * w);
     }
 
     // In-place radix-2 FFT.
     fft_radix2(&mut real, &mut imag);
 
     // Compute one-sided PSD in dB (µV²/Hz).
-    let bin_width = sample_rate / n as f64;
+    let bin_width = ring_sr / n as f64;
     let n_bins = n / 2 + 1;
     let mut spectrum = Vec::with_capacity(n_bins);
     for k in 0..n_bins {
         let freq = k as f64 * bin_width;
-        let power = (real[k] * real[k] + imag[k] * imag[k]) / (n as f64 * sample_rate);
+        // Normalise by window power (win_norm²) so PSD amplitude is correct.
+        let power =
+            (real[k] * real[k] + imag[k] * imag[k]) / (n as f64 * ring_sr * win_norm * win_norm);
         // Double one-sided bins (except DC and Nyquist).
-        let power = if k > 0 && k < n / 2 { power * 2.0 } else { power };
+        let power = if k > 0 && k < n / 2 {
+            power * 2.0
+        } else {
+            power
+        };
         let db = 10.0 * (power.max(1e-20)).log10();
         spectrum.push([freq, db]);
     }
@@ -160,10 +187,7 @@ pub fn draw_fft_section(
     .default_open(false)
     .show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut state.enabled,
-                egui::RichText::new("Enable").size(10.0),
-            );
+            ui.checkbox(&mut state.enabled, egui::RichText::new("Enable").size(10.0));
         });
 
         if !state.enabled {
@@ -218,9 +242,10 @@ pub fn draw_fft_section(
                     .suffix(" Hz"),
             );
             ui.label(egui::RichText::new("–").size(10.0));
+            let ring_nyquist = sample_rate / RING_DWNSP as f64 / 2.0;
             ui.add(
                 egui::DragValue::new(&mut state.freq_max)
-                    .range(state.freq_min + 1.0..=sample_rate / 2.0)
+                    .range(state.freq_min + 1.0..=ring_nyquist)
                     .speed(10.0)
                     .suffix(" Hz"),
             );
@@ -267,7 +292,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         .allow_scroll(false)
         .auto_bounds(egui::Vec2b::new(true, true))
         .x_axis_label("Frequency (Hz)")
-        .y_axis_label(if state.log_scale { "Power (dB)" } else { "Power (µV²/Hz)" })
+        .y_axis_label(if state.log_scale {
+            "Power (dB)"
+        } else {
+            "Power (µV²/Hz)"
+        })
         .set_margin_fraction(egui::vec2(0.02, 0.05));
 
     let ch = state.selected_channel;
@@ -285,14 +314,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         for &freq in &[50.0, 60.0] {
             if freq >= state.freq_min && freq <= state.freq_max {
                 plot_ui.line(
-                    Line::new(PlotPoints::from(vec![
-                        [freq, -200.0],
-                        [freq, 100.0],
-                    ]))
-                    .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
-                    .width(0.8)
-                    .style(egui_plot::LineStyle::dashed_dense())
-                    .name(format!("{freq} Hz")),
+                    Line::new(PlotPoints::from(vec![[freq, -200.0], [freq, 100.0]]))
+                        .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
+                        .width(0.8)
+                        .style(egui_plot::LineStyle::dashed_dense())
+                        .name(format!("{freq} Hz")),
                 );
             }
         }
@@ -301,14 +327,11 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         let nyquist = sample_rate / 2.0;
         if nyquist >= state.freq_min && nyquist <= state.freq_max {
             plot_ui.line(
-                Line::new(PlotPoints::from(vec![
-                    [nyquist, -200.0],
-                    [nyquist, 100.0],
-                ]))
-                .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
-                .width(0.8)
-                .style(egui_plot::LineStyle::dashed_dense())
-                .name("Nyquist"),
+                Line::new(PlotPoints::from(vec![[nyquist, -200.0], [nyquist, 100.0]]))
+                    .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
+                    .width(0.8)
+                    .style(egui_plot::LineStyle::dashed_dense())
+                    .name("Nyquist"),
             );
         }
     });

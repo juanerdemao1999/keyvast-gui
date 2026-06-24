@@ -4,6 +4,13 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use kv_types::SampleBlock;
 
+/// Information about a block drop that occurred during a push.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverflowInfo {
+    pub dropped_blocks: u64,
+    pub buffer_occupancy: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BlockBuffer {
     capacity_blocks: usize,
@@ -26,15 +33,27 @@ impl BlockBuffer {
         })
     }
 
-    pub fn push(&mut self, block: SampleBlock) {
+    pub fn push(&mut self, block: SampleBlock) -> Option<OverflowInfo> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
 
-        if self.blocks.len() == self.capacity_blocks {
+        let overflowed = if self.blocks.len() == self.capacity_blocks {
             self.blocks.pop_front();
             self.dropped_blocks = self.dropped_blocks.saturating_add(1);
-        }
+            true
+        } else {
+            false
+        };
 
         self.blocks.push_back(block);
+
+        if overflowed {
+            Some(OverflowInfo {
+                dropped_blocks: self.dropped_blocks,
+                buffer_occupancy: self.blocks.len() as f64 / self.capacity_blocks as f64,
+            })
+        } else {
+            None
+        }
     }
 
     pub fn pop(&mut self) -> Option<SampleBlock> {
@@ -100,12 +119,34 @@ impl FanoutBlockBuffer {
         Ok(id)
     }
 
-    pub fn push(&mut self, block: SampleBlock) {
+    /// Push a block to all consumers. Returns overflow info for any consumer
+    /// that dropped a block, along with the total dropped blocks across all
+    /// consumers.
+    pub fn push(&mut self, block: SampleBlock) -> Option<OverflowInfo> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
         let block = Arc::new(block);
 
+        let mut total_dropped: u64 = 0;
+        let mut any_overflow = false;
         for consumer in &mut self.consumers {
-            consumer.push(Arc::clone(&block));
+            if consumer.push(Arc::clone(&block)) {
+                any_overflow = true;
+            }
+            total_dropped = total_dropped.saturating_add(consumer.dropped_blocks);
+        }
+
+        if any_overflow {
+            let max_occupancy = self
+                .consumers
+                .iter()
+                .map(|c| c.blocks.len() as f64 / c.capacity_blocks as f64)
+                .fold(0.0_f64, f64::max);
+            Some(OverflowInfo {
+                dropped_blocks: total_dropped,
+                buffer_occupancy: max_occupancy,
+            })
+        } else {
+            None
         }
     }
 
@@ -175,15 +216,20 @@ struct ConsumerQueue {
 }
 
 impl ConsumerQueue {
-    fn push(&mut self, block: Arc<SampleBlock>) {
+    /// Push a block. Returns `true` if a block was dropped due to overflow.
+    fn push(&mut self, block: Arc<SampleBlock>) -> bool {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
 
-        if self.blocks.len() == self.capacity_blocks {
+        let overflowed = if self.blocks.len() == self.capacity_blocks {
             self.blocks.pop_front();
             self.dropped_blocks = self.dropped_blocks.saturating_add(1);
-        }
+            true
+        } else {
+            false
+        };
 
         self.blocks.push_back(block);
+        overflowed
     }
 
     fn status(&self) -> ConsumerBufferStatus {

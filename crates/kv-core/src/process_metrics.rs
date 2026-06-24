@@ -74,7 +74,8 @@ impl WindowsCollector {
         let (end_kernel, end_user) = process_cpu_times()?;
         let memory_mb_max = peak_working_set_mb()?;
 
-        let cpu_delta_100ns = (end_kernel - self.start_kernel) + (end_user - self.start_user);
+        let cpu_delta_100ns =
+            end_kernel.saturating_sub(self.start_kernel) + end_user.saturating_sub(self.start_user);
         // FILETIME units are 100-ns intervals → divide by 10_000_000 for seconds.
         let cpu_seconds = cpu_delta_100ns as f64 / 10_000_000.0;
         let cpu_percent_avg = if wall_clock_seconds > 0.0 {

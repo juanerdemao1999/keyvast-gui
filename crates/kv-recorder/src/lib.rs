@@ -24,6 +24,9 @@ const KVRAW_JSON_RESERVED: usize = 512;
 /// Byte offset where sample data begins (8 magic + 4 len + 512 json = 524).
 pub const KVRAW_DATA_OFFSET: u64 = 8 + 4 + KVRAW_JSON_RESERVED as u64;
 
+/// Maximum number of write-latency samples kept in memory (reservoir sampler).
+const LATENCY_RESERVOIR_CAP: usize = 65_536;
+
 use kv_types::{AcquisitionEvent, IntegritySummary, SampleBlock, SampleBlockError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -593,6 +596,7 @@ pub struct StreamingRecorder {
     channel_count: Option<usize>,
     samples_per_packet: Option<usize>,
     write_latencies_us: Vec<u64>,
+    latency_sample_count: u64,
 }
 
 impl StreamingRecorder {
@@ -640,7 +644,8 @@ impl StreamingRecorder {
             sample_rate: None,
             channel_count: None,
             samples_per_packet: None,
-            write_latencies_us: Vec::new(),
+            write_latencies_us: Vec::with_capacity(LATENCY_RESERVOIR_CAP),
+            latency_sample_count: 0,
         })
     }
 
@@ -675,7 +680,17 @@ impl StreamingRecorder {
         }
 
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.write_latencies_us.push(elapsed_us);
+        self.latency_sample_count += 1;
+        if self.write_latencies_us.len() < LATENCY_RESERVOIR_CAP {
+            self.write_latencies_us.push(elapsed_us);
+        } else {
+            // Reservoir sampling (Algorithm R): replace a random element
+            // with probability LATENCY_RESERVOIR_CAP / latency_sample_count.
+            let idx = cheap_rng(self.latency_sample_count) % self.latency_sample_count;
+            if (idx as usize) < LATENCY_RESERVOIR_CAP {
+                self.write_latencies_us[idx as usize] = elapsed_us;
+            }
+        }
 
         let sample_values = block.data.len() as u64;
         self.block_count = self.block_count.saturating_add(1);
@@ -947,6 +962,14 @@ pub(crate) fn escape_json_string(value: &str) -> String {
     }
 
     escaped
+}
+
+/// Cheap deterministic hash for reservoir sampling (splitmix64-style).
+fn cheap_rng(x: u64) -> u64 {
+    let mut z = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 // ── KVRAW v2 Reader ──────────────────────────────────────────────────────────

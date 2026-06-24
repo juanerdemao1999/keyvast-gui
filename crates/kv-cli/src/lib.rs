@@ -835,9 +835,16 @@ fn simulator_recording_log_lines(integrity: &IntegrityReport) -> Vec<String> {
     lines
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn simulator_recording_events(integrity: &IntegrityReport) -> Vec<AcquisitionEvent> {
     let mut events = vec![AcquisitionEvent::Started {
-        timestamp_host_ms: 0,
+        timestamp_host_ms: now_ms(),
     }];
 
     for gap in &integrity.packet_gaps {
@@ -849,7 +856,7 @@ fn simulator_recording_events(integrity: &IntegrityReport) -> Vec<AcquisitionEve
     }
 
     events.push(AcquisitionEvent::Stopped {
-        timestamp_host_ms: 0,
+        timestamp_host_ms: now_ms(),
     });
     events
 }
@@ -890,7 +897,7 @@ fn rhd_smoke_log_lines(integrity: &IntegrityReport, hardware: bool) -> Vec<Strin
 
 fn rhd_smoke_events(integrity: &IntegrityReport) -> Vec<AcquisitionEvent> {
     let mut events = vec![AcquisitionEvent::Started {
-        timestamp_host_ms: 0,
+        timestamp_host_ms: now_ms(),
     }];
 
     for gap in &integrity.packet_gaps {
@@ -902,7 +909,7 @@ fn rhd_smoke_events(integrity: &IntegrityReport) -> Vec<AcquisitionEvent> {
     }
 
     events.push(AcquisitionEvent::Stopped {
-        timestamp_host_ms: 0,
+        timestamp_host_ms: now_ms(),
     });
     events
 }

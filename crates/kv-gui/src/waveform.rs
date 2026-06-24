@@ -19,7 +19,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::disp_ring::{DisplayRing, RING_DWNSP};
+use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 

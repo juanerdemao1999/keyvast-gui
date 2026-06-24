@@ -257,9 +257,10 @@ where
                 let mut state = lock.lock().expect("shared state lock poisoned");
                 if let Some(overflow) = state.buffer.push(block) {
                     log::warn!(
-                        "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
-                        overflow.dropped_blocks,
-                        overflow.buffer_occupancy * 100.0
+                        "buffer overflow: {} consumers dropped blocks (total dropped: {}, occupancy: {:.1}%)",
+                        overflow.consumers_overflowed,
+                        overflow.total_dropped_blocks,
+                        overflow.max_occupancy * 100.0
                     );
                 }
                 cvar.notify_all();

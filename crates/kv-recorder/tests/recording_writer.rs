@@ -5,8 +5,8 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder,
-    write_benchmark_summary, write_integrity_summary, write_log_file, write_recording,
+    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder, write_benchmark_summary,
+    write_integrity_summary, write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -329,8 +329,8 @@ fn streaming_recorder_writes_blocks_incrementally() {
     // Read the embedded JSON from the header (bytes 12..524 of the kvraw file)
     let kvraw_bytes = fs::read(output_dir.join("recording.kvraw")).expect("kvraw readable");
     let json_len = u32::from_le_bytes(kvraw_bytes[8..12].try_into().unwrap()) as usize;
-    let metadata = std::str::from_utf8(&kvraw_bytes[12..12 + json_len])
-        .expect("header JSON is valid UTF-8");
+    let metadata =
+        std::str::from_utf8(&kvraw_bytes[12..12 + json_len]).expect("header JSON is valid UTF-8");
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
@@ -379,7 +379,10 @@ fn streaming_recorder_matches_batch_recorder_output() {
     let batch_raw = fs::read(batch_dir.join("recording.kvraw")).expect("batch raw");
     let stream_raw = fs::read(stream_dir.join("recording.kvraw")).expect("stream raw");
     let stream_samples = &stream_raw[KVRAW_DATA_OFFSET as usize..];
-    assert_eq!(batch_raw, stream_samples, "sample data should be byte-identical");
+    assert_eq!(
+        batch_raw, stream_samples,
+        "sample data should be byte-identical"
+    );
 
     cleanup_dir(&batch_dir);
     cleanup_dir(&stream_dir);
@@ -476,7 +479,9 @@ fn kvraw_reader_round_trips_streaming_data() {
     assert_eq!(data.len(), ch * frames_to_read);
 
     // Read as per-channel vectors.
-    let channels = reader.read_channels(0, frames_to_read).expect("read channels");
+    let channels = reader
+        .read_channels(0, frames_to_read)
+        .expect("read channels");
     assert_eq!(channels.len(), ch);
     for c in &channels {
         assert_eq!(c.len(), frames_to_read);

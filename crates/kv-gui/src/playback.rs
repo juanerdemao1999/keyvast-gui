@@ -158,8 +158,7 @@ impl PlaybackManager {
             let dt = now.duration_since(self.last_tick).as_secs_f64();
             self.last_tick = now;
 
-            let frames_to_advance =
-                (dt * sample_rate * self.speed).round() as u64;
+            let frames_to_advance = (dt * sample_rate * self.speed).round() as u64;
             self.cursor_frame = self
                 .cursor_frame
                 .saturating_add(frames_to_advance)
@@ -334,12 +333,9 @@ pub fn draw_playback_section(
                     let time_s = playback.cursor_frame as f64 / meta.sample_rate;
                     let total_s = meta.duration_seconds();
                     ui.label(
-                        egui::RichText::new(format!(
-                            "{:.2}s / {:.2}s",
-                            time_s, total_s,
-                        ))
-                        .size(10.0)
-                        .color(theme::TEXT_DIM),
+                        egui::RichText::new(format!("{:.2}s / {:.2}s", time_s, total_s,))
+                            .size(10.0)
+                            .color(theme::TEXT_DIM),
                     );
                 }
             }

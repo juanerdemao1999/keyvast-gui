@@ -1531,6 +1531,7 @@ dependencies = [
  "kv-recorder",
  "kv-simulator",
  "kv-types",
+ "log",
  "windows-sys 0.59.0",
 ]
 

@@ -182,13 +182,7 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    Ok(
-        4 + 2
-            + enabled_streams * (CHANNELS_PER_STREAM + 3)
-            + (enabled_streams % 4)
-            + 8
-            + 2,
-    )
+    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2)
 }
 
 pub fn bytes_per_block(
@@ -209,4 +203,3 @@ pub fn raw_word_to_signed_count(word: u16) -> i16 {
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
 }
-

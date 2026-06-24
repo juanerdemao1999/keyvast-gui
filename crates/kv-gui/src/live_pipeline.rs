@@ -217,8 +217,9 @@ fn producer_loop(
             match SimulatorBackend::new(config) {
                 Ok(sim) => (ActiveSource::Simulator(sim), sleep_dur),
                 Err(e) => {
-                    let _ = event_tx
-                        .send(RecorderEvent::SourceError(format!("simulator init failed: {e}")));
+                    let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                        "simulator init failed: {e}"
+                    )));
                     return;
                 }
             }
@@ -226,8 +227,9 @@ fn producer_loop(
         PipelineSource::Rhd(options) => match RhdHardwareBackend::open(*options) {
             Ok(backend) => (ActiveSource::Rhd(backend), Duration::ZERO),
             Err(e) => {
-                let _ = event_tx
-                    .send(RecorderEvent::SourceError(format!("RHD device open failed: {e}")));
+                let _ = event_tx.send(RecorderEvent::SourceError(format!(
+                    "RHD device open failed: {e}"
+                )));
                 return;
             }
         },
@@ -254,7 +256,15 @@ fn producer_loop(
                 // Push original into shared fanout (recorder gets its slot)
                 // and notify the recorder thread via condvar.
                 {
-                    shared.0.lock().expect("buffer lock poisoned").push(block);
+                    if let Some(overflow) =
+                        shared.0.lock().expect("buffer lock poisoned").push(block)
+                    {
+                        log::warn!(
+                            "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
+                            overflow.dropped_blocks,
+                            overflow.buffer_occupancy * 100.0
+                        );
+                    }
                     shared.1.notify_one();
                 }
             }

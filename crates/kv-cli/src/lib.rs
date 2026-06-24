@@ -1,8 +1,7 @@
 //! Developer command helpers for exercising the Keyvast acquisition stack.
 
 use std::{
-    fs,
-    fmt,
+    fmt, fs,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -164,14 +163,29 @@ pub enum CliCommand {
 #[derive(Debug)]
 pub enum CliError {
     MissingCommand,
-    UnknownCommand { command: String },
-    MissingArgumentValue { flag: &'static str },
-    UnknownArgument { argument: String },
+    UnknownCommand {
+        command: String,
+    },
+    MissingArgumentValue {
+        flag: &'static str,
+    },
+    UnknownArgument {
+        argument: String,
+    },
     MissingOutputDir,
-    InvalidBlockCount { blocks: usize },
-    InvalidNumber { flag: &'static str, value: String },
-    InvalidDuration { seconds: f64 },
-    UnknownPreset { name: String },
+    InvalidBlockCount {
+        blocks: usize,
+    },
+    InvalidNumber {
+        flag: &'static str,
+        value: String,
+    },
+    InvalidDuration {
+        seconds: f64,
+    },
+    UnknownPreset {
+        name: String,
+    },
     SystemTimeBeforeUnixEpoch,
     SimulatorConfig(SimulatorConfigError),
     Rhd(RhdReadError),
@@ -558,8 +572,9 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             path: raw_input.clone(),
             source,
         })?;
-        let block_bytes = bytes_per_block(data_config.enabled_streams, data_config.samples_per_block)
-            .map_err(RhdReadError::InvalidConfig)?;
+        let block_bytes =
+            bytes_per_block(data_config.enabled_streams, data_config.samples_per_block)
+                .map_err(RhdReadError::InvalidConfig)?;
         let expected_bytes = block_bytes.saturating_mul(options.blocks);
         if raw.len() < expected_bytes {
             return Err(CliError::RawInputTooShort {
@@ -573,12 +588,8 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
         run_fixed_blocks(&device_config, options.blocks, &mut || {
             let start = next_packet_id as usize * block_bytes;
             let end = start + block_bytes;
-            let block = parse_rhythm_data_block(
-                next_packet_id,
-                &raw[start..end],
-                &data_config,
-            )
-            .map_err(RhdReadError::Parse)?;
+            let block = parse_rhythm_data_block(next_packet_id, &raw[start..end], &data_config)
+                .map_err(RhdReadError::Parse)?;
             next_packet_id = next_packet_id.saturating_add(1);
             Ok::<_, RhdReadError>(block)
         })?
@@ -601,7 +612,10 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
         &options.output_dir,
         &rhd_smoke_log_lines(&acquisition.integrity, options.raw_input.is_none()),
     )?;
-    write_events_csv(&options.output_dir, &rhd_smoke_events(&acquisition.integrity))?;
+    write_events_csv(
+        &options.output_dir,
+        &rhd_smoke_events(&acquisition.integrity),
+    )?;
     write_benchmark_summary(
         &options.output_dir,
         &rhd_smoke_benchmark_summary(

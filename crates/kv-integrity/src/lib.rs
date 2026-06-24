@@ -83,8 +83,13 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
             .saturating_add(block.data.len() as u64);
 
         if let Some(previous) = previous_block {
-            check_packet_continuity(previous, block, &mut report)?;
-            check_timestamp_continuity(previous, block, &mut report);
+            let had_gap = check_packet_continuity(previous, block, &mut report)?;
+            // Only check timestamp continuity when there is no packet gap;
+            // a gap naturally causes a timestamp jump that is not a clock
+            // discontinuity.
+            if !had_gap {
+                check_timestamp_continuity(previous, block, &mut report);
+            }
         }
 
         previous_block = Some(block);
@@ -105,32 +110,38 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
     Ok(report)
 }
 
+/// Returns `Ok(true)` if a packet gap was detected, `Ok(false)` if
+/// the packet ID is continuous.
 fn check_packet_continuity(
     previous: &SampleBlock,
     current: &SampleBlock,
     report: &mut IntegrityReport,
-) -> Result<(), IntegrityError> {
-    let expected_packet_id = previous.packet_id.saturating_add(1);
+) -> Result<bool, IntegrityError> {
+    let expected_packet_id = previous.packet_id.wrapping_add(1);
 
-    if current.packet_id < expected_packet_id {
+    if current.packet_id == expected_packet_id {
+        return Ok(false);
+    }
+
+    // Use wrapping subtraction to compute the forward gap. A large
+    // forward distance (> half the u64 space) is treated as a backwards
+    // jump.
+    let forward_gap = current.packet_id.wrapping_sub(expected_packet_id);
+    if forward_gap > u64::MAX / 2 {
         return Err(IntegrityError::PacketIdWentBackwards {
             previous_packet_id: previous.packet_id,
             observed_packet_id: current.packet_id,
         });
     }
 
-    if current.packet_id > expected_packet_id {
-        let missing_count = current.packet_id.saturating_sub(expected_packet_id);
-        report.summary.missing_packets =
-            report.summary.missing_packets.saturating_add(missing_count);
-        report.packet_gaps.push(PacketGap {
-            expected_packet_id,
-            observed_packet_id: current.packet_id,
-            missing_count,
-        });
-    }
+    report.summary.missing_packets = report.summary.missing_packets.saturating_add(forward_gap);
+    report.packet_gaps.push(PacketGap {
+        expected_packet_id,
+        observed_packet_id: current.packet_id,
+        missing_count: forward_gap,
+    });
 
-    Ok(())
+    Ok(true)
 }
 
 fn check_timestamp_continuity(
@@ -156,7 +167,7 @@ fn check_timestamp_continuity(
 fn expected_missing_samples(blocks: &[SampleBlock], gap: &PacketGap) -> u64 {
     blocks
         .iter()
-        .find(|block| block.packet_id.saturating_add(1) == gap.expected_packet_id)
+        .find(|block| block.packet_id.wrapping_add(1) == gap.expected_packet_id)
         .map(|block| block.expected_sample_values() as u64)
         .unwrap_or_default()
         .saturating_mul(gap.missing_count)
@@ -206,28 +217,30 @@ impl IncrementalIntegrity {
             .written_samples
             .saturating_add(block.data.len() as u64);
 
+        let mut had_gap = false;
         if let Some(previous_id) = self.previous_packet_id {
-            let expected_packet_id = previous_id.saturating_add(1);
+            let expected_packet_id = previous_id.wrapping_add(1);
 
-            if block.packet_id < expected_packet_id {
-                return Err(IntegrityError::PacketIdWentBackwards {
-                    previous_packet_id: previous_id,
-                    observed_packet_id: block.packet_id,
-                });
-            }
+            if block.packet_id != expected_packet_id {
+                let forward_gap = block.packet_id.wrapping_sub(expected_packet_id);
+                if forward_gap > u64::MAX / 2 {
+                    return Err(IntegrityError::PacketIdWentBackwards {
+                        previous_packet_id: previous_id,
+                        observed_packet_id: block.packet_id,
+                    });
+                }
 
-            if block.packet_id > expected_packet_id {
-                let missing_count = block.packet_id.saturating_sub(expected_packet_id);
+                had_gap = true;
                 self.report.summary.missing_packets = self
                     .report
                     .summary
                     .missing_packets
-                    .saturating_add(missing_count);
+                    .saturating_add(forward_gap);
 
                 let missing_samples = self
                     .previous_samples_per_block
                     .unwrap_or_default()
-                    .saturating_mul(missing_count);
+                    .saturating_mul(forward_gap);
                 self.report.summary.expected_samples = self
                     .report
                     .summary
@@ -237,12 +250,14 @@ impl IncrementalIntegrity {
                 self.report.packet_gaps.push(PacketGap {
                     expected_packet_id,
                     observed_packet_id: block.packet_id,
-                    missing_count,
+                    missing_count: forward_gap,
                 });
             }
         }
 
-        if let Some(expected_timestamp) = self.previous_timestamp_after_block
+        // Only check timestamp continuity when there is no packet gap.
+        if !had_gap
+            && let Some(expected_timestamp) = self.previous_timestamp_after_block
             && block.timestamp_start != expected_timestamp
         {
             self.report.summary.timestamp_discontinuities = self

@@ -10,16 +10,24 @@ use crate::disp_ring::{DisplayRing, RING_DWNSP};
 use crate::theme;
 
 /// FFT analysis state.
+///
+/// The spectrum is refreshed once per frame by [`FftState::update_from_ring`]
+/// whenever an "FFT Spectrum" view is open, so the sidebar section is purely a
+/// set of display controls and the view is self-contained (#4a).
 #[derive(Debug, Clone)]
 pub struct FftState {
     /// Which channel to analyze (physical index).
     pub selected_channel: usize,
     /// FFT size (power of 2).
     pub fft_size: usize,
-    /// Whether to show the FFT panel.
-    pub enabled: bool,
-    /// Cached PSD result: (frequency_hz, power_db) pairs.
+    /// Cached PSD result: (frequency_hz, power_db) pairs (latest frame, raw).
     pub spectrum: Vec<[f64; 2]>,
+    /// Temporally smoothed PSD magnitudes (dB), aligned with `spectrum` bins.
+    pub smoothed_db: Vec<f64>,
+    /// Whether to apply temporal smoothing to the displayed curve (#4d).
+    pub smoothing: bool,
+    /// Eased Y-axis bounds (dB), so the plot does not jitter frame-to-frame.
+    pub y_bounds: Option<(f64, f64)>,
     /// Whether to use log scale on Y axis.
     pub log_scale: bool,
     /// Low frequency cutoff for display (Hz).
@@ -33,12 +41,83 @@ impl Default for FftState {
         Self {
             selected_channel: 0,
             fft_size: 1024,
-            enabled: false,
             spectrum: Vec::new(),
+            smoothed_db: Vec::new(),
+            smoothing: true,
+            y_bounds: None,
             log_scale: true,
             freq_min: 1.0,
             freq_max: 5000.0,
         }
+    }
+}
+
+/// Smoothing factor for the per-bin EMA of the PSD (higher = more responsive).
+const SMOOTH_ALPHA: f64 = 0.3;
+/// Easing factor for shrinking the Y-axis bounds (peaks expand instantly).
+const Y_BOUNDS_EASE: f64 = 0.05;
+
+impl FftState {
+    /// Recompute the PSD for the selected channel from the display ring,
+    /// updating the smoothed curve and eased Y bounds. Called once per frame
+    /// while an FFT view is open.
+    pub fn update_from_ring(&mut self, ring: &DisplayRing, sample_rate: f64) {
+        if !ring.ready {
+            return;
+        }
+        let raw = compute_spectrum(ring, self.selected_channel, self.fft_size, sample_rate);
+
+        // Per-bin temporal EMA. Reset whenever the bin count changes (e.g. the
+        // user picked a different FFT size).
+        if self.smoothing && self.smoothed_db.len() == raw.len() && !raw.is_empty() {
+            for (s, p) in self.smoothed_db.iter_mut().zip(raw.iter()) {
+                *s = *s * (1.0 - SMOOTH_ALPHA) + p[1] * SMOOTH_ALPHA;
+            }
+        } else {
+            self.smoothed_db = raw.iter().map(|p| p[1]).collect();
+        }
+        self.spectrum = raw;
+
+        self.update_y_bounds();
+    }
+
+    /// The PSD magnitudes (dB) to plot, honoring the smoothing toggle.
+    fn display_db(&self) -> &[f64] {
+        &self.smoothed_db
+    }
+
+    /// Recompute eased Y bounds from the visible portion of the curve.
+    fn update_y_bounds(&mut self) {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for (p, &db) in self.spectrum.iter().zip(self.smoothed_db.iter()) {
+            if p[0] >= self.freq_min && p[0] <= self.freq_max {
+                lo = lo.min(db);
+                hi = hi.max(db);
+            }
+        }
+        if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            return;
+        }
+        let pad = ((hi - lo) * 0.1).max(1.0);
+        let (target_lo, target_hi) = (lo - pad, hi + pad);
+        self.y_bounds = Some(match self.y_bounds {
+            // Expand instantly to keep peaks visible; contract slowly to avoid jitter.
+            Some((cur_lo, cur_hi)) => {
+                let nlo = if target_lo < cur_lo {
+                    target_lo
+                } else {
+                    cur_lo + (target_lo - cur_lo) * Y_BOUNDS_EASE
+                };
+                let nhi = if target_hi > cur_hi {
+                    target_hi
+                } else {
+                    cur_hi + (target_hi - cur_hi) * Y_BOUNDS_EASE
+                };
+                (nlo, nhi)
+            }
+            None => (target_lo, target_hi),
+        });
     }
 }
 
@@ -166,11 +245,13 @@ fn fft_radix2(real: &mut [f64], imag: &mut [f64]) {
     }
 }
 
-/// Draw the FFT panel section in the left sidebar.
+/// Draw the FFT settings section in the left sidebar.
+///
+/// This is purely a set of controls for the "FFT Spectrum" view; it performs
+/// no computation. Open the view from `Add view ▸ FFT Spectrum` (#4a).
 pub fn draw_fft_section(
     ui: &mut egui::Ui,
     state: &mut FftState,
-    ring: &DisplayRing,
     sample_rate: f64,
     total_channels: usize,
 ) {
@@ -182,13 +263,12 @@ pub fn draw_fft_section(
     )
     .default_open(false)
     .show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut state.enabled, egui::RichText::new("Enable").size(10.0));
-        });
-
-        if !state.enabled {
-            return;
-        }
+        ui.label(
+            egui::RichText::new("Controls the FFT Spectrum view (Add view ▸ FFT Spectrum).")
+                .size(9.0)
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(2.0);
 
         // Channel selector
         ui.horizontal(|ui| {
@@ -251,42 +331,55 @@ pub fn draw_fft_section(
             &mut state.log_scale,
             egui::RichText::new("Log scale (dB)").size(10.0),
         );
-
-        // Compute spectrum
-        if ring.ready {
-            state.spectrum =
-                compute_spectrum(ring, state.selected_channel, state.fft_size, sample_rate);
-        }
+        ui.checkbox(
+            &mut state.smoothing,
+            egui::RichText::new("Smoothing").size(10.0),
+        )
+        .on_hover_text("Temporally average the spectrum to reduce flicker");
     });
 }
 
 /// Draw the FFT spectrum plot in the central area.
 pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
-    if !state.enabled || state.spectrum.is_empty() {
+    if state.spectrum.is_empty() {
+        ui.centered_and_justified(|ui| {
+            ui.label(
+                egui::RichText::new("Waiting for data…")
+                    .size(11.0)
+                    .color(theme::TEXT_DIM),
+            );
+        });
         return;
     }
 
-    // Filter to display range.
+    // Filter to display range, using the (optionally smoothed) magnitudes.
+    let db = state.display_db();
     let points: Vec<[f64; 2]> = state
         .spectrum
         .iter()
-        .filter(|p| p[0] >= state.freq_min && p[0] <= state.freq_max)
-        .copied()
+        .zip(db.iter())
+        .filter(|(p, _)| p[0] >= state.freq_min && p[0] <= state.freq_max)
+        .map(|(p, &y)| [p[0], y])
         .collect();
 
     if points.is_empty() {
         return;
     }
 
+    // Use the eased Y bounds so the curve doesn't jitter as the level changes.
+    let (y_lo, y_hi) = state
+        .y_bounds
+        .unwrap_or((points[0][1] - 10.0, points[0][1] + 10.0));
+
     let plot = Plot::new("fft_spectrum")
         .height(ui.available_height().min(200.0))
         .width(ui.available_width())
         .show_axes([true, true])
         .show_grid(true)
-        .allow_drag(true)
-        .allow_zoom(true)
+        .allow_drag(false)
+        .allow_zoom(false)
         .allow_scroll(false)
-        .auto_bounds(egui::Vec2b::new(true, true))
+        .auto_bounds(egui::Vec2b::new(false, false))
         .x_axis_label("Frequency (Hz)")
         .y_axis_label(if state.log_scale {
             "Power (dB)"
@@ -299,18 +392,26 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
     let color = theme::channel_color(ch);
 
     plot.show(ui, |plot_ui| {
+        plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+            [state.freq_min, y_lo],
+            [state.freq_max, y_hi],
+        ));
+
+        // PSD curve with a translucent fill down to the bottom of the plot.
         plot_ui.line(
             Line::new(PlotPoints::from(points))
                 .color(color)
                 .width(1.5)
+                .fill(y_lo as f32)
+                .fill_alpha(0.12)
                 .name(format!("CH{ch} PSD")),
         );
 
-        // Draw notable frequency markers
+        // Draw notable frequency markers (mains hum) spanning the visible band.
         for &freq in &[50.0, 60.0] {
             if freq >= state.freq_min && freq <= state.freq_max {
                 plot_ui.line(
-                    Line::new(PlotPoints::from(vec![[freq, -200.0], [freq, 100.0]]))
+                    Line::new(PlotPoints::from(vec![[freq, y_lo], [freq, y_hi]]))
                         .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
                         .width(0.8)
                         .style(egui_plot::LineStyle::dashed_dense())
@@ -320,10 +421,10 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         }
 
         // Nyquist marker
-        let nyquist = sample_rate / 2.0;
+        let nyquist = sample_rate / RING_DWNSP as f64 / 2.0;
         if nyquist >= state.freq_min && nyquist <= state.freq_max {
             plot_ui.line(
-                Line::new(PlotPoints::from(vec![[nyquist, -200.0], [nyquist, 100.0]]))
+                Line::new(PlotPoints::from(vec![[nyquist, y_lo], [nyquist, y_hi]]))
                     .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
                     .width(0.8)
                     .style(egui_plot::LineStyle::dashed_dense())

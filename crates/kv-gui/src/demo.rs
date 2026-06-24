@@ -128,6 +128,19 @@ impl DemoGenerator {
         }
 
         let timestamp_start = self.global_sample;
+
+        // Synthesize a demo TTL gate on bit 0: a ~1 s-high / 1 s-low square
+        // wave so the TTL monitor and gated recording can be exercised without
+        // hardware. Per-sample resolution keeps the displayed edges crisp.
+        let half_period = sr.max(1.0) as u64; // 1 second per half-cycle
+        let ttl_per_sample: Vec<u32> = (0..spc)
+            .map(|s| {
+                let gs = timestamp_start + s as u64;
+                u32::from((gs / half_period).is_multiple_of(2))
+            })
+            .collect();
+        let ttl_last = ttl_per_sample.last().copied().unwrap_or(0);
+
         self.global_sample = self.global_sample.saturating_add(spc as u64);
         let pid = self.packet_id;
         self.packet_id = self.packet_id.saturating_add(1);
@@ -141,10 +154,10 @@ impl DemoGenerator {
             channel_count: ch_count,
             samples_per_channel: spc,
             data,
-            ttl_bits: 0,
+            ttl_bits: ttl_last,
             aux_data: None,
             board_adc_data: None,
-            ttl_in_per_sample: None,
+            ttl_in_per_sample: Some(ttl_per_sample),
             ttl_out_per_sample: None,
         }
     }

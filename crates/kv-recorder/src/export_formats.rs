@@ -16,9 +16,16 @@ use crate::{RecorderError, escape_json_string};
 
 // ── Export format enum ──────────────────────────────────────────────
 
-/// Supported export formats.
+/// Supported data formats.
+///
+/// `KeyvastNative` is the application's own on-disk format (the same `.kvraw`
+/// recordings are written in) and is the default — recordings are always
+/// captured natively in this format.  The remaining variants are optional
+/// conversions to third-party formats.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
+    /// Keyvast native `.kvraw` — raw i16 + sidecar metadata (no conversion).
+    KeyvastNative,
     /// Intan .rhd format (v2.0 header + amplifier data block).
     IntanRhd,
     /// Flat binary with companion metadata JSON (SpikeGLX-compatible).
@@ -28,6 +35,7 @@ pub enum ExportFormat {
 impl ExportFormat {
     pub fn label(self) -> &'static str {
         match self {
+            Self::KeyvastNative => "Keyvast (.kvraw) — native",
             Self::IntanRhd => "Intan .rhd",
             Self::FlatBinary => "Flat Binary (.bin + .meta.json)",
         }
@@ -35,9 +43,15 @@ impl ExportFormat {
 
     pub fn extension(self) -> &'static str {
         match self {
+            Self::KeyvastNative => "kvraw",
             Self::IntanRhd => "rhd",
             Self::FlatBinary => "bin",
         }
+    }
+
+    /// Whether this is the native Keyvast format (no conversion needed).
+    pub fn is_native(self) -> bool {
+        matches!(self, Self::KeyvastNative)
     }
 }
 

@@ -496,3 +496,77 @@ fn kvraw_reader_round_trips_streaming_data() {
 
     cleanup_dir(&output_dir);
 }
+
+// ---------- M34: StreamingRecorder consistency tests ----------
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_sample_rate() {
+    let output_dir = unique_output_dir("streaming-bad-sr");
+    let mut blocks = next_simulator_blocks(2);
+    blocks[1].sample_rate = 15_000.0;
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent sample_rate should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "sample_rate",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_channel_count() {
+    let output_dir = unique_output_dir("streaming-bad-ch");
+    let mut blocks = next_simulator_blocks(2);
+    blocks[1].channel_count = 32;
+    blocks[1].data = vec![0; 32 * blocks[1].samples_per_channel];
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent channel_count should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "channel_count",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
+    let output_dir = unique_output_dir("streaming-bad-spc");
+    let mut blocks = next_simulator_blocks(2);
+    let orig_ch = blocks[1].channel_count;
+    blocks[1].samples_per_channel *= 2;
+    blocks[1].data = vec![0; orig_ch * blocks[1].samples_per_channel];
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent samples_per_channel should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "samples_per_channel",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
+}

@@ -20,7 +20,60 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
+Last updated: 2026-06-14 (RHD cold-start signal bug fixed + chip auto-detect; verified on hardware)
+
+### Session 28: Fix half-scale RHD signal (headstage power timing) + chip auto-detect
+
+Hardware-debugged against a live XEM7310 + RHD2132 (32ch) headstage on Windows.
+
+**Root cause (the "signal is wrong / stuck at 0x4000" symptom).** The KeyVast
+FPGA is the stock Intan 7310 Rhythm data plane, but headstage power is brought
+up by the control-plane MicroBlaze over I2C *after* ConfigureFPGA (eFuse ->
+module DCDC -> per-module isolated power; see `keyvast-fpga-demo .../sw/src/
+power_seq.c`), taking ~0.6 s and otherwise retried on a ~6 s cadence. The host
+(`kv-rhd RhythmFrontPanelBoard::configure`) ran reset + the port/MISO-delay scan
+*immediately* after config, before the rails were up, so the scan saw idle MISO
+(0xFFFF), found no chip, and silently fell back to Port A / delay 0 — a MISO
+phase one SPI bit early, which right-shifts the 16-bit amplifier word: baseline
+0x4000 instead of 0x8000 and half-amplitude signal. (Re-configuring without a
+power-cycle masked it: the external power chips keep their state, so a 2nd
+config found the chip — but still at delay 0 -> 0x4000.)
+
+**Fixes (`crates/kv-rhd/src/backend.rs`, `protocol.rs`):**
+1. After ConfigureFPGA, wait `HEADSTAGE_POWER_SETTLE_MS` (1200 ms) before the
+   scan, then retry the whole scan up to `SCAN_MAX_ATTEMPTS` (6) x `SCAN_RETRY_MS`
+   (600 ms) until a chip answers. `scan_ports_for_headstage` now returns whether
+   a chip was found so the caller controls the retry/fallback.
+2. Chip auto-detect: the scan reads register-63 (chip ID) via `probe_chip_id`;
+   `initialize_rhd_chips` maps it through `RhdChipType` (1=RHD2132/32ch,
+   2=RHD2216/16ch, 4=RHD2164/64ch -> 2 streams) to the actual data-stream count,
+   narrows the FPGA stream-enable mask + parser channel count accordingly, and
+   `RhdHardwareBackend::open` overrides the requested stream count with the
+   detected one. `RhdChipType::from_register63` was wrong (it bit-shifted; the
+   reg-63 value is the literal Intan chip ID, per Open Ephys `getDeviceId`) and
+   is now fixed.
+3. Diagnostics: `kv-cli` (bin `kv-acq`) now initialises `env_logger`; the scan
+   logs per-delay `has_id / chip_id / railed / amp_mean_raw` for responding
+   delays (helpers `amplifier_mean_raw_word`, `probe_chip_id`).
+
+**Verified on hardware (kv-acq rhd-smoke, keyvast_combined_download.bit):**
+- Cold/with-settle scan now locks Port A, chip-ID-verified delays 4-7 (chose 6),
+  `chip_id=Some(1)`=RHD2132; baseline raw ~0x8000 (was 0x4000); per-channel std
+  ~1200-2600 cnt (was halved).
+- `--streams 2` is auto-overridden to 1 stream / 32 channels; recording.json
+  channel_count=32.
+- `cargo test --workspace --exclude kv-gui` all pass; `cargo clippy -p kv-rhd
+  --target x86_64-pc-windows-msvc` clean.
+
+**Op note (hardware):** re-running ConfigureFPGA without a power-cycle leaves the
+headstage rails latched; for a clean test, power-cycle the rig, then run once.
+
+**Next / not yet done:** (a) confirm on a true cold power-cycle (all dev runs were
+warm re-configs, which still exercise the power-settle+retry); (b) GUI smoke test
+that the live view now shows 32ch at the correct baseline; (c) port B..H data-
+source mapping in `set_default_data_sources` is unverified (only Port A tested);
+(d) RHD2216 reports 1 stream = 32 parsed ch with only 16 valid (no 16ch offset
+handling yet).
 
 ### Session 27: Feature triage — remove probe map + per-channel stats
 

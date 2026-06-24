@@ -41,10 +41,14 @@ fn default_registers_match_open_ephys_rhd_30khz_settings() {
         })
         .collect::<Vec<_>>();
 
+    // RH1/RH2 DAC registers (8,10) encode the upper-bandwidth corner. The Open
+    // Ephys RHD plugin reference recording uses HighCut=7500 Hz (settings.xml),
+    // which the Intan resistor fit maps to rh1_dac1=22, rh2_dac1=23. (A 10 kHz
+    // corner would give 17/16 — that was the prior, non-matching value.)
     assert_eq!(
         values,
         vec![
-            222, 66, 4, 2, 156, 64, 128, 0, 17, 128, 16, 128, 44, 134, 255, 255, 255, 255, 255,
+            222, 66, 4, 2, 156, 64, 128, 0, 22, 128, 23, 128, 44, 134, 255, 255, 255, 255, 255,
             255, 255, 255,
         ]
     );

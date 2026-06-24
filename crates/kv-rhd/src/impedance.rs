@@ -64,8 +64,7 @@ impl ImpedanceTestConfig {
 
     /// Total samples needed for the measurement (num_periods complete cycles).
     pub fn total_samples(&self) -> usize {
-        self.samples_per_period()
-            .saturating_mul(self.num_periods)
+        self.samples_per_period().saturating_mul(self.num_periods)
     }
 }
 
@@ -93,13 +92,13 @@ impl ImpedanceResult {
     /// RGBA color for the impedance magnitude (green→yellow→red→gray).
     pub fn quality_color(magnitude: f64) -> [u8; 4] {
         if magnitude < 100_000.0 {
-            [0, 200, 0, 255]       // green
+            [0, 200, 0, 255] // green
         } else if magnitude < 500_000.0 {
-            [200, 200, 0, 255]     // yellow
+            [200, 200, 0, 255] // yellow
         } else if magnitude < 5_000_000.0 {
-            [220, 80, 0, 255]      // orange/red
+            [220, 80, 0, 255] // orange/red
         } else {
-            [180, 0, 0, 255]       // dark red
+            [180, 0, 0, 255] // dark red
         }
     }
 }
@@ -143,7 +142,7 @@ pub fn compute_impedance(
     let mut sum_cos = 0.0_f64;
     let mut sum_sin = 0.0_f64;
     for (i, &sample) in data.iter().enumerate() {
-        let microvolts = sample as f64 * 0.195; // RHD µV/count
+        let microvolts = sample as f64 * crate::protocol::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
         let phase = two_pi * frequency * (i as f64) / sample_rate;
         sum_cos += microvolts * phase.cos();
         sum_sin += microvolts * phase.sin();
@@ -231,7 +230,8 @@ mod tests {
         let freq = 1000.0;
         let n = 600; // 20 periods at 30 samples/period
         let amplitude_uv = 50.0; // 50 µV peak
-        let amplitude_counts = amplitude_uv / 0.195;
+        let amplitude_counts =
+            amplitude_uv / crate::protocol::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
         let data: Vec<i16> = (0..n)
             .map(|i| {
                 let phase = 2.0 * std::f64::consts::PI * freq * (i as f64) / sample_rate;
@@ -240,7 +240,10 @@ mod tests {
             .collect();
 
         let (mag, _phase) = compute_impedance(&data, sample_rate, freq, ZcheckScale::Cs1pF);
-        assert!(mag.is_finite() && mag > 0.0, "expected finite impedance, got {mag}");
+        assert!(
+            mag.is_finite() && mag > 0.0,
+            "expected finite impedance, got {mag}"
+        );
     }
 
     #[test]

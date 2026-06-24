@@ -25,6 +25,12 @@ pub const RHD_VDD_VOLTS_PER_COUNT: f64 = 0.0000748;
 #[allow(dead_code)] // hardware bring-up reference
 pub const RHD_AUX_ADC_VOLTS_PER_COUNT: f64 = 0.0000374;
 
+/// Default device-ID string for Opal Kelly XEM7310 + Rhythm FPGA.
+pub const DEFAULT_RHD_DEVICE_ID: &str = "rhd-xem7310";
+
+/// Default SPI cable length in meters (3 ft ≈ 0.9144 m).
+pub const DEFAULT_CABLE_LENGTH_METERS: f64 = 0.9144;
+
 /// RHD2132 16-channel headstage: amplifier channels are offset by this
 /// many channels from channel 0. The chip only populates the upper 16
 /// of its 32 logical amplifier channels.
@@ -182,13 +188,7 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    Ok(
-        4 + 2
-            + enabled_streams * (CHANNELS_PER_STREAM + 3)
-            + (enabled_streams % 4)
-            + 8
-            + 2,
-    )
+    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2)
 }
 
 pub fn bytes_per_block(
@@ -209,4 +209,3 @@ pub fn raw_word_to_signed_count(word: u16) -> i16 {
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
 }
-

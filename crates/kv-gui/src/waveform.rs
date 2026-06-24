@@ -27,7 +27,7 @@ use crate::theme;
 /// ±32767 counts at 0.195 µV/count → ±6389.6 µV. Display normalization
 /// divides by i16::MAX, so a normalized value of 1.0 corresponds to this
 /// many microvolts.
-const RHD_FULL_SCALE_UV: f64 = 32_767.0 * 0.195;
+const RHD_FULL_SCALE_UV: f64 = 32_767.0 * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
 
 /// Maximum rendered points per channel.
 /// SpikeGLX uses ~2× screen width; for a 1920-wide display that is ~3840.
@@ -105,7 +105,9 @@ pub fn draw_waveform_area(
     let total_channels = block.channel_count;
     // Clamp start_ch so we never go past the last channel.
     let start_ch = start_ch.min(total_channels.saturating_sub(1));
-    let visible = settings.visible_channels.min(total_channels.saturating_sub(start_ch));
+    let visible = settings
+        .visible_channels
+        .min(total_channels.saturating_sub(start_ch));
     if visible == 0 {
         draw_empty_state(ui, empty_hint);
         return;
@@ -137,8 +139,16 @@ pub fn draw_waveform_area(
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
     let traces = collect_from_ring(
-        ring, settings, filters, start_ch, visible,
-        block.sample_rate, x_left, x_right, gain, ch_spacing,
+        ring,
+        settings,
+        filters,
+        start_ch,
+        visible,
+        block.sample_rate,
+        x_left,
+        x_right,
+        gain,
+        ch_spacing,
     );
 
     // Y axis bounds
@@ -292,13 +302,10 @@ pub fn draw_waveform_area(
                 }
                 let y_off = -(disp_pos as f64) * ch_spacing;
                 plot_ui.line(
-                    Line::new(PlotPoints::from(vec![
-                        [x_left, y_off],
-                        [x_right, y_off],
-                    ]))
-                    .color(theme::GRID_ZERO_LINE)
-                    .width(0.5)
-                    .name(""),
+                    Line::new(PlotPoints::from(vec![[x_left, y_off], [x_right, y_off]]))
+                        .color(theme::GRID_ZERO_LINE)
+                        .width(0.5)
+                        .name(""),
                 );
             }
         }
@@ -328,7 +335,8 @@ pub fn draw_waveform_area(
         // region) plus a brighter cursor line make the wrap read as a moving
         // write-head instead of a momentary blank.
         if matches!(settings.display_mode, crate::panels::DisplayMode::Sweep)
-            && cursor_ms > x_left && cursor_ms < x_right
+            && cursor_ms > x_left
+            && cursor_ms < x_right
         {
             let trail = (x_right - x_left) * 0.04;
             let trail_left = (cursor_ms - trail).max(x_left);
@@ -431,11 +439,7 @@ pub fn draw_waveform_area(
                 egui::pos2(frame.left() + 2.0, screen.y - 3.0),
                 egui::vec2(5.0, 6.0),
             );
-            painter.rect_filled(
-                chip,
-                egui::CornerRadius::same(1),
-                brighten_color(base, 1.3),
-            );
+            painter.rect_filled(chip, egui::CornerRadius::same(1), brighten_color(base, 1.3));
         }
     }
 
@@ -443,7 +447,7 @@ pub fn draw_waveform_area(
     // never covers the waveform under the cursor.
     if response.response.hovered()
         && let Some(hovered_ch) = response.inner
-            && let Some(ptr_pos) = response.response.hover_pos()
+        && let Some(ptr_pos) = response.response.hover_pos()
     {
         let plot_val = response.transform.value_from_position(ptr_pos);
         let time_at_cursor = plot_val.x;
@@ -464,9 +468,11 @@ pub fn draw_waveform_area(
             format!("{:+.1} µV", amp_uv)
         };
 
-        let tip = format!("{}  {}",
+        let tip = format!(
+            "{}  {}",
             format_time_tooltip(hovered_ch, time_at_cursor),
-            amp_str);
+            amp_str
+        );
         let plot_rect = response.response.rect;
         let painter = ui.painter();
 
@@ -575,12 +581,18 @@ fn draw_scale_bar(
     );
     // Top tick
     painter.line_segment(
-        [egui::pos2(bar_x - tick_w, bar_top), egui::pos2(bar_x + tick_w, bar_top)],
+        [
+            egui::pos2(bar_x - tick_w, bar_top),
+            egui::pos2(bar_x + tick_w, bar_top),
+        ],
         stroke,
     );
     // Bottom tick
     painter.line_segment(
-        [egui::pos2(bar_x - tick_w, bar_bottom), egui::pos2(bar_x + tick_w, bar_bottom)],
+        [
+            egui::pos2(bar_x - tick_w, bar_bottom),
+            egui::pos2(bar_x + tick_w, bar_bottom),
+        ],
         stroke,
     );
 
@@ -656,8 +668,7 @@ fn collect_from_ring(
     // filled portion, otherwise stride2 grows during a sweep and early data
     // appears progressively coarser (the "stretch/zoom" visual artifact).
     let ms_per_ring = ring.dwnsp as f64 * 1000.0 / ring.sample_rate.max(1.0);
-    let window_ring_entries =
-        ((t_right_ms - t_left_ms) / ms_per_ring).ceil() as usize + 1;
+    let window_ring_entries = ((t_right_ms - t_left_ms) / ms_per_ring).ceil() as usize + 1;
 
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
 
@@ -671,14 +682,17 @@ fn collect_from_ring(
 
         // Read display-ready points from the ring using the PHYSICAL channel index.
         let mut pts = ring.collect_channel(
-            phys_ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries,
+            phys_ch,
+            t_left_ms,
+            t_right_ms,
+            MAX_DISPLAY_POINTS,
+            window_ring_entries,
         );
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
         let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
             let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-            let var =
-                pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
+            let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
             let sig = var.sqrt();
             let thresh = -filters.spike_threshold_sigma * sig;
             let refractory = (sample_rate * 0.001).max(1.0) as usize;

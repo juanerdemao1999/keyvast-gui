@@ -112,6 +112,10 @@ fn process_cpu_times() -> Option<(u64, u64)> {
         dwHighDateTime: 0,
     };
 
+    // SAFETY: GetCurrentProcess() returns a pseudo-handle that is always valid
+    // for the lifetime of the process. The four FILETIME pointers are live,
+    // properly aligned stack locals that outlive this call. GetProcessTimes
+    // only writes to these pointers and does not retain them.
     let ok = unsafe {
         GetProcessTimes(
             GetCurrentProcess(),
@@ -136,9 +140,16 @@ fn peak_working_set_mb() -> Option<f64> {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
+    // SAFETY: PROCESS_MEMORY_COUNTERS is a plain-old-data struct with no
+    // padding invariants; zeroing yields a valid (empty) instance. We
+    // immediately set `cb` to the correct struct size before use.
     let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
     counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
 
+    // SAFETY: GetCurrentProcess() returns a pseudo-handle valid for the
+    // process lifetime. `counters` is a live, properly-sized stack local;
+    // we pass its exact byte size via the third parameter. The function
+    // only writes into the buffer and does not retain the pointer.
     let ok = unsafe {
         GetProcessMemoryInfo(
             GetCurrentProcess(),

@@ -594,6 +594,7 @@ pub struct StreamingRecorder {
     channel_count: Option<usize>,
     samples_per_packet: Option<usize>,
     write_latencies_us: Vec<u64>,
+    max_write_latency_us: u64,
 }
 
 impl StreamingRecorder {
@@ -642,6 +643,7 @@ impl StreamingRecorder {
             channel_count: None,
             samples_per_packet: None,
             write_latencies_us: Vec::new(),
+            max_write_latency_us: 0,
         })
     }
 
@@ -676,6 +678,17 @@ impl StreamingRecorder {
             })?;
 
         let elapsed_us = start.elapsed().as_micros() as u64;
+        if elapsed_us > self.max_write_latency_us {
+            self.max_write_latency_us = elapsed_us;
+        }
+        // Cap the latencies vector to prevent unbounded memory growth during
+        // long recordings. Keep the most recent samples for distribution stats.
+        const MAX_LATENCY_SAMPLES: usize = 65_536;
+        if self.write_latencies_us.len() >= MAX_LATENCY_SAMPLES {
+            // Evict the oldest half to amortize the cost of compaction.
+            let half = MAX_LATENCY_SAMPLES / 2;
+            self.write_latencies_us.drain(..half);
+        }
         self.write_latencies_us.push(elapsed_us);
 
         let sample_values = block.data.len() as u64;
@@ -746,7 +759,11 @@ impl StreamingRecorder {
             source,
         })?;
 
-        let max_write_latency_us = self.write_latencies_us.iter().copied().max();
+        let max_write_latency_us = if self.max_write_latency_us > 0 {
+            Some(self.max_write_latency_us)
+        } else {
+            None
+        };
         let latency_distribution = LatencyDistribution::from_samples(&self.write_latencies_us);
 
         Ok(StreamingRecordingSummary {

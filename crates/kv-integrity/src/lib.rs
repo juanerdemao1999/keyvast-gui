@@ -84,8 +84,13 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
             .saturating_add(block.data.len() as u64);
 
         if let Some(previous) = previous_block {
-            check_packet_continuity(previous, block, &mut report)?;
-            check_timestamp_continuity(previous, block, &mut report);
+            let contiguous = check_packet_continuity(previous, block, &mut report)?;
+            // Only check timestamp continuity when packets are contiguous;
+            // a gap naturally causes a timestamp jump that is not a real
+            // discontinuity (M16).
+            if contiguous {
+                check_timestamp_continuity(previous, block, &mut report);
+            }
         }
 
         previous_block = Some(block);
@@ -119,11 +124,14 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
     Ok(report)
 }
 
+/// Returns `Ok(true)` when packets are contiguous (no gap), `Ok(false)` when
+/// a gap was detected (so the caller can skip the timestamp-continuity check),
+/// and `Err` if packet IDs went backwards.
 fn check_packet_continuity(
     previous: &SampleBlock,
     current: &SampleBlock,
     report: &mut IntegrityReport,
-) -> Result<(), IntegrityError> {
+) -> Result<bool, IntegrityError> {
     let expected_packet_id = previous.packet_id.saturating_add(1);
 
     if current.packet_id < expected_packet_id {
@@ -142,9 +150,10 @@ fn check_packet_continuity(
             observed_packet_id: current.packet_id,
             missing_count,
         });
+        return Ok(false);
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn check_timestamp_continuity(
@@ -211,6 +220,7 @@ impl IncrementalIntegrity {
             .written_samples
             .saturating_add(block.data.len() as u64);
 
+        let mut had_gap = false;
         if let Some(previous_id) = self.previous_packet_id {
             let expected_packet_id = previous_id.saturating_add(1);
 
@@ -222,6 +232,7 @@ impl IncrementalIntegrity {
             }
 
             if block.packet_id > expected_packet_id {
+                had_gap = true;
                 let missing_count = block.packet_id.saturating_sub(expected_packet_id);
                 self.report.summary.missing_packets = self
                     .report
@@ -247,7 +258,10 @@ impl IncrementalIntegrity {
             }
         }
 
-        if let Some(expected_timestamp) = self.previous_timestamp_after_block
+        // Only check timestamp continuity when packets are contiguous;
+        // a packet gap naturally causes a timestamp jump (M16).
+        if !had_gap
+            && let Some(expected_timestamp) = self.previous_timestamp_after_block
             && block.timestamp_start != expected_timestamp
         {
             self.report.summary.timestamp_discontinuities = self

@@ -150,6 +150,9 @@ impl PlaybackManager {
         let meta = self.metadata.as_ref()?;
         self.reader.as_ref()?;
         let sample_rate = meta.sample_rate;
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return None;
+        }
         let total_frames = meta.total_frames();
         let samples_per_channel = meta.samples_per_channel;
 

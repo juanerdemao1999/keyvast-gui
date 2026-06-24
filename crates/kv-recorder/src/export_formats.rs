@@ -351,7 +351,7 @@ impl FlatBinaryStreamWriter {
             self.channel_count,
             self.total_samples,
             total_time_s,
-            self.notes.replace('"', "\\\""),
+            self.notes.replace('\\', "\\\\").replace('"', "\\\""),
         );
         fs::write(&meta_path, meta).map_err(|source| RecorderError::Io {
             path: meta_path.clone(),
@@ -547,7 +547,7 @@ pub fn export_flat_binary(
         channel_count,
         total_samples,
         total_time_s,
-        notes.replace('"', "\\\""),
+        notes.replace('\\', "\\\\").replace('"', "\\\""),
     );
     fs::write(&meta_path, meta).map_err(|source| RecorderError::Io {
         path: meta_path.clone(),

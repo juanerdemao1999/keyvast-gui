@@ -62,26 +62,31 @@ pub fn compute_spectrum(
         return Vec::new();
     }
 
-    // Apply Hann window.
+    // Apply Hann window and accumulate window power for normalization.
     let n = fft_size;
     let mut real = Vec::with_capacity(n);
     let mut imag = vec![0.0_f64; n];
     let pi2_over_n = 2.0 * std::f64::consts::PI / n as f64;
+    let mut window_power_sum = 0.0_f64;
     for (i, &sample) in raw.iter().enumerate().take(n) {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
+        window_power_sum += w * w;
         real.push(sample * w);
     }
 
     // In-place radix-2 FFT.
     fft_radix2(&mut real, &mut imag);
 
-    // Compute one-sided PSD in dB (µV²/Hz).
+    // Compute one-sided PSD in dB (µV²/Hz), normalized by the window power
+    // sum (Hann S2 ≈ 0.375·N) so the spectrum level is independent of
+    // window choice.
     let bin_width = sample_rate / n as f64;
+    let norm = window_power_sum * sample_rate;
     let n_bins = n / 2 + 1;
     let mut spectrum = Vec::with_capacity(n_bins);
     for k in 0..n_bins {
         let freq = k as f64 * bin_width;
-        let power = (real[k] * real[k] + imag[k] * imag[k]) / (n as f64 * sample_rate);
+        let power = (real[k] * real[k] + imag[k] * imag[k]) / norm;
         // Double one-sided bins (except DC and Nyquist).
         let power = if k > 0 && k < n / 2 {
             power * 2.0

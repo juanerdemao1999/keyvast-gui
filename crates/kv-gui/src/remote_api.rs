@@ -21,7 +21,7 @@
 //! - `ping` — Returns "pong" (connectivity check)
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -251,7 +251,14 @@ fn handle_client(
         }
 
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        // Limit read to 64 KiB per line to prevent unbounded allocation
+        // from a misbehaving or malicious client.
+        const MAX_LINE_BYTES: usize = 65_536;
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64)
+            .read_line(&mut line)
+        {
             Ok(0) => break, // connection closed
             Ok(_) => {
                 if let Some((id, cmd)) = parse_jsonrpc_request(&line) {

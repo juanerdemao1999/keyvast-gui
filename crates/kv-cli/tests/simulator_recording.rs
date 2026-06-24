@@ -581,6 +581,7 @@ fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
         bitfile_path: PathBuf::from("unused.bit"),
         frontpanel_dll_path: None,
         serial: None,
+        cable_length_meters: 0.9144,
     })
     .expect("raw RHD smoke should parse");
 

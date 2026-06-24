@@ -123,7 +123,10 @@ pub struct SimulatorStreamResult {
     pub max_write_latency_us: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Default SPI cable length in meters (3 ft ≈ 0.9144 m).
+const DEFAULT_CABLE_LENGTH_METERS: f64 = 0.9144;
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct RhdSmokeOptions {
     pub output_dir: PathBuf,
     pub blocks: usize,
@@ -132,6 +135,8 @@ pub struct RhdSmokeOptions {
     pub bitfile_path: PathBuf,
     pub frontpanel_dll_path: Option<PathBuf>,
     pub serial: Option<String>,
+    /// SPI cable length in meters (default: 0.9144 m / 3 ft).
+    pub cable_length_meters: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -609,7 +614,7 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             frontpanel_dll_path: options.frontpanel_dll_path.clone(),
             serial: options.serial.clone(),
             data: data_config.clone(),
-            cable_length_meters: 0.9144,
+            cable_length_meters: options.cable_length_meters,
         })?;
 
         run_fixed_blocks(&device_config, options.blocks, &mut || backend.read_block())?
@@ -1181,6 +1186,7 @@ fn parse_rhd_smoke_args(args: impl Iterator<Item = String>) -> Result<CliCommand
     let mut frontpanel_dll_path: Option<PathBuf> = None;
     let mut serial: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut cable_length_meters = DEFAULT_CABLE_LENGTH_METERS;
     let mut args = args.peekable();
 
     while let Some(argument) = args.next() {
@@ -1208,6 +1214,14 @@ fn parse_rhd_smoke_args(args: impl Iterator<Item = String>) -> Result<CliCommand
             "--serial" => {
                 serial = Some(next_value(&mut args, "--serial")?);
             }
+            "--cable-length" => {
+                let value = next_value(&mut args, "--cable-length")?;
+                cable_length_meters =
+                    value.parse::<f64>().map_err(|_| CliError::InvalidNumber {
+                        flag: "--cable-length",
+                        value,
+                    })?;
+            }
             "--output" => {
                 let value = next_value(&mut args, "--output")?;
                 output_dir = Some(PathBuf::from(value));
@@ -1229,6 +1243,7 @@ fn parse_rhd_smoke_args(args: impl Iterator<Item = String>) -> Result<CliCommand
         bitfile_path,
         frontpanel_dll_path,
         serial,
+        cable_length_meters,
     }))
 }
 
@@ -1342,5 +1357,41 @@ struct SimulatorReadError(SimulatorError);
 impl fmt::Display for SimulatorReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}", self.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_date_unix_epoch() {
+        assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_date_known_dates() {
+        // 2024-01-01 = day 19723
+        assert_eq!(civil_date_from_unix_days(19723), (2024, 1, 1));
+        // 2000-03-01 = day 11017
+        assert_eq!(civil_date_from_unix_days(11017), (2000, 3, 1));
+    }
+
+    #[test]
+    fn civil_date_negative_days() {
+        // 1969-12-31 = day -1
+        assert_eq!(civil_date_from_unix_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn preset_conflicts_with_duration() {
+        let args = vec![
+            "--preset".to_string(),
+            "quick".to_string(),
+            "--duration".to_string(),
+            "10".to_string(),
+        ];
+        let result = parse_benchmark_args(args.into_iter());
+        assert!(result.is_err());
     }
 }

@@ -8,6 +8,7 @@ pub const DEFAULT_CHANNEL_COUNT: usize = 64;
 pub const DEFAULT_SAMPLES_PER_PACKET: usize = 64;
 pub const DEFAULT_TTL_LINE_COUNT: usize = 16;
 
+/// Hardware backend type for an acquisition device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceBackendKind {
     Simulator,
@@ -16,6 +17,7 @@ pub enum DeviceBackendKind {
     Pcie,
 }
 
+/// Static configuration describing a connected acquisition device.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceConfig {
     pub device_id: String,
@@ -43,6 +45,9 @@ impl DeviceConfig {
     }
 }
 
+/// A single contiguous block of multi-channel sample data produced by an
+/// acquisition source.  All amplifier samples are interleaved as
+/// `data[sample * channel_count + channel]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleBlock {
     pub device_id: String,
@@ -134,6 +139,7 @@ impl SampleBlock {
     }
 }
 
+/// Validation errors for [`SampleBlock`] invariants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SampleBlockError {
     EmptyBlock,
@@ -179,6 +185,7 @@ impl fmt::Display for SampleBlockError {
 
 impl std::error::Error for SampleBlockError {}
 
+/// State machine for the overall acquisition pipeline lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquisitionState {
     Idle,
@@ -190,6 +197,7 @@ pub enum AcquisitionState {
     Error,
 }
 
+/// Events emitted by the pipeline for monitoring, diagnostics, and GUI updates.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcquisitionEvent {
     Started {
@@ -216,6 +224,8 @@ pub enum AcquisitionEvent {
     },
 }
 
+/// Snapshot of a device's current operational state, periodically polled by
+/// the GUI for live status display.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceStatus {
     pub device_id: String,
@@ -231,6 +241,7 @@ pub struct DeviceStatus {
     pub last_error: Option<String>,
 }
 
+/// Cumulative data-integrity statistics for a completed or in-progress acquisition.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct IntegritySummary {
     pub expected_packets: u64,

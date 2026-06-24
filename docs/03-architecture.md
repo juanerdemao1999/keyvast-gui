@@ -5,7 +5,7 @@ Keyvast should be built as a hardware-independent acquisition platform. Real FPG
 ## High-Level Data Flow
 
 ```text
-DeviceBackend
+AcquisitionSource (SimulatorBackend | RhdBackend)
     |
     v
 kv-core
@@ -38,32 +38,33 @@ kv-integrity / benchmark reports
 
 ## Backend Boundary
 
-All device implementations should satisfy one conceptual interface:
+All device implementations satisfy the `AcquisitionSource` trait defined in
+`kv-core`:
 
 ```rust
-pub trait DeviceBackend {
-    fn open(&mut self) -> Result<()>;
-    fn close(&mut self) -> Result<()>;
-    fn configure(&mut self, config: DeviceConfig) -> Result<()>;
-    fn start(&mut self) -> Result<()>;
-    fn stop(&mut self) -> Result<()>;
-    fn read_block(&mut self) -> Result<SampleBlock>;
+pub trait AcquisitionSource {
+    type Error: fmt::Display;
+    fn read_block(&mut self) -> Result<SampleBlock, Self::Error>;
 }
 ```
 
-Initial implementation:
+The trait intentionally exposes only the hot-path read operation.  Lifecycle
+management (open/close/configure/start/stop) is handled by each backend's own
+constructor and configuration methods before the source is handed to the
+pipeline.
+
+Current implementations:
 
 ```text
-SimulatorBackend
+SimulatorBackend   (kv-simulator)
+RhdBackend         (kv-rhd)
 ```
 
 Future implementations:
 
 ```text
-UsbBackend
 EthernetBackend
 PcieBackend
-RealFpgaBackend
 ```
 
 The currently expected physical connector is USB Type-C, but the exact USB protocol, endpoint layout, and packet framing are still TBD.

@@ -31,6 +31,10 @@ use eframe::egui;
 
 use crate::theme;
 
+/// Maximum depth of the shared command/response queues.  If a queue reaches
+/// this limit, new entries evict the oldest to prevent unbounded growth.
+const QUEUE_DEPTH_CAP: usize = 256;
+
 /// Lock a mutex, recovering from poisoning. A panicked worker thread must
 /// not take down the GUI thread or stop acquisition.
 pub fn lock_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -251,7 +255,13 @@ fn handle_client(
             Ok(0) => break, // connection closed
             Ok(_) => {
                 if let Some((id, cmd)) = parse_jsonrpc_request(&line) {
-                    lock_recover(&commands).push_back((id, cmd));
+                    {
+                        let mut q = lock_recover(&commands);
+                        if q.len() >= QUEUE_DEPTH_CAP {
+                            q.pop_front();
+                        }
+                        q.push_back((id, cmd));
+                    }
 
                     // Wait briefly for response (poll up to 100ms)
                     let mut response_sent = false;
@@ -275,6 +285,13 @@ fn handle_client(
                         );
                         let _ = writeln!(writer, "{json}");
                         let _ = writer.flush();
+
+                        // Drain stale responses to prevent unbounded growth.
+                        let mut resps = lock_recover(&responses);
+                        if resps.len() > QUEUE_DEPTH_CAP {
+                            let excess = resps.len() - QUEUE_DEPTH_CAP;
+                            resps.drain(..excess);
+                        }
                     }
                 } else {
                     // Parse error

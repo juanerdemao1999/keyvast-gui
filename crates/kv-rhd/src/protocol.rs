@@ -179,14 +179,57 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
     Ok(())
 }
 
-pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
-    validate_stream_count(enabled_streams)?;
+/// Pre-computed frame geometry for a given `enabled_streams` count.
+/// Eliminates duplicated frame arithmetic across analysis helpers and the parser.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameLayout {
+    pub enabled_streams: usize,
+    /// Total u16 words per sample frame.
+    pub frame_words: usize,
+    /// Total bytes per sample frame (`frame_words * 2`).
+    pub frame_bytes: usize,
+    /// Byte offset to the first AuxCmd3 result within a frame.
+    pub auxcmd3_byte_offset: usize,
+    /// Byte offset to the start of amplifier data within a frame.
+    pub amp_base_bytes: usize,
+}
 
-    Ok(4 + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + ((4 - enabled_streams % 4) % 4)
-        + 8
-        + 2)
+impl FrameLayout {
+    pub fn new(enabled_streams: usize) -> Result<Self, RhythmConfigError> {
+        validate_stream_count(enabled_streams)?;
+        let frame_words = 4
+            + 2
+            + enabled_streams * (CHANNELS_PER_STREAM + 3)
+            + ((4 - enabled_streams % 4) % 4)
+            + 8
+            + 2;
+        let frame_bytes = frame_words * 2;
+        // AuxCmd3 starts after magic(4w) + timestamp(2w) + AuxCmd1(streams) + AuxCmd2(streams)
+        let auxcmd3_byte_offset = (4 + 2 + 2 * enabled_streams) * 2;
+        // Amplifier data starts after magic(4w) + timestamp(2w) + aux(3*streams)
+        let amp_base_bytes = (4 + 2 + 3 * enabled_streams) * 2;
+        Ok(Self {
+            enabled_streams,
+            frame_words,
+            frame_bytes,
+            auxcmd3_byte_offset,
+            amp_base_bytes,
+        })
+    }
+
+    /// Byte offset of the AuxCmd3 result word for a given stream within one frame.
+    pub fn auxcmd3_stream_offset(&self, stream: usize) -> usize {
+        self.auxcmd3_byte_offset + stream * 2
+    }
+
+    /// Byte offset of a specific amplifier word (intra-channel, stream) within one frame.
+    pub fn amp_word_offset(&self, intra_channel: usize, stream: usize) -> usize {
+        self.amp_base_bytes + (intra_channel * self.enabled_streams + stream) * 2
+    }
+}
+
+pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
+    Ok(FrameLayout::new(enabled_streams)?.frame_words)
 }
 
 pub fn bytes_per_block(
@@ -195,9 +238,9 @@ pub fn bytes_per_block(
 ) -> Result<usize, RhythmConfigError> {
     validate_samples_per_block(samples_per_block)?;
 
-    Ok(words_per_frame(enabled_streams)?
-        .saturating_mul(samples_per_block)
-        .saturating_mul(2))
+    Ok(FrameLayout::new(enabled_streams)?
+        .frame_bytes
+        .saturating_mul(samples_per_block))
 }
 
 pub fn raw_word_to_signed_count(word: u16) -> i16 {

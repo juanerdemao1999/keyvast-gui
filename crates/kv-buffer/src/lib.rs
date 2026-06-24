@@ -8,6 +8,7 @@ use std::{
 
 use kv_types::SampleBlock;
 
+/// Single-consumer bounded ring buffer of [`SampleBlock`]s.
 #[derive(Debug, Clone)]
 pub struct BlockBuffer {
     capacity_blocks: usize,
@@ -72,6 +73,9 @@ impl BlockBuffer {
     }
 }
 
+/// Multi-consumer fanout buffer: each pushed block is replicated to all
+/// registered consumers via `Arc` sharing, with independent per-consumer
+/// ring overflow semantics.
 #[derive(Debug, Clone, Default)]
 pub struct FanoutBlockBuffer {
     next_consumer_id: u64,
@@ -236,12 +240,19 @@ impl ConsumerQueue {
     }
 }
 
+/// Opaque handle identifying a registered consumer within a [`FanoutBlockBuffer`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BufferConsumerId(u64);
 
 impl BufferConsumerId {
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+
+    /// Construct an ID from a raw u64.  Intended for testing error paths
+    /// (e.g. verifying `UnknownConsumer` handling).
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 }
 
@@ -251,6 +262,7 @@ impl fmt::Display for BufferConsumerId {
     }
 }
 
+/// Snapshot of a [`BlockBuffer`]'s occupancy and throughput counters.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BufferStatus {
     pub capacity_blocks: usize,
@@ -260,12 +272,14 @@ pub struct BufferStatus {
     pub occupancy: f64,
 }
 
+/// Aggregate status of a [`FanoutBlockBuffer`] (consumer count + total pushes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FanoutBufferStatus {
     pub consumer_count: usize,
     pub pushed_blocks: u64,
 }
 
+/// Per-consumer occupancy and throughput snapshot within a [`FanoutBlockBuffer`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConsumerBufferStatus {
     pub consumer_id: BufferConsumerId,
@@ -278,6 +292,7 @@ pub struct ConsumerBufferStatus {
     pub occupancy: f64,
 }
 
+/// Errors produced by buffer operations (invalid capacity, unknown consumer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferError {
     ZeroCapacity,

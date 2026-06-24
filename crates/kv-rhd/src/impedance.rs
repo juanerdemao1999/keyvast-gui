@@ -11,6 +11,7 @@
 use std::fmt;
 
 use crate::commands::ZcheckScale;
+use crate::protocol::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT;
 
 /// Default test frequency for impedance measurement (Hz).
 pub const DEFAULT_TEST_FREQUENCY: f64 = 1000.0;
@@ -147,7 +148,7 @@ pub fn compute_impedance(
     let mut sum_cos = 0.0_f64;
     let mut sum_sin = 0.0_f64;
     for (i, &sample) in data.iter().enumerate() {
-        let microvolts = sample as f64 * 0.195; // RHD µV/count
+        let microvolts = sample as f64 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
         let phase = two_pi * frequency * (i as f64) / sample_rate;
         sum_cos += microvolts * phase.cos();
         sum_sin += microvolts * phase.sin();

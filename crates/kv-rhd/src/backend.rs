@@ -15,8 +15,9 @@ use crate::{
     impedance,
     parser::{RhythmParseError, parse_rhythm_data_block},
     protocol::{
-        CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, RHYTHM_BOARD_ID, RhythmConfigError,
-        RhythmDataConfig, SAMPLES_PER_USB_BLOCK, USB3_BLOCK_SIZE_BYTES, bytes_per_block,
+        CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, FrameLayout, RHYTHM_BOARD_ID,
+        RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK, USB3_BLOCK_SIZE_BYTES,
+        bytes_per_block,
     },
 };
 
@@ -1301,32 +1302,21 @@ fn stream_range_label(first_stream: u32, enabled_streams: usize) -> String {
 /// bytes appear in consecutive AuxCmd3 result words. Rather than relying on exact
 /// command-list indices, we scan all samples for the pattern.
 fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, samples: usize) -> bool {
-    if enabled_streams == 0 || samples < 5 {
+    if samples < 5 {
         return false;
     }
-
-    // Frame layout per sample (in bytes):
-    //   8 (magic) + 4 (timestamp) + 3*enabled_streams*2 (aux results)
-    //   + CHANNELS_PER_STREAM*enabled_streams*2 (amplifier)
-    //   + ((4-enabled_streams%4)%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
-    let frame_bytes = (4
-        + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + ((4 - enabled_streams % 4) % 4)
-        + 8
-        + 2)
-        * 2;
-
-    // AuxCmd3 results start after magic(8) + timestamp(4) + AuxCmd1(streams*2) + AuxCmd2(streams*2)
-    let auxcmd3_base = 12 + 2 * enabled_streams * 2;
+    let layout = match FrameLayout::new(enabled_streams) {
+        Ok(l) => l,
+        Err(_) => return false,
+    };
 
     let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
 
     for stream in 0..enabled_streams {
-        let word_offset_in_frame = auxcmd3_base + stream * 2;
+        let word_offset_in_frame = layout.auxcmd3_stream_offset(stream);
         let mut aux_bytes: Vec<u8> = Vec::with_capacity(samples);
         for s in 0..samples {
-            let off = s * frame_bytes + word_offset_in_frame;
+            let off = s * layout.frame_bytes + word_offset_in_frame;
             if off + 2 > raw.len() {
                 return false;
             }
@@ -1346,25 +1336,27 @@ fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, samples: usize) -
 /// A correctly-delayed, responding chip reports ~0%; a wrong delay samples the
 /// idle MISO line and reports ~100%. The byte walk mirrors `parse_rhythm_data_block`.
 fn min_stream_railed_fraction(raw: &[u8], enabled_streams: usize, samples: usize) -> f64 {
-    if enabled_streams == 0 || samples == 0 {
+    if samples == 0 {
         return 1.0;
     }
+    let layout = match FrameLayout::new(enabled_streams) {
+        Ok(l) => l,
+        Err(_) => return 1.0,
+    };
+
     let mut railed = vec![0_usize; enabled_streams];
     let mut total = vec![0_usize; enabled_streams];
     let evaluate_from = samples / 2;
-    let mut offset = 0_usize;
 
     for sample_index in 0..samples {
-        offset += 8; // frame magic
-        offset += 4; // timestamp
-        offset += 3 * enabled_streams * 2; // aux command results
-        for _channel in 0..CHANNELS_PER_STREAM {
+        for intra_ch in 0..CHANNELS_PER_STREAM {
             for stream in 0..enabled_streams {
-                if offset + 2 > raw.len() {
+                let off =
+                    sample_index * layout.frame_bytes + layout.amp_word_offset(intra_ch, stream);
+                if off + 2 > raw.len() {
                     return 1.0;
                 }
-                let word = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
-                offset += 2;
+                let word = u16::from_le_bytes([raw[off], raw[off + 1]]);
                 if sample_index >= evaluate_from {
                     if word == 0xffff || word == 0x0000 {
                         railed[stream] += 1;
@@ -1373,10 +1365,6 @@ fn min_stream_railed_fraction(raw: &[u8], enabled_streams: usize, samples: usize
                 }
             }
         }
-        offset += ((4 - enabled_streams % 4) % 4) * 2; // alignment padding
-        offset += 8 * 2; // auxiliary ADC slots
-        offset += 2; // TTL in
-        offset += 2; // TTL out
     }
 
     (0..enabled_streams)
@@ -1402,29 +1390,17 @@ fn extract_channel_from_raw(
 ) -> Vec<i16> {
     use crate::protocol::raw_word_to_signed_count;
 
+    let layout = match FrameLayout::new(enabled_streams) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+
     let stream = ch / CHANNELS_PER_STREAM;
     let intra_ch = ch % CHANNELS_PER_STREAM;
 
-    // Frame layout (in u16 words): 4 (magic) + 2 (timestamp)
-    // + 3*enabled_streams (aux) + CHANNELS_PER_STREAM*enabled_streams (amp)
-    // + ((4-enabled_streams%4)%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
-    let frame_words = 4
-        + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + ((4 - enabled_streams % 4) % 4)
-        + 8
-        + 2;
-    let frame_bytes = frame_words * 2;
-
-    // Amplifier data starts after magic(4w) + timestamp(2w) + aux(3*streams w).
-    let amp_base_words = 4 + 2 + 3 * enabled_streams;
-
     let mut out = Vec::with_capacity(samples);
     for s in 0..samples {
-        // Within the amplifier section: data is channel-major, stream-minor.
-        // Word index = amp_base + (intra_ch * enabled_streams + stream)
-        let word_idx = amp_base_words + intra_ch * enabled_streams + stream;
-        let byte_off = s * frame_bytes + word_idx * 2;
+        let byte_off = s * layout.frame_bytes + layout.amp_word_offset(intra_ch, stream);
         if byte_off + 2 > raw.len() {
             break;
         }

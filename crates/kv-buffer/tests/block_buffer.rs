@@ -152,6 +152,26 @@ fn fanout_rejects_zero_capacity_consumer() {
     );
 }
 
+#[test]
+fn pop_unknown_consumer_returns_error() {
+    let mut buffer = FanoutBlockBuffer::new();
+    let bogus_id = kv_buffer::BufferConsumerId::from_raw(9999);
+    assert_eq!(
+        buffer.pop(bogus_id).unwrap_err(),
+        BufferError::UnknownConsumer { id: 9999 }
+    );
+}
+
+#[test]
+fn consumer_status_unknown_consumer_returns_error() {
+    let buffer = FanoutBlockBuffer::new();
+    let bogus_id = kv_buffer::BufferConsumerId::from_raw(42);
+    assert_eq!(
+        buffer.consumer_status(bogus_id).unwrap_err(),
+        BufferError::UnknownConsumer { id: 42 }
+    );
+}
+
 fn drain_packet_ids(
     buffer: &mut FanoutBlockBuffer,
     consumer: kv_buffer::BufferConsumerId,

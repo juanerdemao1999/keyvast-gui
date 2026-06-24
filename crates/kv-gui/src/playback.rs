@@ -361,3 +361,177 @@ pub fn pick_kvraw_file() -> Option<PathBuf> {
         .add_filter("KVRAW recording", &["kvraw"])
         .pick_file()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kv_recorder::StreamingRecorder;
+    use kv_types::SampleBlock;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-playback")
+            .join(format!("{name}-{nanos}"))
+    }
+
+    fn make_block(packet_id: u64, ch: usize, spc: usize) -> SampleBlock {
+        SampleBlock {
+            device_id: "playback-test".to_string(),
+            stream_id: 0,
+            packet_id,
+            timestamp_start: packet_id * spc as u64,
+            sample_rate: 30_000.0,
+            channel_count: ch,
+            samples_per_channel: spc,
+            ttl_bits: 0,
+            data: vec![1000i16; ch * spc],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    fn write_test_kvraw(dir: &std::path::Path, blocks: usize) -> PathBuf {
+        fs::create_dir_all(dir).expect("mkdir");
+        let mut rec = StreamingRecorder::new(dir).expect("recorder");
+        for i in 0..blocks {
+            rec.write_block(&make_block(i as u64, 4, 256))
+                .expect("write");
+        }
+        rec.finish().expect("finish");
+        dir.join("recording.kvraw")
+    }
+
+    #[test]
+    fn tick_returns_none_when_idle() {
+        let mut pm = PlaybackManager::default();
+        assert_eq!(pm.state, PlaybackState::Idle);
+        assert!(pm.tick().is_none());
+    }
+
+    #[test]
+    fn tick_returns_block_after_load() {
+        let dir = unique_dir("tick-load");
+        let path = write_test_kvraw(&dir, 5);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+        assert_eq!(pm.state, PlaybackState::Paused);
+
+        // First tick after load should emit a block (cursor at 0, never emitted)
+        let block = pm.tick();
+        assert!(block.is_some());
+
+        // Second tick without cursor change should return None
+        assert!(pm.tick().is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tick_paused_emits_after_seek() {
+        let dir = unique_dir("tick-seek");
+        let path = write_test_kvraw(&dir, 5);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+
+        // Consume initial emission
+        pm.tick();
+
+        // Seek to a new position
+        pm.seek_to(500);
+        assert_eq!(pm.cursor_frame, 500);
+
+        // Tick should now emit a new block
+        let block = pm.tick();
+        assert!(block.is_some());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tick_returns_none_with_invalid_sample_rate() {
+        let dir = unique_dir("tick-bad-sr");
+        let path = write_test_kvraw(&dir, 2);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+
+        // Tamper with metadata to simulate invalid sample_rate
+        if let Some(ref mut meta) = pm.metadata {
+            meta.sample_rate = 0.0;
+        }
+
+        pm.play();
+        assert!(pm.tick().is_none());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn seek_clamps_to_total_frames() {
+        let dir = unique_dir("seek-clamp");
+        let path = write_test_kvraw(&dir, 3);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+
+        let total = pm.total_frames();
+        pm.seek_to(total + 10_000);
+        assert_eq!(pm.cursor_frame, total);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn play_pause_toggle_state_transitions() {
+        let dir = unique_dir("toggle");
+        let path = write_test_kvraw(&dir, 2);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+        assert_eq!(pm.state, PlaybackState::Paused);
+
+        pm.toggle_play_pause();
+        assert_eq!(pm.state, PlaybackState::Playing);
+
+        pm.toggle_play_pause();
+        assert_eq!(pm.state, PlaybackState::Paused);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn close_resets_to_idle() {
+        let dir = unique_dir("close");
+        let path = write_test_kvraw(&dir, 2);
+
+        let mut pm = PlaybackManager::default();
+        pm.load_file(path);
+        assert!(pm.is_loaded());
+
+        pm.close();
+        assert!(!pm.is_loaded());
+        assert_eq!(pm.state, PlaybackState::Idle);
+        assert_eq!(pm.cursor_frame, 0);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_nonexistent_file_sets_error() {
+        let mut pm = PlaybackManager::default();
+        pm.load_file(PathBuf::from("/nonexistent/path/bad.kvraw"));
+        assert_eq!(pm.state, PlaybackState::Idle);
+        assert!(pm.error.is_some());
+    }
+}

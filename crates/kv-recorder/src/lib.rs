@@ -1183,8 +1183,11 @@ impl KvrawReader {
         num_frames: usize,
     ) -> Result<Vec<Vec<i16>>, RecorderError> {
         let ch = self.metadata.channel_count;
+        if ch == 0 {
+            return Ok(Vec::new());
+        }
         let interleaved = self.read_frames(start_frame, num_frames)?;
-        let actual_frames = interleaved.len() / ch.max(1);
+        let actual_frames = interleaved.len() / ch;
 
         let mut channels: Vec<Vec<i16>> =
             (0..ch).map(|_| Vec::with_capacity(actual_frames)).collect();

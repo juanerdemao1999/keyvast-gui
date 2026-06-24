@@ -173,19 +173,19 @@ impl DisplayRing {
         (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0 / self.sample_rate
     }
 
-    /// Extract the last `n` ring samples for `ch` as i16 values (de-normalized).
-    /// Used by FFT panel for spectrum computation.
-    pub fn last_n_samples(&self, ch: usize, n: usize) -> Vec<i16> {
+    /// Extract the last `n` ring samples for `ch` as f64 values in µV.
+    /// Avoids i16 quantization loss; used by FFT panel for spectrum computation.
+    pub fn last_n_samples_f64(&self, ch: usize, n: usize) -> Vec<f64> {
         if ch >= self.channel_count || self.len == 0 || !self.ready {
             return Vec::new();
         }
         let ring = &self.y[ch];
         let avail = ring.len().min(n);
         let start = ring.len() - avail;
-        // Ring stores normalized f32 in [-1, 1]. Convert back to i16.
+        // Ring stores normalized f32 in [-1, 1]. Convert to µV (0.195 µV/LSB * 32767).
         ring.iter()
             .skip(start)
-            .map(|&v| (v as f64 * 32767.0).round() as i16)
+            .map(|&v| v as f64 * 32767.0 * 0.195)
             .collect()
     }
 

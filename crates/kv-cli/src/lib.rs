@@ -409,7 +409,8 @@ pub fn run_simulator_pipeline(
         &options.output_dir,
         &simulator_recording_log_lines(&pipeline_result.integrity),
     )?;
-    let events = simulator_recording_events(&pipeline_result.integrity);
+    let mut events = simulator_recording_events(&pipeline_result.integrity);
+    events.extend(pipeline_result.events.iter().cloned());
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = pipeline_benchmark_summary(&pipeline_result, &recording);
@@ -458,7 +459,8 @@ pub fn run_simulator_stream(
         &options.output_dir,
         &simulator_recording_log_lines(&result.integrity),
     )?;
-    let events = simulator_recording_events(&result.integrity);
+    let mut events = simulator_recording_events(&result.integrity);
+    events.extend(result.events.iter().cloned());
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = streaming_benchmark_summary(&result, &streaming_config.device, None);
@@ -539,7 +541,8 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
         &options.output_dir,
         &simulator_recording_log_lines(&result.integrity),
     )?;
-    let events = simulator_recording_events(&result.integrity);
+    let mut events = simulator_recording_events(&result.integrity);
+    events.extend(result.events.iter().cloned());
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = streaming_benchmark_summary(&result, &device, process_metrics.as_ref());
@@ -593,8 +596,8 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
 
         let mut next_packet_id = 0_u64;
         run_fixed_blocks(&device_config, options.blocks, &mut || {
-            let start = next_packet_id as usize * block_bytes;
-            let end = start + block_bytes;
+            let start = (next_packet_id as usize).saturating_mul(block_bytes);
+            let end = start.saturating_add(block_bytes);
             let block = parse_rhythm_data_block(next_packet_id, &raw[start..end], &data_config)
                 .map_err(RhdReadError::Parse)?;
             next_packet_id = next_packet_id.saturating_add(1);
@@ -1140,6 +1143,19 @@ fn parse_benchmark_args(args: impl Iterator<Item = String>) -> Result<CliCommand
         (None, None) => DEFAULT_CHANNEL_COUNT,
     };
 
+    if channel_count == 0 {
+        return Err(CliError::ConflictingArguments {
+            message: "--channels must be greater than zero",
+        });
+    }
+
+    let effective_sample_rate = sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
+    if effective_sample_rate <= 0.0 || !effective_sample_rate.is_finite() {
+        return Err(CliError::ConflictingArguments {
+            message: "--sample-rate must be a positive finite number",
+        });
+    }
+
     let output_dir = match output_dir {
         Some(output_dir) => output_dir,
         None => default_recording_output_dir()?,
@@ -1149,7 +1165,7 @@ fn parse_benchmark_args(args: impl Iterator<Item = String>) -> Result<CliCommand
         output_dir,
         duration_seconds,
         channel_count,
-        sample_rate: sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE),
+        sample_rate: effective_sample_rate,
         samples_per_packet: samples_per_packet.unwrap_or(DEFAULT_SAMPLES_PER_PACKET),
         recorder_capacity_blocks: recorder_capacity,
         preview_capacity_blocks: preview_capacity,

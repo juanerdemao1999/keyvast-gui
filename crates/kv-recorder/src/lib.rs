@@ -138,13 +138,14 @@ pub fn write_recording_with_backend(
     write_raw_file(&raw_path, blocks)?;
     write_metadata_file(&metadata_path, blocks, backend)?;
 
+    let total_samples = written_samples(blocks);
     Ok(RecordingSummary {
         output_dir,
         raw_path,
         metadata_path,
         block_count: blocks.len() as u64,
-        written_samples: written_samples(blocks),
-        byte_count: written_samples(blocks).saturating_mul(2),
+        written_samples: total_samples,
+        byte_count: total_samples.saturating_mul(2),
         first_packet_id: blocks.first().map(|block| block.packet_id),
         last_packet_id: blocks.last().map(|block| block.packet_id),
     })

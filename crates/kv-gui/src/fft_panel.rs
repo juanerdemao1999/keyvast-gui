@@ -56,20 +56,20 @@ pub fn compute_spectrum(
         return Vec::new();
     }
 
-    // Extract the most recent `fft_size` samples for this channel from the ring.
-    let raw = ring.last_n_samples(channel, fft_size);
+    // Extract the most recent `fft_size` samples (already in µV) from the ring.
+    let raw = ring.last_n_samples_f64(channel, fft_size);
     if raw.len() < fft_size {
         return Vec::new();
     }
 
-    // Apply Hann window and convert to f64.
+    // Apply Hann window.
     let n = fft_size;
     let mut real = Vec::with_capacity(n);
     let mut imag = vec![0.0_f64; n];
     let pi2_over_n = 2.0 * std::f64::consts::PI / n as f64;
     for (i, &sample) in raw.iter().enumerate().take(n) {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
-        real.push(sample as f64 * 0.195 * w); // convert to µV
+        real.push(sample * w);
     }
 
     // In-place radix-2 FFT.

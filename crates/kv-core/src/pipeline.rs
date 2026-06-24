@@ -13,7 +13,7 @@ use std::time::Instant;
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
 use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
 use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
-use kv_types::{DeviceConfig, SampleBlock};
+use kv_types::{AcquisitionEvent, DeviceConfig, SampleBlock};
 
 use crate::AcquisitionSource;
 
@@ -41,6 +41,7 @@ pub struct PipelineResult {
     pub timing: PipelineTiming,
     pub recorder_status: ConsumerBufferStatus,
     pub preview_status: ConsumerBufferStatus,
+    pub events: Vec<AcquisitionEvent>,
 }
 
 /// Configuration for a streaming fan-out pipeline that writes to disk
@@ -64,6 +65,7 @@ pub struct StreamingPipelineResult {
     pub preview_status: ConsumerBufferStatus,
     pub max_write_latency_us: Option<u64>,
     pub latency_distribution: Option<LatencyDistribution>,
+    pub events: Vec<AcquisitionEvent>,
 }
 
 /// Errors from the threaded pipeline.
@@ -121,6 +123,7 @@ struct SharedState {
     buffer: FanoutBlockBuffer,
     producer_done: bool,
     producer_error: Option<String>,
+    events: Vec<AcquisitionEvent>,
 }
 
 /// Run a threaded fan-out acquisition pipeline.
@@ -149,6 +152,7 @@ where
             buffer: fanout,
             producer_done: false,
             producer_error: None,
+            events: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -198,9 +202,10 @@ where
         .map_err(|_| PipelineError::ProducerPanicked)?;
 
     let (lock, _) = &*shared;
-    let state = lock.lock().expect("shared state lock poisoned");
+    let mut state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let events = std::mem::take(&mut state.events);
     drop(state);
 
     let wall_clock = start.elapsed();
@@ -218,6 +223,7 @@ where
         timing,
         recorder_status,
         preview_status,
+        events,
     })
 }
 
@@ -231,7 +237,12 @@ where
         match source.read_block() {
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
-                state.buffer.push(block);
+                if let Some(overflow) = state.buffer.push(block) {
+                    state.events.push(AcquisitionEvent::BufferOverflow {
+                        dropped_blocks: overflow.total_dropped_blocks,
+                        buffer_occupancy: overflow.max_occupancy,
+                    });
+                }
                 cvar.notify_all();
             }
             Err(error) => {
@@ -288,6 +299,7 @@ where
             buffer: fanout,
             producer_done: false,
             producer_error: None,
+            events: Vec::new(),
         }),
         Condvar::new(),
     ));
@@ -348,9 +360,10 @@ where
         .map_err(|_| PipelineError::ProducerPanicked)?;
 
     let (lock, _) = &*shared;
-    let state = lock.lock().expect("shared state lock poisoned");
+    let mut state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let events = std::mem::take(&mut state.events);
     drop(state);
 
     let wall_clock = start.elapsed();
@@ -371,6 +384,7 @@ where
         preview_status,
         max_write_latency_us: streaming_summary.max_write_latency_us,
         latency_distribution: streaming_summary.latency_distribution,
+        events,
     })
 }
 

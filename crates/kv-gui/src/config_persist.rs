@@ -153,7 +153,7 @@ impl PersistentConfig {
             amp_scale_idx = self.amp_scale_idx,
             show_grid = self.show_grid,
             channel_spacing = self.channel_spacing,
-            display_mode = self.display_mode,
+            display_mode = self.display_mode.replace('\\', "\\\\").replace('"', "\\\""),
             color_by_group = self.color_by_group,
             channels_per_group = self.channels_per_group,
             hp_enabled = self.hp_enabled,
@@ -169,7 +169,7 @@ impl PersistentConfig {
             ui_scale = self.ui_scale,
             window_width = self.window_width,
             window_height = self.window_height,
-            last_source = self.last_source,
+            last_source = self.last_source.replace('\\', "\\\\").replace('"', "\\\""),
         )
     }
 
@@ -325,7 +325,9 @@ impl PersistentConfig {
 /// Save config to disk.
 pub fn save_config(path: &PathBuf, config: &PersistentConfig) -> Result<(), String> {
     let json = config.to_json();
-    fs::write(path, json).map_err(|e| format!("Failed to save config: {e}"))
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| format!("Failed to write temp config: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| format!("Failed to rename config: {e}"))
 }
 
 /// Load config from disk.

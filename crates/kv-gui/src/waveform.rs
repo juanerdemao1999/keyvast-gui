@@ -278,16 +278,18 @@ pub fn draw_waveform_area(
             }
         });
 
-        // Draw spike threshold lines (negative-going) when enabled
+        // Draw spike threshold lines (negative-going) when enabled.
+        // Reuse a single buffer to avoid per-channel Vec allocation.
         if filters.spike_threshold_enabled {
+            let mut thresh_pts = Vec::with_capacity(2);
             for meta in &spike_metas {
-                let line = Line::new(PlotPoints::from(vec![
-                    [x_left, meta.thresh_y],
-                    [x_right, meta.thresh_y],
-                ]))
-                .color(theme::ACCENT_RED)
-                .width(0.8)
-                .style(egui_plot::LineStyle::dashed_dense());
+                thresh_pts.clear();
+                thresh_pts.push([x_left, meta.thresh_y]);
+                thresh_pts.push([x_right, meta.thresh_y]);
+                let line = Line::new(PlotPoints::from(thresh_pts.clone()))
+                    .color(theme::ACCENT_RED)
+                    .width(0.8)
+                    .style(egui_plot::LineStyle::dashed_dense());
                 plot_ui.line(line);
             }
         }

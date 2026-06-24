@@ -573,9 +573,7 @@ impl RhythmFrontPanelBoard {
         // primary stream pair over all 16 delays and enable whichever port actually
         // has a responding chip. AuxCmd3 bank 0 (register config + ADC calibrate) is
         // selected, so each probe run also configures/calibrates the chip found.
-        log::info!(
-            "scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage..."
-        );
+        log::info!("scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage...");
         // Wait for the headstage power rails (I2C bring-up) before probing, then
         // re-scan until a chip answers -- the rails can lag FPGA config by up to a
         // few seconds, and probing too early is exactly what dropped acquisition
@@ -617,7 +615,9 @@ impl RhythmFrontPanelBoard {
         if found {
             log::info!(
                 "auto-detected chip {:?} -> {} data stream(s), {} amplifier channel(s)",
-                chip, detected_streams, detected_streams * CHANNELS_PER_STREAM,
+                chip,
+                detected_streams,
+                detected_streams * CHANNELS_PER_STREAM,
             );
         }
         let stream_mask = ((1_u32 << detected_streams) - 1) << (port as u32 * 4);
@@ -645,7 +645,8 @@ impl RhythmFrontPanelBoard {
         self.run()?;
         self.wait_until_not_running()?;
         let verify_raw = self.read_pipe_block(detected_streams, VERIFY_SAMPLES)?;
-        if let Some(mean) = amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, 0)
+        if let Some(mean) =
+            amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, 0)
         {
             log::info!("post-delay centering check: amp mean raw word = 0x{mean:04x}");
             if (0x3000..=0x5000).contains(&mean) {
@@ -653,7 +654,9 @@ impl RhythmFrontPanelBoard {
                     "amplifier data is half-scale (mean 0x{mean:04x} ~ 0x4000): the committed \
                      MISO delay is the wrong sampling phase. Refusing to record corrupt data."
                 );
-                return Err(RhdReadError::HalfScaleAmplifierData { mean_raw_word: mean });
+                return Err(RhdReadError::HalfScaleAmplifierData {
+                    mean_raw_word: mean,
+                });
             }
         }
 
@@ -939,8 +942,14 @@ impl RhythmFrontPanelBoard {
                     let chip_id = probe_chip_id(&raw, enabled_streams, PROBE_SAMPLES, 0);
                     log::info!(
                         "  scan port {} delay {:2}: has_id={} chip_id={:?} railed_s0={:.3} amp_mean_raw_s0={}",
-                        port_letter, delay, has_id, chip_id, railed,
-                        amp_mean.map(|m| format!("0x{:04x}", m)).unwrap_or_else(|| "n/a".to_string()),
+                        port_letter,
+                        delay,
+                        has_id,
+                        chip_id,
+                        railed,
+                        amp_mean
+                            .map(|m| format!("0x{:04x}", m))
+                            .unwrap_or_else(|| "n/a".to_string()),
                     );
                     if has_id && port_chip_id.is_none() {
                         port_chip_id = chip_id;
@@ -986,8 +995,14 @@ impl RhythmFrontPanelBoard {
             );
 
             // Prefer chip-ID-verified ports over railed-fraction-only ports.
-            let dominated = best.as_ref().is_some_and(|&(_, _, prev_id, _)| prev_id && !validated_by_id);
-            if !dominated && best.as_ref().is_none_or(|&(_, _, prev_id, _)| validated_by_id >= prev_id) {
+            let dominated = best
+                .as_ref()
+                .is_some_and(|&(_, _, prev_id, _)| prev_id && !validated_by_id);
+            if !dominated
+                && best
+                    .as_ref()
+                    .is_none_or(|&(_, _, prev_id, _)| validated_by_id >= prev_id)
+            {
                 best = Some((port, chosen_delay, validated_by_id, port_chip_id));
             }
         }
@@ -1615,12 +1630,8 @@ fn amplifier_mean_raw_word(
     if enabled_streams == 0 || samples == 0 || stream >= enabled_streams {
         return None;
     }
-    let frame_bytes = (4 + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + (enabled_streams % 4)
-        + 8
-        + 2)
-        * 2;
+    let frame_bytes =
+        (4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2) * 2;
     let amp_base_words = 4 + 2 + 3 * enabled_streams;
     let from = samples / 2;
     let mut sum: u64 = 0;
@@ -1644,21 +1655,12 @@ fn amplifier_mean_raw_word(
 /// `create_command_list_register_config` the ROM read block is
 /// `[63, 62, 61, 60, 59, 48..55, 40('I'), 41('N'), 42('T'), 43('A'), 44('N')]`,
 /// so the reg-63 result lands exactly 13 result words before the 'I'.
-fn probe_chip_id(
-    raw: &[u8],
-    enabled_streams: usize,
-    samples: usize,
-    stream: usize,
-) -> Option<u8> {
+fn probe_chip_id(raw: &[u8], enabled_streams: usize, samples: usize, stream: usize) -> Option<u8> {
     if enabled_streams == 0 || samples < 18 || stream >= enabled_streams {
         return None;
     }
-    let frame_bytes = (4 + 2
-        + enabled_streams * (CHANNELS_PER_STREAM + 3)
-        + (enabled_streams % 4)
-        + 8
-        + 2)
-        * 2;
+    let frame_bytes =
+        (4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2) * 2;
     let auxcmd3_base = 12 + 2 * enabled_streams * 2;
     let word_offset_in_frame = auxcmd3_base + stream * 2;
     let mut aux: Vec<u8> = Vec::with_capacity(samples);

@@ -370,9 +370,15 @@ impl SpikeSnippetStore {
         &mut self.bufs[idx].snippets
     }
 
-    pub fn channel_count(&self) -> usize { self.bufs.len() }
-    pub fn pre_ms(&self)  -> f32 { samples_to_ms(self.pre_samples,  self.sample_rate) }
-    pub fn post_ms(&self) -> f32 { samples_to_ms(self.post_samples, self.sample_rate) }
+    pub fn channel_count(&self) -> usize {
+        self.bufs.len()
+    }
+    pub fn pre_ms(&self) -> f32 {
+        samples_to_ms(self.pre_samples, self.sample_rate)
+    }
+    pub fn post_ms(&self) -> f32 {
+        samples_to_ms(self.post_samples, self.sample_rate)
+    }
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────

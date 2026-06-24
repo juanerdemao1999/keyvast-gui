@@ -685,11 +685,19 @@ fn collect_from_ring(
         // are not skipped by decimation (#4b).
         let mut pts = if ring.peak_hold {
             ring.collect_channel_minmax(
-                phys_ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries,
+                phys_ch,
+                t_left_ms,
+                t_right_ms,
+                MAX_DISPLAY_POINTS,
+                window_ring_entries,
             )
         } else {
             ring.collect_channel(
-                phys_ch, t_left_ms, t_right_ms, MAX_DISPLAY_POINTS, window_ring_entries,
+                phys_ch,
+                t_left_ms,
+                t_right_ms,
+                MAX_DISPLAY_POINTS,
+                window_ring_entries,
             )
         };
 

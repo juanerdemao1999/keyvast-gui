@@ -754,13 +754,7 @@ impl<'a> KvTileBehavior<'a> {
 
         // ── Snippet plot ─────────────────────────────────────────────
         // Renderer needs &mut to refresh each snippet's cached geometry.
-        spike_overlay::draw_spike_overlay(
-            ui,
-            self.snippet_store,
-            channels,
-            *show_grid,
-            tile_salt,
-        );
+        spike_overlay::draw_spike_overlay(ui, self.snippet_store, channels, *show_grid, tile_salt);
     }
 }
 

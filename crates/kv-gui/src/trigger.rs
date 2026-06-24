@@ -269,8 +269,8 @@ impl TtlHistory {
         } else {
             let t_ms = start * 1000.0 / sr;
             self.push_word(t_ms, block.ttl_bits);
-            self.latest_ms = (start + block.samples_per_channel.saturating_sub(1) as f64) * 1000.0
-                / sr;
+            self.latest_ms =
+                (start + block.samples_per_channel.saturating_sub(1) as f64) * 1000.0 / sr;
         }
         self.prune();
     }
@@ -297,7 +297,11 @@ impl TtlHistory {
 
     /// Level of `bit` at time `t_ms` (last transition at or before it).
     fn level_at(&self, bit: usize, t_ms: f64) -> bool {
-        let mut level = self.buf.front().map(|e| bit_set(e.bits, bit)).unwrap_or(false);
+        let mut level = self
+            .buf
+            .front()
+            .map(|e| bit_set(e.bits, bit))
+            .unwrap_or(false);
         for e in &self.buf {
             if e.t_ms > t_ms {
                 break;
@@ -468,11 +472,17 @@ mod tests {
         // Low: nothing
         assert_eq!(cfg.process_block(&make_block(0b0)), TriggerAction::None);
         // High: start, idempotent while held
-        assert_eq!(cfg.process_block(&make_block(0b1)), TriggerAction::StartRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(0b1)),
+            TriggerAction::StartRecording
+        );
         assert_eq!(cfg.process_block(&make_block(0b1)), TriggerAction::None);
         assert!(cfg.is_recording());
         // Low: stop
-        assert_eq!(cfg.process_block(&make_block(0b0)), TriggerAction::StopRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(0b0)),
+            TriggerAction::StopRecording
+        );
         assert!(!cfg.is_recording());
     }
 
@@ -487,9 +497,15 @@ mod tests {
         // Bit high → inactive (active-low)
         assert_eq!(cfg.process_block(&make_block(0b100)), TriggerAction::None);
         // Bit low → active → start
-        assert_eq!(cfg.process_block(&make_block(0b000)), TriggerAction::StartRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(0b000)),
+            TriggerAction::StartRecording
+        );
         // Bit high again → stop
-        assert_eq!(cfg.process_block(&make_block(0b100)), TriggerAction::StopRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(0b100)),
+            TriggerAction::StopRecording
+        );
     }
 
     #[test]
@@ -500,9 +516,15 @@ mod tests {
             active_high: true,
             ..Default::default()
         };
-        assert_eq!(cfg.process_block(&make_block(1)), TriggerAction::StartRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(1)),
+            TriggerAction::StartRecording
+        );
         cfg.enabled = false;
-        assert_eq!(cfg.process_block(&make_block(1)), TriggerAction::StopRecording);
+        assert_eq!(
+            cfg.process_block(&make_block(1)),
+            TriggerAction::StopRecording
+        );
         assert_eq!(cfg.process_block(&make_block(1)), TriggerAction::None);
     }
 

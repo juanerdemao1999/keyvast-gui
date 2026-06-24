@@ -297,7 +297,11 @@ impl SpikeSnippetStore {
 
     /// Return reference to snippets for a specific physical channel.
     pub fn snippets_for(&self, ch: usize) -> &VecDeque<SpikeSnippet> {
-        &self.bufs[ch.min(self.bufs.len().saturating_sub(1))].snippets
+        static EMPTY: VecDeque<SpikeSnippet> = VecDeque::new();
+        if self.bufs.is_empty() {
+            return &EMPTY;
+        }
+        &self.bufs[ch.min(self.bufs.len() - 1)].snippets
     }
 
     pub fn channel_count(&self) -> usize {

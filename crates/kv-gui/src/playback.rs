@@ -79,6 +79,14 @@ impl PlaybackManager {
         match KvrawReader::open(&path) {
             Ok(reader) => {
                 let meta = reader.metadata().clone();
+                if !meta.sample_rate.is_finite() || meta.sample_rate <= 0.0 {
+                    self.error = Some(format!(
+                        "Invalid sample_rate ({}) in file metadata",
+                        meta.sample_rate
+                    ));
+                    self.state = PlaybackState::Idle;
+                    return;
+                }
                 self.metadata = Some(meta);
                 self.reader = Some(reader);
                 self.file_path = Some(path);

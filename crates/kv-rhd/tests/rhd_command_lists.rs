@@ -1,13 +1,12 @@
 use kv_rhd::{
     AuxCommandSlot, BoardPort, RHD_COMMAND_LIST_LEN, Rhd2000CommandType, Rhd2000Registers,
-    create_rhd2000_command,
+    RhdChipType, create_rhd2000_command,
 };
 
 #[test]
 fn encodes_rhd2000_spi_commands_like_intan() {
     assert_eq!(
-        create_rhd2000_command(Rhd2000CommandType::Convert, Some(12), None)
-            .expect("valid convert"),
+        create_rhd2000_command(Rhd2000CommandType::Convert, Some(12), None).expect("valid convert"),
         0x0c00
     );
     assert_eq!(
@@ -21,8 +20,7 @@ fn encodes_rhd2000_spi_commands_like_intan() {
         0x849c
     );
     assert_eq!(
-        create_rhd2000_command(Rhd2000CommandType::Calibrate, None, None)
-            .expect("valid calibrate"),
+        create_rhd2000_command(Rhd2000CommandType::Calibrate, None, None).expect("valid calibrate"),
         0x5500
     );
     assert_eq!(
@@ -99,4 +97,39 @@ fn board_port_bit_shifts_match_frontpanel_bank_wires() {
     assert_eq!(BoardPort::PortH.bit_shift(), 28);
     assert_eq!(BoardPort::all().len(), 8);
     assert_eq!(format!("{:?}", AuxCommandSlot::AuxCmd3), "AuxCmd3");
+}
+
+// ---------- H20: RhdChipType dispatch tests ----------
+
+#[test]
+fn rhd_chip_type_from_register63_known_values() {
+    // num_amps = (reg63 >> 6) & 0x03
+    // 0 → Rhd2216 (16ch), 1 → Rhd2132 (32ch), 2 → Rhd2164 (64ch)
+    let rhd2216 = RhdChipType::from_register63(0b_00_000000).unwrap();
+    assert_eq!(rhd2216, RhdChipType::Rhd2216);
+    assert_eq!(rhd2216.channel_count(), 16);
+    assert_eq!(rhd2216.streams_per_headstage(), 1);
+
+    let rhd2132 = RhdChipType::from_register63(0b_01_000000).unwrap();
+    assert_eq!(rhd2132, RhdChipType::Rhd2132);
+    assert_eq!(rhd2132.channel_count(), 32);
+    assert_eq!(rhd2132.streams_per_headstage(), 1);
+
+    let rhd2164 = RhdChipType::from_register63(0b_10_000000).unwrap();
+    assert_eq!(rhd2164, RhdChipType::Rhd2164);
+    assert_eq!(rhd2164.channel_count(), 64);
+    assert_eq!(rhd2164.streams_per_headstage(), 2);
+}
+
+#[test]
+fn rhd_chip_type_from_register63_with_revision_bits() {
+    // Lower 6 bits are die revision, should be ignored by chip-type dispatch.
+    let with_rev = RhdChipType::from_register63(0b_01_101010).unwrap();
+    assert_eq!(with_rev, RhdChipType::Rhd2132);
+}
+
+#[test]
+fn rhd_chip_type_from_register63_unknown_returns_none() {
+    // num_amps == 3 is not a known chip type.
+    assert!(RhdChipType::from_register63(0b_11_000000).is_none());
 }

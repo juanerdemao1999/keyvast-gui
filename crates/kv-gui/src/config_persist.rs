@@ -298,7 +298,9 @@ impl PersistentConfig {
             .min(crate::panels::TIME_WINDOWS.len() - 1);
         display.amp_scale_idx = self.amp_scale_idx.min(crate::panels::AMP_SCALES.len() - 1);
         display.show_grid = self.show_grid;
-        display.channel_spacing = self.channel_spacing;
+        display.channel_spacing = self
+            .channel_spacing
+            .clamp(crate::panels::SPACING_MIN, crate::panels::SPACING_MAX);
         display.display_mode = match self.display_mode.as_str() {
             "roll" => DisplayMode::Roll,
             _ => DisplayMode::Sweep,
@@ -311,7 +313,9 @@ impl PersistentConfig {
         filters.lp_enabled = self.lp_enabled;
         filters.lp_cutoff_hz = self.lp_cutoff_hz;
         filters.notch_enabled = self.notch_enabled;
-        filters.notch_idx = self.notch_idx;
+        filters.notch_idx = self
+            .notch_idx
+            .min(crate::panels::NOTCH_FREQS.len().saturating_sub(1));
         filters.car_enabled = self.car_enabled;
 
         *output_dir = self.output_dir.clone();

@@ -216,6 +216,9 @@ pub enum CliError {
     InvalidDuration {
         seconds: f64,
     },
+    NonPositiveValue {
+        flag: &'static str,
+    },
     UnknownPreset {
         name: String,
     },
@@ -260,6 +263,9 @@ impl fmt::Display for CliError {
                     formatter,
                     "duration must be a positive finite number, got {seconds}"
                 )
+            }
+            Self::NonPositiveValue { flag } => {
+                write!(formatter, "{flag} must be greater than zero")
             }
             Self::UnknownPreset { name } => {
                 write!(
@@ -310,6 +316,7 @@ impl std::error::Error for CliError {
             | Self::InvalidBlockCount { .. }
             | Self::InvalidNumber { .. }
             | Self::InvalidDuration { .. }
+            | Self::NonPositiveValue { .. }
             | Self::UnknownPreset { .. }
             | Self::SystemTimeBeforeUnixEpoch
             | Self::RawInputTooShort { .. } => None,

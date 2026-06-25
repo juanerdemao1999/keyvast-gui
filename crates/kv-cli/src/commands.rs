@@ -301,8 +301,10 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             if is_cancelled() {
                 return Err(RhdReadError::Cancelled);
             }
-            let start = next_packet_id as usize * block_bytes;
-            let end = start + block_bytes;
+            // Saturating arithmetic avoids an overflow panic; the slice bounds
+            // are already guaranteed by the `expected_bytes` check above.
+            let start = (next_packet_id as usize).saturating_mul(block_bytes);
+            let end = start.saturating_add(block_bytes);
             let block = parse_rhythm_data_block(next_packet_id, &raw[start..end], &data_config)
                 .map_err(RhdReadError::Parse)?;
             next_packet_id = next_packet_id.saturating_add(1);

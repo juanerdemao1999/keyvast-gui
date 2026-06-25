@@ -222,9 +222,10 @@ pub(crate) fn parse_benchmark_args(
     }
 
     let duration_seconds = match (&preset, duration) {
+        // An explicit --duration always wins, even alongside a preset, so it is
+        // never silently dropped.
+        (_, Some(d)) => d,
         (Some(p), None) => p.duration_seconds(),
-        (None, Some(d)) => d,
-        (Some(p), Some(_)) => p.duration_seconds(),
         (None, None) => 10.0,
     };
 
@@ -233,6 +234,15 @@ pub(crate) fn parse_benchmark_args(
         (Some(p), None) => p.channel_count().unwrap_or(DEFAULT_CHANNEL_COUNT),
         (None, None) => DEFAULT_CHANNEL_COUNT,
     };
+
+    if channel_count == 0 {
+        return Err(CliError::NonPositiveValue { flag: "--channels" });
+    }
+    if sample_rate.is_some_and(|rate| !(rate.is_finite() && rate > 0.0)) {
+        return Err(CliError::NonPositiveValue {
+            flag: "--sample-rate",
+        });
+    }
 
     let output_dir = match output_dir {
         Some(output_dir) => output_dir,
@@ -313,12 +323,19 @@ pub(crate) fn parse_rhd_smoke_args(
 }
 
 pub(crate) fn default_rhd_bitfile_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("..")
-        .join(kv_rhd::DEFAULT_RHD_BITFILE_NAME)
+    let name = kv_rhd::DEFAULT_RHD_BITFILE_NAME;
+    // Resolve at run time, not compile time: the FPGA bitfile ships next to the
+    // installed binary, so look beside the running executable first and fall
+    // back to the current working directory. Baking in CARGO_MANIFEST_DIR would
+    // point at the build machine's source tree, which never exists on the
+    // deployment host.
+    if let Ok(exe) = std::env::current_exe() {
+        let candidate = exe.parent().map(|dir| dir.join(name));
+        if let Some(candidate) = candidate.filter(|path| path.exists()) {
+            return candidate;
+        }
+    }
+    PathBuf::from(name)
 }
 
 pub(crate) fn parse_benchmark_preset(name: &str) -> Result<BenchmarkPreset, CliError> {
@@ -397,4 +414,59 @@ pub(crate) fn parse_u64(flag: &'static str, value: &str) -> Result<u64, CliError
         flag,
         value: value.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn benchmark(args: &[&str]) -> Result<BenchmarkOptions, CliError> {
+        let mut full = vec!["benchmark"];
+        full.extend_from_slice(args);
+        match parse_args(full) {
+            Ok(CliCommand::Benchmark(options)) => Ok(options),
+            Ok(other) => panic!("expected a benchmark command, got {other:?}"),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn explicit_duration_overrides_a_preset() {
+        // H11: --duration must not be silently dropped when a preset is present.
+        let options = benchmark(&["--preset", "smoke", "--duration", "3.5"]).expect("parses");
+        assert!((options.duration_seconds - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_channels_is_rejected() {
+        // I3: --channels 0 must error rather than produce a degenerate run.
+        let error = benchmark(&["--channels", "0"]).expect_err("zero channels is invalid");
+        assert!(matches!(
+            error,
+            CliError::NonPositiveValue { flag: "--channels" }
+        ));
+    }
+
+    #[test]
+    fn non_positive_sample_rate_is_rejected() {
+        // I3: --sample-rate 0 must error rather than produce a degenerate run.
+        let error = benchmark(&["--sample-rate", "0"]).expect_err("zero sample rate is invalid");
+        assert!(matches!(
+            error,
+            CliError::NonPositiveValue {
+                flag: "--sample-rate"
+            }
+        ));
+    }
+
+    #[test]
+    fn civil_date_matches_known_unix_days() {
+        // L31: cover the proleptic-Gregorian conversion at known epochs.
+        assert_eq!(civil_date_from_unix_days(0), (1970, 1, 1));
+        assert_eq!(civil_date_from_unix_days(31), (1970, 2, 1));
+        // 2000-01-01 is 10_957 days after the unix epoch.
+        assert_eq!(civil_date_from_unix_days(10_957), (2000, 1, 1));
+        // A pre-epoch day stays in 1969.
+        assert_eq!(civil_date_from_unix_days(-1), (1969, 12, 31));
+    }
 }

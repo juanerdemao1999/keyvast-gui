@@ -77,6 +77,16 @@ pub enum RecorderError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A legacy (v1) `.kvraw` file had neither an embedded header nor a
+    /// companion `.json`, so its channel count and sample rate are unknown.
+    MissingMetadata {
+        path: PathBuf,
+    },
+    /// A frame range was so large that computing its byte offset/length
+    /// overflowed the addressable range — the file or request is corrupt.
+    OffsetOverflow {
+        context: &'static str,
+    },
 }
 
 impl fmt::Display for RecorderError {
@@ -101,6 +111,17 @@ impl fmt::Display for RecorderError {
                     path.display()
                 )
             }
+            Self::MissingMetadata { path } => {
+                write!(
+                    formatter,
+                    "legacy kvraw file {} has no embedded header or companion .json; \
+                     channel count and sample rate are unknown",
+                    path.display()
+                )
+            }
+            Self::OffsetOverflow { context } => {
+                write!(formatter, "kvraw {context} computation overflowed")
+            }
         }
     }
 }
@@ -110,7 +131,9 @@ impl std::error::Error for RecorderError {
         match self {
             Self::InvalidBlock { source, .. } => Some(source),
             Self::Io { source, .. } => Some(source),
-            Self::InconsistentBlockConfig { .. } => None,
+            Self::InconsistentBlockConfig { .. }
+            | Self::MissingMetadata { .. }
+            | Self::OffsetOverflow { .. } => None,
         }
     }
 }
@@ -1081,21 +1104,13 @@ impl KvrawReader {
                     })?;
                 parse_kvraw_json(&json_str)
             } else {
-                // Minimal fallback
-                KvrawMetadata {
-                    format_version: 1,
-                    data_offset_bytes: 0,
-                    device_id: String::new(),
-                    backend: String::new(),
-                    sample_rate: 30_000.0,
-                    channel_count: 64,
-                    samples_per_channel: 0,
-                    written_samples: 0,
-                    block_count: 0,
-                    first_packet_id: None,
-                    last_packet_id: None,
-                    clean_stop: false,
-                }
+                // No embedded header and no companion .json: the channel count
+                // and sample rate are genuinely unknown. Fabricating defaults
+                // (64 ch / 30 kHz) would silently mis-interpret every frame, so
+                // surface the missing metadata instead.
+                return Err(RecorderError::MissingMetadata {
+                    path: path.to_path_buf(),
+                });
             };
             // v1 files have raw data from offset 0
             (meta, 0)
@@ -1146,10 +1161,16 @@ impl KvrawReader {
             return Ok(Vec::new());
         }
 
-        let sample_offset = start_frame * ch as u64;
-        let byte_offset = self.data_start + sample_offset * 2;
-        let total_samples = ch * num_frames;
-        let byte_count = total_samples * 2;
+        let overflow = || RecorderError::OffsetOverflow {
+            context: "frame byte-offset",
+        };
+        let sample_offset = start_frame.checked_mul(ch as u64).ok_or_else(overflow)?;
+        let byte_offset = sample_offset
+            .checked_mul(2)
+            .and_then(|bytes| self.data_start.checked_add(bytes))
+            .ok_or_else(overflow)?;
+        let total_samples = ch.checked_mul(num_frames).ok_or_else(overflow)?;
+        let byte_count = total_samples.checked_mul(2).ok_or_else(overflow)?;
 
         self.reader
             .seek(SeekFrom::Start(byte_offset))

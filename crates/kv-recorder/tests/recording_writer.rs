@@ -497,6 +497,43 @@ fn kvraw_reader_round_trips_streaming_data() {
     cleanup_dir(&output_dir);
 }
 
+#[test]
+fn kvraw_reader_errors_on_legacy_file_without_metadata() {
+    use kv_recorder::KvrawReader;
+
+    // A non-v2 file (no KEYVAST magic) with no companion .json: the channel
+    // count and sample rate are unknown, so the reader must refuse rather than
+    // fabricate 64ch/30kHz defaults.
+    let output_dir = unique_output_dir("v1-no-meta");
+    fs::create_dir_all(&output_dir).expect("mkdir");
+    let raw_path = output_dir.join("legacy.kvraw");
+    fs::write(&raw_path, vec![0u8; 4096]).expect("write raw");
+
+    let error = KvrawReader::open(&raw_path).expect_err("missing metadata should be an error");
+    assert!(matches!(error, RecorderError::MissingMetadata { .. }));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvraw_reader_errors_on_truncated_v2_header() {
+    use kv_recorder::KvrawReader;
+
+    // KEYVAST magic followed by fewer than the 4 json-length bytes: the header
+    // is truncated and the reader should surface an I/O error, not panic.
+    let output_dir = unique_output_dir("v2-trunc");
+    fs::create_dir_all(&output_dir).expect("mkdir");
+    let raw_path = output_dir.join("trunc.kvraw");
+    let mut bytes = b"KEYVAST\n".to_vec();
+    bytes.extend_from_slice(&[0u8; 2]);
+    fs::write(&raw_path, bytes).expect("write raw");
+
+    let error = KvrawReader::open(&raw_path).expect_err("truncated header should be an error");
+    assert!(matches!(error, RecorderError::Io { .. }));
+
+    cleanup_dir(&output_dir);
+}
+
 // ---------- M34: StreamingRecorder consistency tests ----------
 
 #[test]

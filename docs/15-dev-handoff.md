@@ -20,7 +20,27 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
+Last updated: 2026-06-25 (doc 20 deep audit imported; batched remediation plan started)
+
+### Session 28: Doc 20 deep-audit remediation — planning + tracker
+
+The in-vivo productionization deep audit (44 findings) is now tracked in-repo:
+
+1. **`docs/20-deep-audit.md`** — the audit itself (2 Critical, 21 High, 15
+   Medium, 6 Low), imported verbatim so fixes can reference `DA` numbers.
+2. **`docs/21-doc20-remediation-plan.md`** — 15 batched PRs (P1–P15) covering all
+   44 findings exactly once, ordered by in-vivo risk, each listing the design
+   docs to sync and any earlier branch to reuse.
+3. `docs/01-documentation-roadmap.md` gains an "Audits And Remediation" section.
+
+**Plan**: land the docs first (this PR), then ship P1…P15 progressively, each as
+its own PR that closes its `DA` items and syncs the listed design docs. `⏳ 待核实`
+findings are re-verified against source before any code change.
+
+**Verification environment** (Windows VM, no MSVC): build/test via the bundled
+GNU toolchain — `cargo +stable-x86_64-pc-windows-gnu test --workspace --exclude
+kv-gui` (all green) and `cargo +stable-x86_64-pc-windows-gnu clippy -p kv-gui`.
+CI itself runs the workspace tests on Linux + a Windows-MSVC clippy check.
 
 ### Session 27: Feature triage — remove probe map + per-channel stats
 

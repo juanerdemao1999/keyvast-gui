@@ -117,7 +117,8 @@ fn single_stream_round_trips_through_the_4_stream_filler_padding() {
 
     let config = test_config(1, 2);
     let raw = build_raw_block(&config, 10, 0x0003);
-    let block = parse_rhythm_data_block(2, &raw, &config).expect("single-stream block should parse");
+    let block =
+        parse_rhythm_data_block(2, &raw, &config).expect("single-stream block should parse");
 
     assert_eq!(block.channel_count, 32);
     assert_eq!(block.samples_per_channel, 2);

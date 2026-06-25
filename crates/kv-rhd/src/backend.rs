@@ -6,7 +6,7 @@ use kv_types::SampleBlock;
 use crate::commands::RhdCommandError;
 use crate::frontpanel::{FrontPanelError, FrontPanelLibrary};
 use crate::impedance;
-use crate::parser::{RhythmParseError, parse_rhythm_data_block};
+use crate::parser::{RhythmParseError, parse_rhythm_data_block_reporting};
 use crate::protocol::{
     CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID,
     DEFAULT_RHD_SAMPLE_RATE, RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
@@ -104,8 +104,16 @@ impl RhdHardwareBackend {
         let raw = self.board.read_raw_block(&self.config)?;
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
-        let block =
-            parse_rhythm_data_block(packet_id, &raw, &self.config).map_err(RhdReadError::Parse)?;
+        let parsed = parse_rhythm_data_block_reporting(packet_id, &raw, &self.config)
+            .map_err(RhdReadError::Parse)?;
+        if !parsed.report.is_clean() {
+            log::warn!(
+                "RHD packet {packet_id} parsed with framing anomalies: {} bad-magic frame(s), {} timestamp discontinuit(ies)",
+                parsed.report.bad_magic_frames,
+                parsed.report.timestamp_discontinuities
+            );
+        }
+        let block = parsed.block;
 
         if !self.logged_first_block {
             self.logged_first_block = true;

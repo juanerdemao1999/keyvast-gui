@@ -130,6 +130,21 @@ impl SampleBlock {
             });
         }
 
+        for per_sample in [&self.ttl_in_per_sample, &self.ttl_out_per_sample]
+            .into_iter()
+            .flatten()
+        {
+            for (sample_index, &ttl_bits) in per_sample.iter().enumerate() {
+                if ttl_bits & !allowed_mask != 0 {
+                    return Err(SampleBlockError::TtlPerSampleOutOfRange {
+                        sample_index,
+                        ttl_bits,
+                        ttl_line_count,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -144,6 +159,11 @@ pub enum SampleBlockError {
         observed: usize,
     },
     TtlBitsOutOfRange {
+        ttl_bits: u32,
+        ttl_line_count: usize,
+    },
+    TtlPerSampleOutOfRange {
+        sample_index: usize,
         ttl_bits: u32,
         ttl_line_count: usize,
     },
@@ -168,6 +188,14 @@ impl fmt::Display for SampleBlockError {
             } => write!(
                 formatter,
                 "ttl bits {ttl_bits:#034b} exceed configured ttl line count {ttl_line_count}"
+            ),
+            Self::TtlPerSampleOutOfRange {
+                sample_index,
+                ttl_bits,
+                ttl_line_count,
+            } => write!(
+                formatter,
+                "per-sample ttl bits {ttl_bits:#034b} at sample {sample_index} exceed configured ttl line count {ttl_line_count}"
             ),
             Self::TtlLineCountOutOfRange { ttl_line_count } => write!(
                 formatter,
@@ -342,5 +370,26 @@ mod tests {
             block.validate_against_ttl_lines(33),
             Err(SampleBlockError::TtlLineCountOutOfRange { ttl_line_count: 33 })
         );
+    }
+
+    #[test]
+    fn validate_against_ttl_lines_enforces_the_mask_per_sample() {
+        let mut block = valid_block();
+        // Summary ttl_bits stays within the mask, but a per-sample word does not.
+        block.ttl_bits = 0b0010;
+        block.ttl_in_per_sample = Some(vec![0b0001, 0b0010, 0b1_0000]);
+        assert_eq!(
+            block.validate_against_ttl_lines(4),
+            Err(SampleBlockError::TtlPerSampleOutOfRange {
+                sample_index: 2,
+                ttl_bits: 0b1_0000,
+                ttl_line_count: 4,
+            })
+        );
+
+        // Within-mask per-sample vectors on both directions pass.
+        block.ttl_in_per_sample = Some(vec![0b0001, 0b0010, 0b0100]);
+        block.ttl_out_per_sample = Some(vec![0b1000, 0b0000, 0b0011]);
+        assert_eq!(block.validate_against_ttl_lines(4), Ok(()));
     }
 }

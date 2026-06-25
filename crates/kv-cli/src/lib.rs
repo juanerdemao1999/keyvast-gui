@@ -15,8 +15,9 @@ pub(crate) use kv_core::process_metrics::{ProcessMetrics, ProcessMetricsCollecto
 pub(crate) use kv_core::{AcquisitionRunError, AcquisitionRunSummary, run_fixed_blocks};
 pub(crate) use kv_integrity::IntegrityReport;
 pub(crate) use kv_recorder::{
-    BenchmarkSummary, RecorderError, RecordingSummary, write_benchmark_summary, write_events_csv,
-    write_integrity_summary, write_log_file, write_recording, write_recording_with_backend,
+    BenchmarkSummary, RecorderError, RecordingSummary, ttl_change_events, write_benchmark_summary,
+    write_events_csv, write_integrity_summary, write_log_file, write_recording,
+    write_recording_with_backend,
 };
 pub(crate) use kv_rhd::{
     DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE,

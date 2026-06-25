@@ -50,7 +50,10 @@ pub fn run_simulator_recording(
         &options.output_dir,
         &simulator_recording_log_lines(&acquisition.integrity),
     )?;
-    let events = simulator_recording_events(&acquisition.integrity);
+    let events = simulator_recording_events(
+        &acquisition.integrity,
+        ttl_change_events(&acquisition.blocks),
+    );
     write_events_csv(&options.output_dir, &events)?;
     let benchmark =
         simulator_benchmark_summary(&acquisition.summary, &recording, &acquisition.integrity);
@@ -104,7 +107,10 @@ pub fn run_simulator_pipeline(
         &options.output_dir,
         &simulator_recording_log_lines(&pipeline_result.integrity),
     )?;
-    let events = simulator_recording_events(&pipeline_result.integrity);
+    let events = simulator_recording_events(
+        &pipeline_result.integrity,
+        ttl_change_events(&pipeline_result.recorded_blocks),
+    );
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = pipeline_benchmark_summary(&pipeline_result, &recording);
@@ -158,7 +164,7 @@ pub fn run_simulator_stream(
         &options.output_dir,
         &simulator_recording_log_lines(&result.integrity),
     )?;
-    let events = simulator_recording_events(&result.integrity);
+    let events = simulator_recording_events(&result.integrity, Vec::new());
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = streaming_benchmark_summary(&result, &streaming_config.device, None);
@@ -244,7 +250,7 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
         &options.output_dir,
         &simulator_recording_log_lines(&result.integrity),
     )?;
-    let events = simulator_recording_events(&result.integrity);
+    let events = simulator_recording_events(&result.integrity, Vec::new());
     write_events_csv(&options.output_dir, &events)?;
 
     let benchmark = streaming_benchmark_summary(&result, &device, process_metrics.as_ref());

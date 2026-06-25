@@ -162,10 +162,15 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn simulator_recording_events(integrity: &IntegrityReport) -> Vec<AcquisitionEvent> {
+pub(crate) fn simulator_recording_events(
+    integrity: &IntegrityReport,
+    ttl_events: Vec<AcquisitionEvent>,
+) -> Vec<AcquisitionEvent> {
     let mut events = vec![AcquisitionEvent::Started {
         timestamp_host_ms: now_ms(),
     }];
+
+    events.extend(ttl_events);
 
     for gap in &integrity.packet_gaps {
         events.push(AcquisitionEvent::PacketMissing {

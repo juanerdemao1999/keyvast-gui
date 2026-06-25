@@ -136,6 +136,50 @@ Human-readable operational log:
 [INFO] acquisition stopped cleanly
 ```
 
+## Failure Handling and Finalization
+
+A recording that fails partway through must never silently discard the data
+acquired before the failure. In-vivo acquisitions are unreproducible, so the
+recorder always finalizes whatever was captured.
+
+### Streaming pipeline (DA12)
+
+`run_streaming_pipeline` writes each block through a `StreamingRecorder` as it
+arrives. The acquisition (producer) runs on its own thread; the recorder
+consumer drains it on the caller's thread. On any error — a recorder write
+failure, an integrity-check error, or a producer-reported acquisition error —
+the pipeline:
+
+1. sets a shared `stop_requested` flag and notifies the producer, so it stops
+   reading hardware into a buffer no one is draining (no orphaned acquisition
+   thread);
+2. joins the producer thread;
+3. calls `recorder.finish()` so `recording.kvraw` is flushed and its header is
+   rewritten with the final block/sample counts instead of being left
+   truncated.
+
+A producer failure surfaces as `PipelineError::ProducerFailed { message,
+blocks_acquired }`, where `blocks_acquired` reports how many blocks reached
+disk before the failure.
+
+### Fixed-block CLI paths (DA14)
+
+The `simulator-record` and `rhd-smoke` commands acquire a bounded number of
+blocks before writing. If a backend read fails mid-run, the blocks already
+acquired are carried out of acquisition (rather than dropped) and a **partial
+recording is finalized** — `recording.kvraw`, `recording.json`,
+`integrity.json`, `events.csv`, `benchmark.json`, and `log.txt` are all written
+from the partial data. The log is prefixed with:
+
+```text
+[WARN] acquisition ended early: backend read failed; partial recording finalized
+```
+
+The command still returns the underlying read error to the caller, but the
+captured signal is preserved on disk. For long-running hardware acquisitions
+prefer the streaming commands (`simulator-stream`, `benchmark`), which flush to
+disk incrementally and keep memory bounded.
+
 ## Later Export Formats
 
 Do not write these during acquisition in the first MVP:

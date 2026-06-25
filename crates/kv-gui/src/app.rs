@@ -56,6 +56,11 @@ use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 /// is re-filtered (lets slider drags settle first).
 const REFILTER_DEBOUNCE_MS: u64 = 150;
 
+/// Channels whose absolute sample is at or above this (≈0.998 of full scale)
+/// are treated as rail-pinned/saturated and excluded from the common-average
+/// reference so a single dead electrode can't poison every channel (DA22).
+const CAR_RAIL_EXCLUDE_I16: u16 = 32_700;
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,6 +562,31 @@ impl KvApp {
         }
     }
 
+    /// Common-average reference for one time step: the mean of the samples,
+    /// excluding channels pinned to the ADC rail (saturated / dead-electrode)
+    /// so they don't contaminate the reference. Accumulates in f64. Falls back
+    /// to the full mean when every channel is railed, so the reference is never
+    /// undefined.
+    fn car_reference_mean(samples: &[i16]) -> f64 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        let mut n = 0usize;
+        for &v in samples {
+            if v.unsigned_abs() < CAR_RAIL_EXCLUDE_I16 {
+                sum += v as f64;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            // All channels railed — no clean reference available; use the full
+            // mean rather than dropping CAR entirely.
+            return samples.iter().map(|&v| v as f64).sum::<f64>() / samples.len() as f64;
+        }
+        sum / n as f64
+    }
+
     /// Apply filter chains to a single block, producing a new filtered block.
     fn filter_block_with_chains(
         block: &SampleBlock,
@@ -568,16 +598,17 @@ impl KvApp {
         let mut data = block.data.clone();
 
         for s in 0..spc {
-            // CAR: subtract mean across channels at this time step
+            // CAR: subtract the common-average reference at this time step.
+            // The reference mean excludes rail-pinned (saturated) channels so a
+            // single dead/saturated electrode can't inject its inverted artifact
+            // (scaled 1/N) into every other channel, and the subtraction rounds
+            // once in f64 rather than truncating toward zero (DA22).
             if car_enabled && ch_count > 0 {
                 let base = s * ch_count;
-                let mut sum: f64 = 0.0;
+                let mean = Self::car_reference_mean(&data[base..base + ch_count]);
                 for ch in 0..ch_count {
-                    sum += data[base + ch] as f64;
-                }
-                let mean = sum / ch_count as f64;
-                for ch in 0..ch_count {
-                    data[base + ch] = (data[base + ch] as f64 - mean) as i16;
+                    let corrected = (data[base + ch] as f64 - mean).round();
+                    data[base + ch] = corrected.clamp(i16::MIN as f64, i16::MAX as f64) as i16;
                 }
             }
             // Per-channel biquad filter
@@ -2591,6 +2622,32 @@ mod tests {
         // Metadata is preserved; only the samples change.
         assert_eq!(out.channel_count, block.channel_count);
         assert_eq!(out.samples_per_channel, block.samples_per_channel);
+    }
+
+    #[test]
+    fn car_reference_mean_excludes_railed_channels() {
+        // Three clean channels around 100 and one dead electrode pinned to the
+        // positive rail. The reference must be the mean of the clean channels
+        // (~100), not dragged toward the rail by the bad channel (DA22).
+        let mean = KvApp::car_reference_mean(&[90, 100, 110, i16::MAX]);
+        assert!((mean - 100.0).abs() < 1e-9, "got {mean}");
+        // With every channel railed there is no clean reference; fall back to
+        // the full mean so CAR is still defined.
+        let all_railed = KvApp::car_reference_mean(&[i16::MAX, i16::MAX]);
+        assert!((all_railed - i16::MAX as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn car_does_not_inject_railed_channel_artifact() {
+        // One railed channel + three clean DC channels at 100. Without rail
+        // exclusion the reference would be (3*100 + 32767)/4 ≈ 8267, smearing a
+        // huge inverted offset across the clean channels. Excluding the rail
+        // leaves the clean channels near zero after CAR.
+        let block = block_interleaved(4, 1, vec![100, 100, 100, i16::MAX]);
+        let mut chains = vec![FilterChain::passthrough(); 4];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, true);
+        // Clean channels: 100 - mean(100,100,100)=100 -> 0.
+        assert_eq!(&out.data[0..3], &[0, 0, 0]);
     }
 }
 

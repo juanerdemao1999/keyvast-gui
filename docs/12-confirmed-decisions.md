@@ -90,3 +90,22 @@ crates/kv-gui
 This lets each part stay small, while still building as one project.
 
 The folder can stay named `51_keyvast_gui`. Rust crate names should use normal package names such as `kv-types`, `kv-core`, and `kv-cli`.
+
+## Saturation / railing indicator (DA21)
+
+`finalize_channel` removes each channel's window mean before applying gain. A
+channel pinned to the ADC rail (a saturated amp or dead/floating electrode sits
+at ≈±1.0 normalized, i.e. ±32767) therefore drops to ≈0 after mean subtraction
+and renders as a flat line on the baseline — visually identical to a quiet,
+healthy channel. The single most valuable bring-up check (spotting saturation,
+floating grounds, and bad electrodes) was defeated, and the display actively
+disguised the fault.
+
+`collect_from_ring` now runs `lane_is_saturated` on the **raw normalized points,
+before** DC removal: a lane is flagged when at least `SAT_FRACTION` (0.5) of its
+window samples are at or beyond `SAT_LEVEL` (0.98 of full scale). A railed lane
+sits near 1.0 for ~100% of the window; a healthy channel with the occasional
+large transient stays far below the fraction. Flagged lanes are drawn in the
+warning color and tagged with a left-edge **`SAT`** badge (opposite the
+right-edge spike counts so the two never overlap). The check operates on the
+already-decimated display points, so it adds no measurable per-frame cost.

@@ -99,13 +99,12 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
         .summary
         .observed_packets
         .saturating_add(report.summary.missing_packets);
-    report.summary.expected_samples = report.summary.written_samples.saturating_add(
-        report
-            .packet_gaps
-            .iter()
-            .map(|gap| expected_missing_samples(blocks, gap))
-            .sum::<u64>(),
-    );
+    // `expected_samples` accumulated the missing-sample estimate for each gap
+    // as it was found (O(n) total); add the samples actually written.
+    report.summary.expected_samples = report
+        .summary
+        .expected_samples
+        .saturating_add(report.summary.written_samples);
 
     Ok(report)
 }
@@ -135,6 +134,12 @@ fn check_packet_continuity(
     }
 
     report.summary.missing_packets = report.summary.missing_packets.saturating_add(forward_gap);
+    // The block right before the gap is `previous`, so the missing-sample
+    // estimate can be computed here instead of re-scanning all blocks per gap.
+    report.summary.expected_samples = report
+        .summary
+        .expected_samples
+        .saturating_add((previous.expected_sample_values() as u64).saturating_mul(forward_gap));
     report.packet_gaps.push(PacketGap {
         expected_packet_id,
         observed_packet_id: current.packet_id,
@@ -162,15 +167,6 @@ fn check_timestamp_continuity(
                 observed_timestamp_start: current.timestamp_start,
             });
     }
-}
-
-fn expected_missing_samples(blocks: &[SampleBlock], gap: &PacketGap) -> u64 {
-    blocks
-        .iter()
-        .find(|block| block.packet_id.wrapping_add(1) == gap.expected_packet_id)
-        .map(|block| block.expected_sample_values() as u64)
-        .unwrap_or_default()
-        .saturating_mul(gap.missing_count)
 }
 
 /// Incremental integrity checker that processes blocks one at a time.

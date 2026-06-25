@@ -106,8 +106,14 @@ fn pipeline_propagates_producer_error() {
 
     let error = run_threaded_pipeline(&config, source).expect_err("pipeline should fail");
     match error {
-        PipelineError::ProducerFailed(message) => {
+        PipelineError::ProducerFailed {
+            message,
+            blocks_acquired,
+        } => {
             assert_eq!(message, "synthetic producer failure");
+            // The synthetic producer emits a few blocks before failing, so the
+            // count must be recorded rather than lost.
+            assert!(blocks_acquired > 0);
         }
         other => panic!("expected ProducerFailed, got: {other}"),
     }

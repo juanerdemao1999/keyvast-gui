@@ -70,7 +70,12 @@ pub struct StreamingPipelineResult {
 #[derive(Debug)]
 pub enum PipelineError {
     BufferSetup(BufferError),
-    ProducerFailed(String),
+    ProducerFailed {
+        message: String,
+        /// Number of blocks successfully acquired before the failure, so
+        /// callers can tell "failed after 0 blocks" from "failed after 999".
+        blocks_acquired: u64,
+    },
     ProducerPanicked,
     IntegrityCheck(IntegrityError),
     Recorder(RecorderError),
@@ -80,7 +85,13 @@ impl fmt::Display for PipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::BufferSetup(error) => write!(formatter, "buffer setup failed: {error}"),
-            Self::ProducerFailed(message) => write!(formatter, "producer failed: {message}"),
+            Self::ProducerFailed {
+                message,
+                blocks_acquired,
+            } => write!(
+                formatter,
+                "producer failed after {blocks_acquired} blocks: {message}"
+            ),
             Self::ProducerPanicked => write!(formatter, "producer thread panicked"),
             Self::IntegrityCheck(error) => write!(formatter, "integrity check failed: {error}"),
             Self::Recorder(error) => write!(formatter, "recorder failed: {error}"),
@@ -94,7 +105,7 @@ impl std::error::Error for PipelineError {
             Self::BufferSetup(error) => Some(error),
             Self::IntegrityCheck(error) => Some(error),
             Self::Recorder(error) => Some(error),
-            Self::ProducerFailed(_) | Self::ProducerPanicked => None,
+            Self::ProducerFailed { .. } | Self::ProducerPanicked => None,
         }
     }
 }
@@ -211,7 +222,10 @@ where
 
         if done {
             if let Some(error) = error {
-                return Err(PipelineError::ProducerFailed(error));
+                return Err(PipelineError::ProducerFailed {
+                    message: error,
+                    blocks_acquired: recorded_blocks.len() as u64,
+                });
             }
             break;
         }
@@ -386,7 +400,14 @@ where
 
         if done {
             if let Some(error) = error {
-                return Err(PipelineError::ProducerFailed(error));
+                let blocks_acquired = recorder.block_count();
+                // Finalize the file (flush + rewrite the header) even on the
+                // error path so a partial .kvraw is not left silently truncated.
+                let _ = recorder.finish();
+                return Err(PipelineError::ProducerFailed {
+                    message: error,
+                    blocks_acquired,
+                });
             }
             break;
         }

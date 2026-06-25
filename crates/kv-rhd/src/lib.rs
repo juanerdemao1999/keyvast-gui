@@ -2,10 +2,13 @@
 
 mod backend;
 mod commands;
+mod frame_analysis;
 mod frontpanel;
 pub mod impedance;
 mod parser;
 mod protocol;
+mod rhythm_acquire;
+mod rhythm_board;
 
 pub use backend::{RhdHardwareBackend, RhdHardwareOptions, RhdReadError};
 pub use commands::{

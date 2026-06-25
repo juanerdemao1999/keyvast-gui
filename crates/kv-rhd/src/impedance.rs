@@ -207,6 +207,199 @@ impl fmt::Display for ImpedanceError {
 
 impl std::error::Error for ImpedanceError {}
 
+use crate::backend::RhdReadError;
+use crate::commands::{AuxCommandSlot, Rhd2000Registers};
+use crate::frame_analysis::extract_channel_from_raw;
+use crate::protocol::CHANNELS_PER_STREAM;
+use crate::rhythm_board::RhythmFrontPanelBoard;
+
+impl RhythmFrontPanelBoard {
+    /// Run impedance measurement across all channels using the on-chip DAC.
+    ///
+    /// Algorithm (port of Intan RHX `impedancereader.cpp`):
+    /// 1. Upload DC waveform to AuxCmd1 Bank 0, sine wave to AuxCmd1 Bank 1.
+    /// 2. Upload register configs with zcheck enabled + 3 cap scales to
+    ///    AuxCmd3 Banks 2/3/4.
+    /// 3. For each channel: set zcheck_select, switch banks, run acquisition.
+    /// 4. Compute impedance magnitude/phase via DFT at the test frequency.
+    /// 5. Auto-select the best capacitor scale and re-measure if needed.
+    pub(crate) fn run_impedance_test(
+        &self,
+        config: &crate::impedance::ImpedanceTestConfig,
+        enabled_streams: usize,
+        progress_callback: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<crate::impedance::ImpedanceResult, RhdReadError> {
+        use crate::commands::ZcheckScale;
+
+        log::info!(
+            "starting impedance test: freq={:.0} Hz, {} channels, {} periods",
+            config.frequency_hz,
+            config.channel_count,
+            config.num_periods
+        );
+
+        let mut registers = Rhd2000Registers::open_ephys_default();
+
+        // ── Step 1: Upload DAC waveforms to AuxCmd1 ──────────────
+        // Bank 0: DC (flat mid-scale).
+        let dc_dac = registers
+            .create_command_list_zcheck_dac(0.0, 0.0)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&dc_dac, AuxCommandSlot::AuxCmd1, 0)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1)?;
+
+        // Bank 1: sine wave at the test frequency.
+        let sine_dac = registers
+            .create_command_list_zcheck_dac(config.frequency_hz, config.dac_amplitude)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&sine_dac, AuxCommandSlot::AuxCmd1, 1)?;
+
+        // ── Step 2: Upload zcheck register configs to AuxCmd3 ────
+        registers.enable_zcheck(true);
+
+        registers.set_zcheck_scale(ZcheckScale::Cs100fF);
+        registers.set_zcheck_polarity(false);
+        let zcheck_100ff = registers
+            .create_command_list_register_config(false)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&zcheck_100ff, AuxCommandSlot::AuxCmd3, 2)?;
+
+        registers.set_zcheck_scale(ZcheckScale::Cs1pF);
+        let zcheck_1pf = registers
+            .create_command_list_register_config(false)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&zcheck_1pf, AuxCommandSlot::AuxCmd3, 3)?;
+
+        registers.set_zcheck_scale(ZcheckScale::Cs10pF);
+        let zcheck_10pf = registers
+            .create_command_list_register_config(false)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&zcheck_10pf, AuxCommandSlot::AuxCmd3, 4)?;
+
+        // ── Step 3: Measure each channel ─────────────────────────
+        let samples_needed = config.total_samples();
+        let channels = config
+            .channel_count
+            .min(CHANNELS_PER_STREAM * enabled_streams);
+
+        let mut results: Vec<crate::impedance::ChannelImpedance> = Vec::with_capacity(channels);
+
+        // Start with sine wave on AuxCmd1 Bank 1.
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 1)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, sine_dac.len() - 1)?;
+
+        for ch in 0..channels {
+            if let Some(cb) = progress_callback {
+                cb(ch, channels);
+            }
+
+            let chip_channel = (ch % CHANNELS_PER_STREAM) as u8;
+            registers.set_zcheck_channel(chip_channel);
+
+            // Initial measurement with 1 pF (Bank 3).
+            registers.set_zcheck_scale(ZcheckScale::Cs1pF);
+            let updated_cfg = registers
+                .create_command_list_register_config(false)
+                .map_err(RhdReadError::Command)?;
+            self.upload_command_list(&updated_cfg, AuxCommandSlot::AuxCmd3, 3)?;
+            self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, 3)?;
+
+            self.flush_fifo()?;
+            self.set_max_time_step(samples_needed as u32)?;
+            self.set_continuous_run_mode(false)?;
+            self.run()?;
+            self.wait_until_not_running()?;
+
+            let raw = self.read_pipe_block(enabled_streams, samples_needed)?;
+            let amp_data = extract_channel_from_raw(&raw, enabled_streams, samples_needed, ch);
+
+            let (mag_1pf, phase_1pf) = crate::impedance::compute_impedance(
+                &amp_data,
+                config.sample_rate,
+                config.frequency_hz,
+                ZcheckScale::Cs1pF,
+            );
+
+            // Auto-select the best scale and re-measure if needed.
+            let best_scale = crate::impedance::auto_select_scale(mag_1pf);
+
+            let (magnitude, phase, scale) = if best_scale != ZcheckScale::Cs1pF {
+                registers.set_zcheck_scale(best_scale);
+                let re_cfg = registers
+                    .create_command_list_register_config(false)
+                    .map_err(RhdReadError::Command)?;
+
+                let bank = match best_scale {
+                    ZcheckScale::Cs100fF => 2,
+                    ZcheckScale::Cs1pF => 3,
+                    ZcheckScale::Cs10pF => 4,
+                };
+
+                self.upload_command_list(&re_cfg, AuxCommandSlot::AuxCmd3, bank)?;
+                self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, bank)?;
+
+                self.flush_fifo()?;
+                self.set_max_time_step(samples_needed as u32)?;
+                self.set_continuous_run_mode(false)?;
+                self.run()?;
+                self.wait_until_not_running()?;
+
+                let raw2 = self.read_pipe_block(enabled_streams, samples_needed)?;
+                let amp2 = extract_channel_from_raw(&raw2, enabled_streams, samples_needed, ch);
+
+                let (mag, ph) = crate::impedance::compute_impedance(
+                    &amp2,
+                    config.sample_rate,
+                    config.frequency_hz,
+                    best_scale,
+                );
+                (mag, ph, best_scale)
+            } else {
+                (mag_1pf, phase_1pf, ZcheckScale::Cs1pF)
+            };
+
+            results.push(crate::impedance::ChannelImpedance {
+                channel: ch,
+                magnitude_ohms: magnitude,
+                phase_degrees: phase,
+                scale_used: scale,
+                valid: magnitude.is_finite() && magnitude > 0.0,
+            });
+        }
+
+        // ── Step 4: Restore normal operation ─────────────────────
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 0)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dc_dac.len() - 1)?;
+
+        registers.enable_zcheck(false);
+        let normal_cfg = registers
+            .create_command_list_register_config(false)
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&normal_cfg, AuxCommandSlot::AuxCmd3, 1)?;
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, 1)?;
+
+        registers.set_dig_out_low();
+        let dig_out = registers
+            .create_command_list_update_dig_out()
+            .map_err(RhdReadError::Command)?;
+        self.upload_command_list(&dig_out, AuxCommandSlot::AuxCmd1, 0)?;
+        self.select_aux_command_length(AuxCommandSlot::AuxCmd1, 0, dig_out.len() - 1)?;
+        self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd1, 0)?;
+
+        self.flush_fifo()?;
+
+        log::info!(
+            "impedance test complete: {} channels measured",
+            results.len()
+        );
+
+        Ok(crate::impedance::ImpedanceResult {
+            config: config.clone(),
+            channels: results,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

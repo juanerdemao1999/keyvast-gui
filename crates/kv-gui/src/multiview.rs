@@ -531,21 +531,22 @@ impl<'a> KvTileBehavior<'a> {
             self.sweep_start_ms
         };
 
-        // Use a temporary display settings that overrides visible_channels with
-        // this tile's visible_count so draw_waveform_area renders the right number.
-        let mut tile_display = self.display.clone();
-        tile_display.visible_channels = visible_count;
-
+        // Override visible_channels with this tile's visible_count for the
+        // draw call, then restore it. Temporarily mutating the shared settings
+        // avoids cloning the whole struct (two Vecs) every frame per tile.
+        let prev_visible = self.display.visible_channels;
+        self.display.visible_channels = visible_count;
         waveform::draw_waveform_area(
             ui,
             ring,
             self.latest_block,
             *start_ch,
-            &tile_display,
+            self.display,
             self.filters,
             sweep_left_ms,
             self.empty_hint,
         );
+        self.display.visible_channels = prev_visible;
 
         // Tile type badge (top-left corner)
         let painter = ui.painter();

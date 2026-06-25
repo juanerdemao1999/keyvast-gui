@@ -55,7 +55,10 @@ pub fn compute_spectrum(
     fft_size: usize,
     hardware_sample_rate: f64,
 ) -> Vec<[f64; 2]> {
-    if !ring.ready || hardware_sample_rate <= 0.0 {
+    // The radix-2 FFT requires a power-of-two length; reject anything else
+    // here (in release builds `fft_radix2` only `debug_assert!`s this) so a
+    // bad caller gets an empty spectrum rather than a wrong/garbage one.
+    if !ring.ready || hardware_sample_rate <= 0.0 || fft_size == 0 || !fft_size.is_power_of_two() {
         return Vec::new();
     }
 

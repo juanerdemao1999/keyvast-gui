@@ -359,12 +359,15 @@ pub fn draw_spike_overlay(
                 continue;
             }
             let total = snippet.samples.len().max(1);
+            // Guard the single-sample case: `total - 1 == 0` would make the
+            // normalized position NaN/inf. With one sample we place it at x_left.
+            let denom = (total - 1).max(1) as f64;
             let pts: Vec<[f64; 2]> = snippet
                 .samples
                 .iter()
                 .enumerate()
                 .map(|(i, &v)| {
-                    let t_ms = x_left + (i as f64 / (total - 1) as f64) * (x_right - x_left);
+                    let t_ms = x_left + (i as f64 / denom) * (x_right - x_left);
                     let y = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
                         - (disp_pos as f64) * ch_spacing;
                     [t_ms, y]

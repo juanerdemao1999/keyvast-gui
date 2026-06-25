@@ -366,3 +366,80 @@ pub fn pick_kvraw_file() -> Option<PathBuf> {
         .add_filter("KVRAW recording", &["kvraw"])
         .pick_file()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kv_recorder::StreamingRecorder;
+    use kv_types::SampleBlock;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const CH: usize = 4;
+    const SPC: usize = 8;
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("kv_playback_test_{tag}_{pid}_{n}"))
+    }
+
+    fn block(packet_id: u64) -> SampleBlock {
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id,
+            timestamp_start: packet_id * SPC as u64,
+            sample_rate: 30_000.0,
+            channel_count: CH,
+            samples_per_channel: SPC,
+            ttl_bits: 0,
+            data: (0..CH * SPC).map(|i| i as i16).collect(),
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    /// Write a 2-block recording.kvraw into a fresh temp dir and return its path.
+    fn write_recording(tag: &str) -> PathBuf {
+        let dir = unique_dir(tag);
+        let mut rec = StreamingRecorder::new(&dir).expect("create recorder");
+        rec.write_block(&block(0)).expect("write block 0");
+        rec.write_block(&block(1)).expect("write block 1");
+        rec.finish().expect("finish recording");
+        dir.join("recording.kvraw")
+    }
+
+    #[test]
+    fn tick_emits_a_block_then_none_until_cursor_moves() {
+        let path = write_recording("tick");
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        assert!(pb.is_loaded());
+        assert_eq!(pb.state, PlaybackState::Paused);
+
+        // First tick reads the block at the current cursor position.
+        let first = pb.tick().expect("first tick yields a block");
+        assert_eq!(first.channel_count, CH);
+
+        // Cursor has not moved, so a paused tick produces no fresh block.
+        assert!(pb.tick().is_none());
+
+        // Seeking moves the cursor, so the next tick emits again.
+        pb.seek_to(10);
+        assert_eq!(pb.cursor_frame, 10);
+        assert!(pb.tick().is_some());
+    }
+
+    #[test]
+    fn seek_to_clamps_to_total_frames() {
+        let path = write_recording("seek");
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        // 2 blocks * 8 samples = 16 frames total.
+        pb.seek_to(9_999);
+        assert_eq!(pb.cursor_frame, (2 * SPC) as u64);
+    }
+}

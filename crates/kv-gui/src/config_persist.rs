@@ -153,7 +153,6 @@ impl PersistentConfig {
             amp_scale_idx = self.amp_scale_idx,
             show_grid = self.show_grid,
             channel_spacing = self.channel_spacing,
-            display_mode = self.display_mode,
             color_by_group = self.color_by_group,
             channels_per_group = self.channels_per_group,
             hp_enabled = self.hp_enabled,
@@ -163,13 +162,14 @@ impl PersistentConfig {
             notch_enabled = self.notch_enabled,
             notch_idx = self.notch_idx,
             car_enabled = self.car_enabled,
-            output_dir = self.output_dir.replace('\\', "\\\\").replace('"', "\\\""),
-            file_prefix = self.file_prefix.replace('"', "\\\""),
+            output_dir = json_escape(&self.output_dir),
+            file_prefix = json_escape(&self.file_prefix),
             remote_port = self.remote_port,
             ui_scale = self.ui_scale,
             window_width = self.window_width,
             window_height = self.window_height,
-            last_source = self.last_source,
+            display_mode = json_escape(&self.display_mode),
+            last_source = json_escape(&self.last_source),
         )
     }
 
@@ -326,10 +326,22 @@ impl PersistentConfig {
 
 // ── File I/O ────────────────────────────────────────────────────────
 
-/// Save config to disk.
+/// Escape a string for safe embedding inside a double-quoted JSON string.
+/// Backslash first so the escapes we add afterwards are not double-escaped.
+fn json_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Save config to disk atomically: write to a sibling temp file, then rename
+/// over the target so a crash mid-write cannot leave a truncated config.
 pub fn save_config(path: &PathBuf, config: &PersistentConfig) -> Result<(), String> {
     let json = config.to_json();
-    fs::write(path, json).map_err(|e| format!("Failed to save config: {e}"))
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, json).map_err(|e| format!("Failed to save config: {e}"))?;
+    fs::rename(&tmp, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Failed to save config: {e}")
+    })
 }
 
 /// Load config from disk.

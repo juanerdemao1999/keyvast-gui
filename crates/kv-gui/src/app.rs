@@ -213,6 +213,9 @@ pub struct KvApp {
     ui_scale: f32,
     /// Set once after the first frame restores the saved window size (#15).
     window_restored: bool,
+    /// Window size persisted at startup, reused on the first frame so the
+    /// config file is read once (in `new`) rather than again in `update`.
+    restore_window_size: (f32, f32),
 }
 
 impl KvApp {
@@ -293,6 +296,7 @@ impl KvApp {
             config_persist: ConfigPersistState::default(),
             ui_scale,
             window_restored: false,
+            restore_window_size: (saved.window_width, saved.window_height),
         };
 
         // Apply the persisted display/filter/recording settings to live state.
@@ -894,6 +898,13 @@ impl KvApp {
                     let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
+                } else {
+                    // No live pipeline (e.g. it was already torn down): there is
+                    // no recorder thread to emit RecorderEvent::Stopped, so reset
+                    // the recording state here instead of leaving it stuck.
+                    self.recording.state = RecordingState::Idle;
+                    self.recording_start_time = None;
+                    self.recorder_buffer_occupancy = 0.0;
                 }
             }
             AcqMode::Demo => {
@@ -1492,9 +1503,9 @@ impl eframe::App for KvApp {
         // config the rest of the settings come from.
         if !self.window_restored {
             self.window_restored = true;
-            let saved = config_persist::load_or_default();
-            let w = saved.window_width.clamp(640.0, 7680.0);
-            let h = saved.window_height.clamp(480.0, 4320.0);
+            let (sw, sh) = self.restore_window_size;
+            let w = sw.clamp(640.0, 7680.0);
+            let h = sh.clamp(480.0, 4320.0);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
 
@@ -1895,7 +1906,10 @@ impl eframe::App for KvApp {
         // ── Device error banner ─────────────────────────────────
         // Surfaced when the acquisition source fails to open or read.
         // Dismissible; the GUI and any other mode keep running regardless.
-        if let Some(err) = self.device_error.clone() {
+        // Borrow the message instead of cloning it every frame; record the
+        // dismiss action in a local and apply it after the panel closure ends.
+        let mut dismiss_device_error = false;
+        if let Some(err) = self.device_error.as_ref() {
             egui::TopBottomPanel::top("device_error_banner")
                 .frame(
                     egui::Frame::new()
@@ -1912,11 +1926,14 @@ impl eframe::App for KvApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Dismiss").clicked() {
-                                self.device_error = None;
+                                dismiss_device_error = true;
                             }
                         });
                     });
                 });
+        }
+        if dismiss_device_error {
+            self.device_error = None;
         }
 
         // ── Bottom status bar ───────────────────────────────────

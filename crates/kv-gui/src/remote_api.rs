@@ -26,6 +26,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -87,6 +88,42 @@ pub struct RemoteResponse {
     pub id: u64,
     /// Result JSON string (success) or error message.
     pub result: Result<String, String>,
+    /// When the GUI produced this response. Used to evict responses whose
+    /// client already timed out or disconnected, so the queue cannot leak.
+    enqueued_at: Instant,
+}
+
+impl RemoteResponse {
+    /// Build a response stamped with the current time.
+    pub fn new(id: u64, result: Result<String, String>) -> Self {
+        Self {
+            id,
+            result,
+            enqueued_at: Instant::now(),
+        }
+    }
+}
+
+/// Drop responses older than this. A client polls for ~100 ms then gives up,
+/// so anything older than a few seconds has no reader and would otherwise leak.
+const RESPONSE_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Enqueue a response, capping the queue length and discarding the oldest
+/// entry on overflow so a flood of unread responses cannot exhaust memory.
+pub fn push_response(responses: &ResponseQueue, response: RemoteResponse) {
+    let mut q = lock_recover(responses);
+    if q.len() >= MAX_QUEUE_LEN {
+        q.pop_front();
+    }
+    q.push_back(response);
+}
+
+/// Remove responses whose client never collected them (timed out or
+/// disconnected) so the shared queue does not grow without bound.
+pub fn sweep_stale_responses(responses: &ResponseQueue) {
+    let mut q = lock_recover(responses);
+    let now = Instant::now();
+    q.retain(|r| now.duration_since(r.enqueued_at) < RESPONSE_MAX_AGE);
 }
 
 /// Current application status (for `get_status` response).
@@ -577,5 +614,39 @@ mod tests {
     fn parse_invalid_request() {
         assert!(parse_jsonrpc_request("not json").is_none());
         assert!(parse_jsonrpc_request("{}").is_none());
+    }
+
+    #[test]
+    fn push_response_caps_queue_length() {
+        let responses: ResponseQueue = Arc::new(Mutex::new(VecDeque::new()));
+        for id in 0..(MAX_QUEUE_LEN as u64 + 10) {
+            push_response(&responses, RemoteResponse::new(id, Ok("\"ok\"".to_string())));
+        }
+        let q = lock_recover(&responses);
+        assert_eq!(q.len(), MAX_QUEUE_LEN);
+        // Oldest entries are evicted, so the newest id is still present.
+        assert_eq!(q.back().unwrap().id, MAX_QUEUE_LEN as u64 + 9);
+        assert!(q.front().unwrap().id > 0);
+    }
+
+    #[test]
+    fn sweep_removes_stale_responses_only() {
+        let responses: ResponseQueue = Arc::new(Mutex::new(VecDeque::new()));
+        let stale_at = Instant::now()
+            .checked_sub(RESPONSE_MAX_AGE + Duration::from_secs(1))
+            .expect("instant underflow");
+        {
+            let mut q = lock_recover(&responses);
+            q.push_back(RemoteResponse {
+                id: 1,
+                result: Ok("\"old\"".to_string()),
+                enqueued_at: stale_at,
+            });
+            q.push_back(RemoteResponse::new(2, Ok("\"fresh\"".to_string())));
+        }
+        sweep_stale_responses(&responses);
+        let q = lock_recover(&responses);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front().unwrap().id, 2);
     }
 }

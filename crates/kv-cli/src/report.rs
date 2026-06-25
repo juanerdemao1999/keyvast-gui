@@ -150,6 +150,13 @@ pub(crate) fn simulator_recording_log_lines(integrity: &IntegrityReport) -> Vec<
         ));
     }
 
+    if integrity.summary.buffer_overflows > 0 {
+        lines.push(format!(
+            "[WARN] buffer overflow dropped_blocks={}",
+            integrity.summary.buffer_overflows
+        ));
+    }
+
     lines.push("[INFO] recorder flushed".to_string());
     lines.push("[INFO] acquisition stopped cleanly".to_string());
     lines
@@ -175,10 +182,25 @@ pub(crate) fn simulator_recording_events(integrity: &IntegrityReport) -> Vec<Acq
         });
     }
 
+    push_buffer_overflow_event(&mut events, integrity);
+
     events.push(AcquisitionEvent::Stopped {
         timestamp_host_ms: now_ms(),
     });
     events
+}
+
+/// Emit a `BufferOverflow` event when the pipeline dropped any block, so the
+/// `events.csv` audit trail records overflow instead of swallowing it.
+/// `buffer_occupancy` is 1.0 because a drop only happens when a consumer queue
+/// is already full.
+fn push_buffer_overflow_event(events: &mut Vec<AcquisitionEvent>, integrity: &IntegrityReport) {
+    if integrity.summary.buffer_overflows > 0 {
+        events.push(AcquisitionEvent::BufferOverflow {
+            dropped_blocks: integrity.summary.buffer_overflows,
+            buffer_occupancy: 1.0,
+        });
+    }
 }
 
 pub(crate) fn rhd_smoke_log_lines(integrity: &IntegrityReport, hardware: bool) -> Vec<String> {
@@ -210,6 +232,13 @@ pub(crate) fn rhd_smoke_log_lines(integrity: &IntegrityReport, hardware: bool) -
         ));
     }
 
+    if integrity.summary.buffer_overflows > 0 {
+        lines.push(format!(
+            "[WARN] buffer overflow dropped_blocks={}",
+            integrity.summary.buffer_overflows
+        ));
+    }
+
     lines.push("[INFO] recorder flushed".to_string());
     lines.push("[INFO] rhd smoke stopped cleanly".to_string());
     lines
@@ -227,6 +256,8 @@ pub(crate) fn rhd_smoke_events(integrity: &IntegrityReport) -> Vec<AcquisitionEv
             missing_count: gap.missing_count,
         });
     }
+
+    push_buffer_overflow_event(&mut events, integrity);
 
     events.push(AcquisitionEvent::Stopped {
         timestamp_host_ms: now_ms(),
@@ -285,4 +316,66 @@ pub(crate) fn average_write_mb_s(byte_count: u64, duration_seconds: f64) -> f64 
     }
 
     byte_count as f64 / duration_seconds / 1_000_000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kv_types::IntegritySummary;
+
+    fn report_with_overflows(dropped: u64) -> IntegrityReport {
+        IntegrityReport {
+            summary: IntegritySummary {
+                buffer_overflows: dropped,
+                ..IntegritySummary::default()
+            },
+            packet_gaps: Vec::new(),
+            timestamp_discontinuities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn simulator_events_emit_buffer_overflow_when_blocks_dropped() {
+        let events = simulator_recording_events(&report_with_overflows(7));
+        let overflow = events.iter().find_map(|e| match e {
+            AcquisitionEvent::BufferOverflow {
+                dropped_blocks,
+                buffer_occupancy,
+            } => Some((*dropped_blocks, *buffer_occupancy)),
+            _ => None,
+        });
+        assert_eq!(overflow, Some((7, 1.0)));
+    }
+
+    #[test]
+    fn rhd_events_emit_buffer_overflow_when_blocks_dropped() {
+        let events = rhd_smoke_events(&report_with_overflows(3));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AcquisitionEvent::BufferOverflow {
+                dropped_blocks: 3,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn no_buffer_overflow_event_without_drops() {
+        let events = simulator_recording_events(&report_with_overflows(0));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AcquisitionEvent::BufferOverflow { .. }))
+        );
+    }
+
+    #[test]
+    fn log_lines_report_buffer_overflow() {
+        let lines = simulator_recording_log_lines(&report_with_overflows(5));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("buffer overflow") && l.contains("dropped_blocks=5"))
+        );
+    }
 }

@@ -41,6 +41,8 @@ pub struct PipelineResult {
     pub timing: PipelineTiming,
     pub recorder_status: ConsumerBufferStatus,
     pub preview_status: ConsumerBufferStatus,
+    /// Cumulative blocks dropped across all consumers due to buffer overflow.
+    pub dropped_blocks: u64,
 }
 
 /// Configuration for a streaming fan-out pipeline that writes to disk
@@ -64,6 +66,8 @@ pub struct StreamingPipelineResult {
     pub preview_status: ConsumerBufferStatus,
     pub max_write_latency_us: Option<u64>,
     pub latency_distribution: Option<LatencyDistribution>,
+    /// Cumulative blocks dropped across all consumers due to buffer overflow.
+    pub dropped_blocks: u64,
 }
 
 /// Errors from the threaded pipeline.
@@ -132,6 +136,9 @@ struct SharedState {
     buffer: FanoutBlockBuffer,
     producer_done: bool,
     producer_error: Option<String>,
+    /// Cumulative dropped-block count reported by the fanout buffer, surfaced
+    /// so overflow is observable instead of only logged.
+    dropped_blocks_total: u64,
 }
 
 /// Run a threaded fan-out acquisition pipeline.
@@ -160,6 +167,7 @@ where
             buffer: fanout,
             producer_done: false,
             producer_error: None,
+            dropped_blocks_total: 0,
         }),
         Condvar::new(),
     ));
@@ -239,10 +247,12 @@ where
     let state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let dropped_blocks = state.dropped_blocks_total;
     drop(state);
 
     let wall_clock = start.elapsed();
-    let integrity = check_blocks(&recorded_blocks)?;
+    let mut integrity = check_blocks(&recorded_blocks)?;
+    integrity.summary.buffer_overflows = dropped_blocks;
 
     let timing = PipelineTiming {
         wall_clock_seconds: wall_clock.as_secs_f64(),
@@ -256,6 +266,7 @@ where
         timing,
         recorder_status,
         preview_status,
+        dropped_blocks,
     })
 }
 
@@ -270,6 +281,7 @@ where
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
                 if let Some(overflow) = state.buffer.push(block) {
+                    state.dropped_blocks_total = overflow.dropped_blocks;
                     log::warn!(
                         "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
                         overflow.dropped_blocks,
@@ -336,6 +348,7 @@ where
             buffer: fanout,
             producer_done: false,
             producer_error: None,
+            dropped_blocks_total: 0,
         }),
         Condvar::new(),
     ));
@@ -421,11 +434,13 @@ where
     let state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let dropped_blocks = state.dropped_blocks_total;
     drop(state);
 
     let wall_clock = start.elapsed();
     let streaming_summary = recorder.finish()?;
-    let integrity_report = integrity.finish();
+    let mut integrity_report = integrity.finish();
+    integrity_report.summary.buffer_overflows = dropped_blocks;
 
     let timing = PipelineTiming {
         wall_clock_seconds: wall_clock.as_secs_f64(),
@@ -441,5 +456,6 @@ where
         preview_status,
         max_write_latency_us: streaming_summary.max_write_latency_us,
         latency_distribution: streaming_summary.latency_distribution,
+        dropped_blocks,
     })
 }

@@ -123,8 +123,16 @@ impl FanoutBlockBuffer {
     /// that dropped a block, along with the total dropped blocks across all
     /// consumers.
     pub fn push(&mut self, block: SampleBlock) -> Option<OverflowInfo> {
+        self.push_arc(Arc::new(block))
+    }
+
+    /// Push an already-`Arc`-wrapped block to all consumers.
+    ///
+    /// Lets the producer share a single allocation between the GUI preview
+    /// channel and the fanout buffer, avoiding a deep copy of the block on the
+    /// real-time acquisition thread.
+    pub fn push_arc(&mut self, block: Arc<SampleBlock>) -> Option<OverflowInfo> {
         self.pushed_blocks = self.pushed_blocks.saturating_add(1);
-        let block = Arc::new(block);
 
         let mut total_dropped: u64 = 0;
         let mut any_overflow = false;

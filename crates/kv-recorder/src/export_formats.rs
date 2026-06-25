@@ -6,6 +6,7 @@
 //! - **Flat binary** — simple raw i16 interleaved file with a companion `.meta.json`.
 //!   Compatible with SpikeGLX readers and custom analysis pipelines.
 
+use std::borrow::Borrow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,17 @@ use std::path::{Path, PathBuf};
 use kv_types::SampleBlock;
 
 use crate::{RecorderError, escape_json_string};
+
+/// Sample-rate and channel-count header needed before streaming blocks.
+///
+/// The streaming exporters cannot peek at the first block to read these values
+/// (the block iterator may be lazy and single-pass), so callers supply them
+/// explicitly — typically from the source recording's metadata.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportHeader {
+    pub sample_rate: f64,
+    pub channel_count: usize,
+}
 
 // ── Export format enum ──────────────────────────────────────────────
 
@@ -79,10 +91,31 @@ pub fn export_intan_rhd(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no blocks to export"),
         });
     }
+    let header = ExportHeader {
+        sample_rate: blocks[0].sample_rate,
+        channel_count: blocks[0].channel_count,
+    };
+    export_intan_rhd_streaming(output_path, header, blocks.iter(), notes)
+}
 
-    let first = &blocks[0];
-    let sample_rate = first.sample_rate;
-    let channel_count = first.channel_count;
+/// Streaming variant of [`export_intan_rhd`].
+///
+/// Accepts any iterator of blocks (owned or borrowed) together with an explicit
+/// [`ExportHeader`], so callers can feed data lazily from disk without
+/// materializing the whole recording in memory. Memory usage stays
+/// `O(RHD_SAMPLES_PER_BLOCK * channel_count)` regardless of recording length.
+pub fn export_intan_rhd_streaming<I, B>(
+    output_path: &Path,
+    header: ExportHeader,
+    blocks: I,
+    notes: &str,
+) -> Result<PathBuf, RecorderError>
+where
+    I: IntoIterator<Item = B>,
+    B: Borrow<SampleBlock>,
+{
+    let sample_rate = header.sample_rate;
+    let channel_count = header.channel_count;
 
     let file = File::create(output_path).map_err(|source| RecorderError::Io {
         path: output_path.to_path_buf(),
@@ -101,6 +134,7 @@ pub fn export_intan_rhd(
     let mut ts = 0u32;
 
     for block in blocks {
+        let block = block.borrow();
         for s in 0..block.samples_per_channel {
             buf_timestamps.push(ts);
             for ch in 0..block.channel_count {
@@ -313,15 +347,35 @@ pub fn export_flat_binary(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no blocks to export"),
         });
     }
+    let header = ExportHeader {
+        sample_rate: blocks[0].sample_rate,
+        channel_count: blocks[0].channel_count,
+    };
+    export_flat_binary_streaming(output_dir, header, blocks.iter(), notes)
+}
 
+/// Streaming variant of [`export_flat_binary`].
+///
+/// Accepts any iterator of blocks (owned or borrowed) together with an explicit
+/// [`ExportHeader`], so callers can feed data lazily from disk without
+/// materializing the whole recording in memory.
+pub fn export_flat_binary_streaming<I, B>(
+    output_dir: &Path,
+    header: ExportHeader,
+    blocks: I,
+    notes: &str,
+) -> Result<PathBuf, RecorderError>
+where
+    I: IntoIterator<Item = B>,
+    B: Borrow<SampleBlock>,
+{
     fs::create_dir_all(output_dir).map_err(|source| RecorderError::Io {
         path: output_dir.to_path_buf(),
         source,
     })?;
 
-    let first = &blocks[0];
-    let sample_rate = first.sample_rate;
-    let channel_count = first.channel_count;
+    let sample_rate = header.sample_rate;
+    let channel_count = header.channel_count;
 
     // Write raw binary data
     let bin_path = output_dir.join("recording.bin");
@@ -333,6 +387,7 @@ pub fn export_flat_binary(
 
     let mut total_samples: u64 = 0;
     for block in blocks {
+        let block = block.borrow();
         for sample in &block.data {
             w.write_all(&sample.to_le_bytes())
                 .map_err(|source| RecorderError::Io {

@@ -18,6 +18,7 @@
 //! Mouse: scroll-wheel over the plot also adjusts the time window.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
@@ -1209,7 +1210,7 @@ impl KvApp {
         // mutating other self fields, so collect into locals first.
 
         let mut recorder_events: Vec<RecorderEvent> = Vec::new();
-        let mut preview_blocks: Vec<SampleBlock> = Vec::new();
+        let mut preview_blocks: Vec<Arc<SampleBlock>> = Vec::new();
 
         {
             let Some(pipeline) = self.live_pipeline.as_mut() else {
@@ -1299,6 +1300,9 @@ impl KvApp {
         // ── Ingest all preview blocks ─────────────────────────────────────────
         let last_block = preview_blocks.last().cloned();
         for block in preview_blocks {
+            // Reuse the producer's allocation when the recorder has already
+            // released its copy; otherwise fall back to a single deep clone.
+            let block = Arc::try_unwrap(block).unwrap_or_else(|b| (*b).clone());
             self.ingest_block(block);
         }
 
@@ -2342,8 +2346,11 @@ fn export_kvraw(
     source: &std::path::Path,
     format: kv_recorder::export_formats::ExportFormat,
 ) -> Result<std::path::PathBuf, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use kv_recorder::KvrawReader;
-    use kv_recorder::export_formats::{self, ExportFormat};
+    use kv_recorder::export_formats::{self, ExportFormat, ExportHeader};
 
     let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
     let meta = reader.metadata().clone();
@@ -2351,54 +2358,80 @@ fn export_kvraw(
         return Err("kvraw file has no channels".to_string());
     }
     let total_frames = reader.total_frames();
-
-    // Read in ~1 s chunks; the exporters re-chunk internally as needed.
-    const FRAMES_PER_CHUNK: usize = 30_000;
-    let mut blocks: Vec<SampleBlock> = Vec::new();
-    let mut frame: u64 = 0;
-    let mut packet_id: u64 = 0;
-    while frame < total_frames {
-        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
-        let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
-        if data.is_empty() {
-            break;
-        }
-        let frames_read = data.len() / meta.channel_count;
-        blocks.push(SampleBlock {
-            device_id: meta.device_id.clone(),
-            stream_id: 0,
-            packet_id,
-            timestamp_start: frame,
-            sample_rate: meta.sample_rate,
-            channel_count: meta.channel_count,
-            samples_per_channel: frames_read,
-            ttl_bits: 0,
-            data,
-            aux_data: None,
-            board_adc_data: None,
-            ttl_in_per_sample: None,
-            ttl_out_per_sample: None,
-        });
-        packet_id += 1;
-        frame += frames_read as u64;
-    }
-    if blocks.is_empty() {
+    if total_frames == 0 {
         return Err("no data to export".to_string());
     }
 
+    let header = ExportHeader {
+        sample_rate: meta.sample_rate,
+        channel_count: meta.channel_count,
+    };
     let notes = format!("exported from {}", source.display());
-    match format {
+
+    // Stream blocks straight from disk into the exporter. Reading happens lazily
+    // inside the iterator so the whole recording is never held in memory; a read
+    // failure is captured and surfaced after the exporter returns.
+    const FRAMES_PER_CHUNK: usize = 30_000;
+    let read_err: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let read_err_sink = Rc::clone(&read_err);
+    let channel_count = meta.channel_count;
+    let device_id = meta.device_id.clone();
+    let sample_rate = meta.sample_rate;
+    let mut frame: u64 = 0;
+    let mut packet_id: u64 = 0;
+    let blocks = std::iter::from_fn(move || {
+        if frame >= total_frames {
+            return None;
+        }
+        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+        match reader.read_frames(frame, want) {
+            Ok(data) => {
+                if data.is_empty() {
+                    return None;
+                }
+                let frames_read = data.len() / channel_count;
+                let block = SampleBlock {
+                    device_id: device_id.clone(),
+                    stream_id: 0,
+                    packet_id,
+                    timestamp_start: frame,
+                    sample_rate,
+                    channel_count,
+                    samples_per_channel: frames_read,
+                    ttl_bits: 0,
+                    data,
+                    aux_data: None,
+                    board_adc_data: None,
+                    ttl_in_per_sample: None,
+                    ttl_out_per_sample: None,
+                };
+                packet_id += 1;
+                frame += frames_read as u64;
+                Some(block)
+            }
+            Err(e) => {
+                *read_err_sink.borrow_mut() = Some(e.to_string());
+                None
+            }
+        }
+    });
+
+    let result = match format {
         ExportFormat::IntanRhd => {
             let output = source.with_extension(format.extension());
-            export_formats::export_intan_rhd(&output, &blocks, &notes)
+            export_formats::export_intan_rhd_streaming(&output, header, blocks, &notes)
         }
         ExportFormat::FlatBinary => {
             // Flat binary writes recording.bin + recording.meta.json into a directory.
             let output_dir = source.with_extension("export");
-            export_formats::export_flat_binary(&output_dir, &blocks, &notes)
+            export_formats::export_flat_binary_streaming(&output_dir, header, blocks, &notes)
         }
+    };
+
+    if let Some(e) = read_err.borrow_mut().take() {
+        return Err(e);
     }
-    .map_err(|e| e.to_string())
+    result.map_err(|e| e.to_string())
 }
 
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

@@ -28,6 +28,11 @@ use crate::channel_select;
 /// Recorder buffer: ~5 s at 64ch × 30 kHz / 64 spp = 2344 blocks/s.
 const RECORDER_CAPACITY: usize = 12_000;
 
+/// Recorder command channel depth. Commands are low-frequency, user-driven
+/// Start/Stop/Terminate messages, so a small bound is ample and keeps the
+/// channel bounded instead of growing without limit.
+const RECORDER_CMD_CAPACITY: usize = 64;
+
 // ── Data source selector ────────────────────────────────────────────
 
 /// Which backend the producer thread pulls blocks from.
@@ -89,7 +94,7 @@ pub struct LivePipelineHandle {
     /// Events sent from the recorder thread back to the GUI.
     pub event_rx: mpsc::Receiver<RecorderEvent>,
     /// Commands GUI sends to the recorder thread.
-    pub recorder_cmd_tx: mpsc::Sender<RecorderCmd>,
+    pub recorder_cmd_tx: mpsc::SyncSender<RecorderCmd>,
     /// Cumulative preview blocks received (for BlockStats computation).
     pub total_blocks: u64,
     /// Packet-ID based drop detection: expected next packet_id.
@@ -143,7 +148,7 @@ pub fn start_live_pipeline(source: PipelineSource) -> LivePipelineHandle {
     // gives ~2 s of headroom before dropping.  If the GUI can't keep up, the
     // producer will block briefly rather than accumulating unbounded memory.
     let (preview_tx, preview_rx) = mpsc::sync_channel::<Arc<SampleBlock>>(1024);
-    let (cmd_tx, cmd_rx) = mpsc::channel::<RecorderCmd>();
+    let (cmd_tx, cmd_rx) = mpsc::sync_channel::<RecorderCmd>(RECORDER_CMD_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel::<RecorderEvent>();
     let stop_flag = Arc::new(AtomicBool::new(false));
 

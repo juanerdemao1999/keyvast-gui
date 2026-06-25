@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::backend::RhdReadError;
 use crate::frame_analysis::{
-    min_stream_railed_fraction, stream_range_label, verify_chip_id_in_probe,
+    amplifier_mean_raw_word, min_stream_railed_fraction, probe_chip_id, stream_range_label,
+    verify_chip_id_in_probe,
 };
 use crate::protocol::{RhythmDataConfig, USB3_BLOCK_SIZE_BYTES, bytes_per_block};
 use crate::rhythm_board::RhythmFrontPanelBoard;
@@ -122,24 +123,27 @@ impl RhythmFrontPanelBoard {
     /// sweep all 16 FPGA MISO delays, measuring how many amplifier words are railed
     /// (idle-high 0xFFFF / 0x0000). A correctly-delayed, populated port reports ~0%
     /// railed; an empty port reports ~100% at every delay. We keep the least-railed
-    /// port and, like scanPorts, pick a middle "good" delay for timing margin.
+    /// port and, like Open Ephys scanPorts, pick the second good delay
+    /// (indexSecondGoodDelay) for timing margin.
     ///
     /// Each probe enables exactly `enabled_streams` streams (the same count
     /// acquisition will use), so the FPGA frame size during the scan matches what the
     /// parser expects — only the *physical* port behind those stream slots changes.
-    /// Falls back to Port A if nothing responds. AuxCmd3 bank 0 (register config + ADC
-    /// calibrate) must be selected so each run also configures/calibrates the chip.
+    /// AuxCmd3 bank 0 (register config + ADC calibrate) must be selected so each run
+    /// also configures/calibrates the chip. Returns `(port, delay, chip-ID byte,
+    /// found)`; `found == false` means nothing responded (the caller decides whether
+    /// to retry or refuse to arm).
     pub(crate) fn scan_ports_for_headstage(
         &self,
         enabled_streams: usize,
-    ) -> Result<(u32, u32), RhdReadError> {
+    ) -> Result<(usize, u32, Option<u8>, bool), RhdReadError> {
         const PROBE_SAMPLES: usize = 128;
         const PORT_LETTERS: [char; 8] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
         let stream_bits = crate::protocol::stream_enable_mask(enabled_streams);
 
-        // (port index, chosen delay, has_chip_id)
-        let mut best: Option<(usize, u32, bool)> = None;
+        // (port index, chosen delay, has_chip_id, chip-ID byte)
+        let mut best: Option<(usize, u32, bool, Option<u8>)> = None;
 
         for (port, &port_letter) in PORT_LETTERS.iter().enumerate() {
             let first_stream = (port * 4) as u32;
@@ -149,6 +153,8 @@ impl RhythmFrontPanelBoard {
             let mut id_verified_delays: Vec<u32> = Vec::new();
             // Delays where railed fraction < 50% (weak fallback).
             let mut low_railed_delays: Vec<u32> = Vec::new();
+            // First register-63 chip ID seen on a chip-ID-verified delay.
+            let mut port_chip_id: Option<u8> = None;
 
             for delay in 0..16_u32 {
                 self.set_cable_delay_all_ports(delay)?;
@@ -164,6 +170,24 @@ impl RhythmFrontPanelBoard {
                 }
 
                 let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
+                if railed < 0.9 || has_id {
+                    let amp_mean = amplifier_mean_raw_word(&raw, enabled_streams, PROBE_SAMPLES, 0);
+                    let chip_id = probe_chip_id(&raw, enabled_streams, PROBE_SAMPLES, 0);
+                    log::info!(
+                        "  scan port {} delay {:2}: has_id={} chip_id={:?} railed_s0={:.3} amp_mean_raw_s0={}",
+                        port_letter,
+                        delay,
+                        has_id,
+                        chip_id,
+                        railed,
+                        amp_mean
+                            .map(|m| format!("0x{m:04x}"))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    );
+                    if has_id && port_chip_id.is_none() {
+                        port_chip_id = chip_id;
+                    }
+                }
                 if railed < 0.5 {
                     low_railed_delays.push(delay);
                 }
@@ -176,9 +200,13 @@ impl RhythmFrontPanelBoard {
                 (low_railed_delays, false)
             };
 
-            // Mirror scanPorts: 1-2 good delays -> first; >2 -> a middle one (margin).
+            // Match Open Ephys DeviceThread::scanPorts exactly: 1-2 good delays ->
+            // the first; >2 -> the SECOND good delay (indexSecondGoodDelay), NOT the
+            // middle. good_delays is in ascending order, so index 1 is the second.
+            // On this rig the second good delay (5 for good delays 4-7) reads
+            // measurably quieter in the 5-300 Hz / mains band than the middle (6).
             let chosen_delay = if good_delays.len() > 2 {
-                good_delays[good_delays.len() / 2]
+                good_delays[1]
             } else if let Some(&d) = good_delays.first() {
                 d
             } else {
@@ -202,38 +230,31 @@ impl RhythmFrontPanelBoard {
             // Prefer chip-ID-verified ports over railed-fraction-only ports.
             let dominated = best
                 .as_ref()
-                .is_some_and(|&(_, _, prev_id)| prev_id && !validated_by_id);
+                .is_some_and(|&(_, _, prev_id, _)| prev_id && !validated_by_id);
             if !dominated
                 && best
                     .as_ref()
-                    .is_none_or(|&(_, _, prev_id)| validated_by_id >= prev_id)
+                    .is_none_or(|&(_, _, prev_id, _)| validated_by_id >= prev_id)
             {
-                best = Some((port, chosen_delay, validated_by_id));
+                best = Some((port, chosen_delay, validated_by_id, port_chip_id));
             }
         }
 
         match best {
-            Some((port, delay, _)) => {
+            Some((port, delay, _, chip_id)) => {
                 let first_stream = (port * 4) as u32;
                 log::info!(
-                    "FOUND headstage on port {} ({}) at MISO delay {}",
+                    "FOUND headstage on port {} ({}) at MISO delay {} (chip ID {:?})",
                     PORT_LETTERS[port],
                     stream_range_label(first_stream, enabled_streams),
                     delay,
+                    chip_id,
                 );
                 // Apply per-port delay only for the discovered port.
                 self.set_cable_delay_port(port, delay)?;
-                Ok((stream_bits << first_stream, delay))
+                Ok((port, delay, chip_id, true))
             }
-            None => {
-                log::warn!(
-                    "no responding RHD chip found on any of the 8 SPI ports. \
-                     Defaulting to Port A at delay 0; expect flat data. Check that the headstage \
-                     is connected and powered, and that this is a KeyVast bitstream (the stock \
-                     Intan bit cannot drive the KeyVast headstage SPI pins)."
-                );
-                Ok((stream_bits, 0))
-            }
+            None => Ok((0, 0, None, false)),
         }
     }
 

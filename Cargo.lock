@@ -1525,6 +1525,7 @@ name = "kv-cli"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "env_logger",
  "kv-buffer",
  "kv-core",
  "kv-integrity",

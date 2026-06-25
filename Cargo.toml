@@ -20,3 +20,8 @@ codegen-units = 1
 
 [workspace.package]
 edition = "2024"
+
+# Shared third-party dependencies are pinned once here so every crate stays on
+# the same version. Member crates opt in with e.g. `log.workspace = true`.
+[workspace.dependencies]
+log = "0.4"

@@ -17,8 +17,26 @@ pub struct SampleBlock {
     pub samples_per_channel: usize,
     pub ttl_bits: u32,
     pub data: Vec<i16>,
+
+    // ── Optional side-band channels (None when a backend does not extract them) ──
+    /// Auxiliary inputs: `[stream][aux_ch][sample]`, 3 aux channels per stream,
+    /// one `u16` per sample.
+    pub aux_data: Option<Vec<Vec<Vec<u16>>>>,
+    /// Board ADC channels: `[adc_ch][sample]`, 8 channels of `u16`.
+    pub board_adc_data: Option<Vec<Vec<u16>>>,
+    /// Per-sample TTL input words; when present, `len() == samples_per_channel`.
+    /// `ttl_bits` still holds the last sample's TTL word for compatibility.
+    pub ttl_in_per_sample: Option<Vec<u32>>,
+    /// Per-sample TTL output words; same length convention as `ttl_in_per_sample`.
+    pub ttl_out_per_sample: Option<Vec<u32>>,
 }
 ```
+
+The four optional fields carry side-band data that not every backend produces.
+They are `None` by default (e.g. the simulator only fills `ttl_in_per_sample`
+when TTL is enabled); the RHD parser populates them when the corresponding
+endpoints are decoded. `ttl_bits` is the legacy scalar mirror of the most
+recent `ttl_in_per_sample` entry and is always present.
 
 ## Data Layout
 

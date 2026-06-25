@@ -5,7 +5,7 @@ Keyvast should be built as a hardware-independent acquisition platform. Real FPG
 ## High-Level Data Flow
 
 ```text
-DeviceBackend
+AcquisitionSource (kv-simulator / kv-rhd / ...)
     |
     v
 kv-core
@@ -38,33 +38,40 @@ kv-integrity / benchmark reports
 
 ## Backend Boundary
 
-All device implementations should satisfy one conceptual interface:
+Every data source plugs into `kv-core` through a single small trait,
+`AcquisitionSource` (defined in `kv-core/src/lib.rs`):
 
 ```rust
-pub trait DeviceBackend {
-    fn open(&mut self) -> Result<()>;
-    fn close(&mut self) -> Result<()>;
-    fn configure(&mut self, config: DeviceConfig) -> Result<()>;
-    fn start(&mut self) -> Result<()>;
-    fn stop(&mut self) -> Result<()>;
-    fn read_block(&mut self) -> Result<SampleBlock>;
+pub trait AcquisitionSource {
+    type Error: fmt::Display;
+
+    fn read_block(&mut self) -> Result<SampleBlock, Self::Error>;
 }
+
+// Any `FnMut() -> Result<SampleBlock, E>` is also a source, so closures and
+// adapters can be used without a dedicated type.
+impl<F, E> AcquisitionSource for F
+where
+    F: FnMut() -> Result<SampleBlock, E>,
+    E: fmt::Display,
+{ /* ... */ }
 ```
 
-Initial implementation:
+The trait is intentionally minimal: it only pulls the next `SampleBlock`. The
+device **lifecycle** (open / configure / start / stop) is not part of the
+trait — each source performs its own setup in its constructor and tear-down on
+`Drop`, while `kv-core`'s pipeline owns the run loop and integrity checks. This
+keeps `kv-core` agnostic of any specific transport.
+
+Current implementations:
 
 ```text
-SimulatorBackend
+kv-simulator   — synthetic neural data (used directly or via an FnMut closure)
+kv-rhd         — Opal Kelly / Intan RHD board over FrontPanel (Windows)
 ```
 
-Future implementations:
-
-```text
-UsbBackend
-EthernetBackend
-PcieBackend
-RealFpgaBackend
-```
+Future transports (USB / Ethernet / PCIe variants, other FPGA boards) implement
+the same `AcquisitionSource` trait.
 
 The currently expected physical connector is USB Type-C, but the exact USB protocol, endpoint layout, and packet framing are still TBD.
 

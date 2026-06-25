@@ -242,3 +242,105 @@ pub struct IntegritySummary {
     pub expected_samples: u64,
     pub written_samples: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_block() -> SampleBlock {
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count: 2,
+            samples_per_channel: 3,
+            ttl_bits: 0,
+            data: vec![0; 6],
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_consistent_block() {
+        assert_eq!(valid_block().validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_or_non_positive_sample_rate() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut block = valid_block();
+            block.sample_rate = bad;
+            assert_eq!(
+                block.validate(),
+                Err(SampleBlockError::InvalidSampleRate),
+                "sample_rate {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_channels_and_samples() {
+        let mut no_channels = valid_block();
+        no_channels.channel_count = 0;
+        no_channels.data.clear();
+        assert_eq!(
+            no_channels.validate(),
+            Err(SampleBlockError::EmptyChannelSet)
+        );
+
+        let mut no_samples = valid_block();
+        no_samples.samples_per_channel = 0;
+        no_samples.data.clear();
+        assert_eq!(no_samples.validate(), Err(SampleBlockError::EmptyBlock));
+    }
+
+    #[test]
+    fn validate_rejects_data_length_mismatch() {
+        let mut block = valid_block();
+        block.data.push(0);
+        assert_eq!(
+            block.validate(),
+            Err(SampleBlockError::DataLengthMismatch {
+                expected: 6,
+                observed: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn expected_sample_values_saturates_instead_of_overflowing() {
+        let mut block = valid_block();
+        block.channel_count = usize::MAX;
+        block.samples_per_channel = 2;
+        assert_eq!(block.expected_sample_values(), usize::MAX);
+    }
+
+    #[test]
+    fn validate_against_ttl_lines_enforces_the_line_mask() {
+        let mut block = valid_block();
+        block.ttl_bits = 0b1010;
+        assert_eq!(block.validate_against_ttl_lines(4), Ok(()));
+        // Bit 4 is set but only 4 lines (bits 0..=3) are allowed.
+        block.ttl_bits = 0b1_0000;
+        assert_eq!(
+            block.validate_against_ttl_lines(4),
+            Err(SampleBlockError::TtlBitsOutOfRange {
+                ttl_bits: 0b1_0000,
+                ttl_line_count: 4,
+            })
+        );
+        // Full 32-bit mask accepts any pattern.
+        block.ttl_bits = u32::MAX;
+        assert_eq!(block.validate_against_ttl_lines(32), Ok(()));
+        // Asking for more lines than u32 can hold is rejected.
+        assert_eq!(
+            block.validate_against_ttl_lines(33),
+            Err(SampleBlockError::TtlLineCountOutOfRange { ttl_line_count: 33 })
+        );
+    }
+}

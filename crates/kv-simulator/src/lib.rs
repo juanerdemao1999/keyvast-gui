@@ -2,11 +2,19 @@
 
 use std::fmt;
 
-use kv_types::{
-    DEFAULT_SAMPLES_PER_PACKET, DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError,
-};
+use kv_types::{DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError};
 
 pub const DEFAULT_SIMULATOR_SEED: u64 = 0x4b56_5354_0000_0001;
+
+/// Synthetic LFP oscillation frequency. The triangle carrier period is derived
+/// from the configured sample rate so the waveform stays a fixed real-world
+/// frequency regardless of packet size (was coupled to `samples_per_packet`).
+const SIM_LFP_FREQ_HZ: f64 = 8.0;
+
+/// Spike-trial window length in Hz: one independent spike opportunity per
+/// `sample_rate / SIM_SPIKE_TRIAL_HZ` samples. Decouples spike timing from the
+/// packet boundary so spikes no longer burst once per whole packet.
+const SIM_SPIKE_TRIAL_HZ: f64 = 250.0;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SimulatorConfig {
@@ -65,6 +73,12 @@ impl SimulatorBackend {
         let packet_id = self.next_packet_id;
         let timestamp_start =
             packet_id.saturating_mul(self.config.device.samples_per_packet as u64);
+        let ttl_in_per_sample = self.ttl_in_per_sample(timestamp_start);
+        // `ttl_bits` keeps the last sample's word for backward compatibility.
+        let ttl_bits = ttl_in_per_sample
+            .as_ref()
+            .and_then(|words| words.last().copied())
+            .unwrap_or(0);
         let block = SampleBlock {
             device_id: self.config.device.device_id.clone(),
             stream_id: self.config.stream_id,
@@ -73,11 +87,11 @@ impl SimulatorBackend {
             sample_rate: self.config.device.sample_rate,
             channel_count: self.config.device.channel_count,
             samples_per_channel: self.config.device.samples_per_packet,
-            ttl_bits: self.ttl_bits(packet_id),
+            ttl_bits,
             data: self.samples_for_packet(packet_id, timestamp_start),
             aux_data: None,
             board_adc_data: None,
-            ttl_in_per_sample: None,
+            ttl_in_per_sample,
             ttl_out_per_sample: None,
         };
 
@@ -108,34 +122,60 @@ impl SimulatorBackend {
     }
 
     fn sample_value(&self, packet_id: u64, sample_index: u64, channel: usize) -> i16 {
+        let sample_rate = self.config.device.sample_rate;
         let noise_seed = self.config.seed
             ^ packet_id.rotate_left(13)
             ^ sample_index.rotate_left(7)
             ^ (channel as u64).rotate_left(29);
         let noise = (mix_u64(noise_seed) % 41) as i32 - 20;
-        let lfp = triangle_wave(sample_index.saturating_add((channel as u64).saturating_mul(3)));
-        let spike = spike_component(self.config.seed, sample_index, channel);
+        let lfp = triangle_wave(
+            sample_index.saturating_add((channel as u64).saturating_mul(3)),
+            sample_rate,
+        );
+        let spike = spike_component(self.config.seed, sample_index, channel, sample_rate);
         clamp_i16(noise + lfp + spike)
     }
 
-    fn ttl_bits(&self, packet_id: u64) -> u32 {
+    fn ttl_line_mask(&self) -> u32 {
         if !self.config.device.ttl_enabled || self.config.device.ttl_line_count == 0 {
             return 0;
         }
-
-        let mask = if self.config.device.ttl_line_count == u32::BITS as usize {
+        if self.config.device.ttl_line_count == u32::BITS as usize {
             u32::MAX
         } else {
             (1_u32 << self.config.device.ttl_line_count) - 1
-        };
+        }
+    }
 
-        (mix_u64(self.config.seed ^ (packet_id / 8)) as u32) & mask
+    /// Per-sample TTL input words for a packet, or `None` when TTL is disabled.
+    /// Each sample gets an independent deterministic word so downstream code that
+    /// consumes `ttl_in_per_sample` has realistic per-sample edges to test against.
+    fn ttl_in_per_sample(&self, timestamp_start: u64) -> Option<Vec<u32>> {
+        let mask = self.ttl_line_mask();
+        if mask == 0 {
+            return None;
+        }
+        let spp = self.config.device.samples_per_packet;
+        let mut words = Vec::with_capacity(spp);
+        for offset in 0..spp {
+            let sample_index = timestamp_start.saturating_add(offset as u64);
+            words.push((mix_u64(self.config.seed ^ sample_index.rotate_left(11)) as u32) & mask);
+        }
+        Some(words)
     }
 }
 
 impl Default for SimulatorBackend {
     fn default() -> Self {
-        Self::new(SimulatorConfig::default()).expect("default simulator config is valid")
+        // The default config is valid by construction, so build the backend
+        // directly instead of unwrapping a Result with `.expect()`.
+        let mut config = SimulatorConfig::default();
+        config.drop_packet_ids.sort_unstable();
+        config.drop_packet_ids.dedup();
+        Self {
+            config,
+            next_packet_id: 0,
+        }
     }
 }
 
@@ -249,8 +289,8 @@ fn mix_u64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn triangle_wave(sample_index: u64) -> i32 {
-    let period = (DEFAULT_SAMPLES_PER_PACKET as u64).saturating_mul(4);
+fn triangle_wave(sample_index: u64, sample_rate: f64) -> i32 {
+    let period = sample_period(sample_rate, SIM_LFP_FREQ_HZ);
     let phase = (sample_index % period) as i32;
     let half_period = (period / 2) as i32;
 
@@ -261,16 +301,24 @@ fn triangle_wave(sample_index: u64) -> i32 {
     }
 }
 
-fn spike_component(seed: u64, sample_index: u64, channel: usize) -> i32 {
+fn spike_component(seed: u64, sample_index: u64, channel: usize, sample_rate: f64) -> i32 {
     // Channel-dependent spike rate: lower channels spike more often.
     // Modulus controls rarity — higher modulus = fewer spikes.
     let rarity = 512 + (channel as u64 % 8) * 128;
 
-    let event_seed =
-        seed ^ (sample_index / DEFAULT_SAMPLES_PER_PACKET as u64) ^ (channel as u64 * 17);
-    if mix_u64(event_seed).is_multiple_of(rarity) && sample_index % 6 <= 2 {
-        // 3-sample biphasic spike template
-        match sample_index % 6 {
+    // One independent spike trial per fixed-length window (in samples), so spike
+    // timing no longer bursts on packet boundaries. The 3-sample biphasic
+    // template is emitted only at the start of a trial that fires.
+    let trial_len = sample_period(sample_rate, SIM_SPIKE_TRIAL_HZ).max(6);
+    let trial = sample_index / trial_len;
+    let phase = sample_index % trial_len;
+    if phase > 2 {
+        return 0;
+    }
+
+    let event_seed = seed ^ trial ^ (channel as u64 * 17);
+    if mix_u64(event_seed).is_multiple_of(rarity) {
+        match phase {
             0 => -180,
             1 => 260,
             2 => -80,
@@ -279,6 +327,15 @@ fn spike_component(seed: u64, sample_index: u64, channel: usize) -> i32 {
     } else {
         0
     }
+}
+
+/// Number of samples in one period of `freq_hz` at `sample_rate`, clamped to a
+/// sane minimum so a degenerate rate never yields a zero-length period.
+fn sample_period(sample_rate: f64, freq_hz: f64) -> u64 {
+    if !sample_rate.is_finite() || sample_rate <= 0.0 || freq_hz <= 0.0 {
+        return 2;
+    }
+    ((sample_rate / freq_hz).round() as u64).max(2)
 }
 
 fn clamp_i16(value: i32) -> i16 {

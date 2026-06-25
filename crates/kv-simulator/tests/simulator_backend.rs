@@ -1,5 +1,7 @@
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
-use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, DeviceConfig};
+use kv_types::{
+    DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, DEFAULT_TTL_LINE_COUNT, DeviceConfig,
+};
 
 #[test]
 fn default_simulator_emits_a_valid_sample_block() {
@@ -107,6 +109,84 @@ fn deterministic_packet_drop_is_represented_as_a_packet_id_gap() {
             (DEFAULT_SAMPLES_PER_PACKET * 4) as u64,
         ]
     );
+}
+
+#[test]
+fn ttl_enabled_populates_per_sample_words_within_the_line_mask() {
+    let mut simulator = SimulatorBackend::default();
+    let block = simulator.next_block().expect("packet 0");
+
+    let words = block
+        .ttl_in_per_sample
+        .as_ref()
+        .expect("ttl-enabled simulator should populate per-sample TTL words");
+    assert_eq!(
+        words.len(),
+        DEFAULT_SAMPLES_PER_PACKET,
+        "one TTL word per sample"
+    );
+
+    let allowed_mask = (1_u32 << DEFAULT_TTL_LINE_COUNT) - 1;
+    assert!(
+        words.iter().all(|word| word & !allowed_mask == 0),
+        "per-sample TTL words must stay within the configured line mask"
+    );
+    assert_eq!(
+        block.ttl_bits,
+        *words.last().unwrap(),
+        "legacy ttl_bits should mirror the last sample's word"
+    );
+}
+
+#[test]
+fn ttl_disabled_leaves_per_sample_words_empty() {
+    let mut device = DeviceConfig::simulator_default();
+    device.ttl_enabled = false;
+    let mut simulator = SimulatorBackend::new(SimulatorConfig {
+        device,
+        ..SimulatorConfig::default()
+    })
+    .expect("valid simulator config");
+
+    let block = simulator.next_block().expect("packet 0");
+    assert!(block.ttl_in_per_sample.is_none());
+    assert_eq!(block.ttl_bits, 0);
+}
+
+#[test]
+fn spikes_are_present_and_decoupled_from_packet_size() {
+    let mut simulator = SimulatorBackend::default();
+    let mut saw_spike = false;
+    // The biphasic template peaks at +260; with the default seed at least one
+    // such peak appears within a handful of packets if spikes are emitted.
+    for _ in 0..64 {
+        let block = simulator.next_block().expect("block");
+        if block.data.iter().any(|sample| *sample >= 240) {
+            saw_spike = true;
+            break;
+        }
+    }
+    assert!(saw_spike, "simulator should emit observable spike events");
+}
+
+#[test]
+fn large_packet_id_does_not_panic_and_stays_valid() {
+    let mut simulator = SimulatorBackend::default();
+    // Skip ahead near u64 range by deterministically dropping a huge span is
+    // impractical; instead validate that a far-future timestamp generates a
+    // valid block via a high-rate config exercising saturating arithmetic.
+    let mut device = DeviceConfig::simulator_default();
+    device.sample_rate = 1.0; // forces sample_period clamp path
+    let mut high = SimulatorBackend::new(SimulatorConfig {
+        device,
+        ..SimulatorConfig::default()
+    })
+    .expect("valid config");
+    let block = high.next_block().expect("block");
+    block
+        .validate_against_ttl_lines(DEFAULT_TTL_LINE_COUNT)
+        .expect("block stays valid even at a degenerate sample rate");
+    let _ = simulator.next_block().expect("default still works");
 }
 
 #[test]

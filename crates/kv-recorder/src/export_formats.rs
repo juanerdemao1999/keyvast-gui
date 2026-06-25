@@ -519,4 +519,99 @@ mod tests {
         let result = export_flat_binary(&dir, &[], "");
         assert!(result.is_err());
     }
+
+    #[test]
+    fn intan_rhd_header_encodes_version_and_sample_rate() {
+        let dir = std::env::temp_dir().join("kv_intan_header_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let blocks = make_test_blocks(2, 128, 1);
+        let rhd_path = dir.join("hdr.rhd");
+        export_intan_rhd(&rhd_path, &blocks, "test").unwrap();
+        let data = fs::read(&rhd_path).unwrap();
+
+        // Fixed-offset header prefix: magic, version major/minor, sample rate.
+        assert_eq!(
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            INTAN_MAGIC
+        );
+        assert_eq!(i16::from_le_bytes([data[4], data[5]]), INTAN_VERSION_MAJOR);
+        assert_eq!(i16::from_le_bytes([data[6], data[7]]), INTAN_VERSION_MINOR);
+        assert_eq!(
+            f32::from_le_bytes([data[8], data[9], data[10], data[11]]),
+            30_000.0
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intan_rhd_data_block_is_channel_major_and_offset_by_32768() {
+        let dir = std::env::temp_dir().join("kv_intan_content_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Exactly one RHD block of one channel keeps the data section at the
+        // file tail so we can locate it without parsing the variable header.
+        let channels = 1;
+        let blocks = make_test_blocks(channels, RHD_SAMPLES_PER_BLOCK, 1);
+        let rhd_path = dir.join("content.rhd");
+        export_intan_rhd(&rhd_path, &blocks, "test").unwrap();
+        let data = fs::read(&rhd_path).unwrap();
+
+        let ts_bytes = RHD_SAMPLES_PER_BLOCK * 4;
+        let amp_bytes = channels * RHD_SAMPLES_PER_BLOCK * 2;
+        let block_start = data.len() - ts_bytes - amp_bytes;
+
+        // First timestamp is zero.
+        assert_eq!(
+            i32::from_le_bytes([
+                data[block_start],
+                data[block_start + 1],
+                data[block_start + 2],
+                data[block_start + 3],
+            ]),
+            0
+        );
+
+        // First amplifier sample (ch0, sample0) is the raw i16 shifted by 32768.
+        let amp_start = data.len() - amp_bytes;
+        let raw0 = blocks[0].data[0];
+        assert_eq!(
+            u16::from_le_bytes([data[amp_start], data[amp_start + 1]]),
+            (raw0 as i32 + 32_768) as u16
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intan_rhd_zero_pads_trailing_partial_block() {
+        let dir = std::env::temp_dir().join("kv_intan_pad_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let channels = 2;
+
+        // One full RHD block.
+        let full = make_test_blocks(channels, RHD_SAMPLES_PER_BLOCK, 1);
+        let full_path = dir.join("full.rhd");
+        export_intan_rhd(&full_path, &full, "test").unwrap();
+        let full_len = fs::metadata(&full_path).unwrap().len();
+
+        // One extra sample forces a second block that must be zero-padded to a
+        // full 128-sample block rather than silently dropping the remainder.
+        let partial = make_test_blocks(channels, RHD_SAMPLES_PER_BLOCK + 1, 1);
+        let partial_path = dir.join("partial.rhd");
+        export_intan_rhd(&partial_path, &partial, "test").unwrap();
+        let partial_len = fs::metadata(&partial_path).unwrap().len();
+
+        let data_block_bytes =
+            (RHD_SAMPLES_PER_BLOCK * 4 + channels * RHD_SAMPLES_PER_BLOCK * 2) as u64;
+        assert_eq!(
+            partial_len - full_len,
+            data_block_bytes,
+            "the trailing sample must produce exactly one zero-padded block"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

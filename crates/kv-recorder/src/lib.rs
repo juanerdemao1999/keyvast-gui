@@ -310,22 +310,38 @@ fn write_raw_file(path: &Path, blocks: &[SampleBlock]) -> Result<(), RecorderErr
         source,
     })?;
     let mut writer = BufWriter::new(file);
+    let mut scratch = Vec::new();
 
     for block in blocks {
-        for sample in &block.data {
-            writer
-                .write_all(&sample.to_le_bytes())
-                .map_err(|source| RecorderError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                })?;
-        }
+        write_samples_le(&mut writer, &block.data, &mut scratch, path)?;
     }
 
     writer.flush().map_err(|source| RecorderError::Io {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Serialize an i16 sample slice into little-endian bytes through a reusable
+/// scratch buffer and emit them in a single `write_all`, instead of one
+/// `write_all` call per sample.
+fn write_samples_le(
+    writer: &mut BufWriter<File>,
+    samples: &[i16],
+    scratch: &mut Vec<u8>,
+    path: &Path,
+) -> Result<(), RecorderError> {
+    scratch.clear();
+    scratch.reserve(samples.len() * 2);
+    for &sample in samples {
+        scratch.extend_from_slice(&sample.to_le_bytes());
+    }
+    writer
+        .write_all(scratch)
+        .map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 fn write_metadata_file(
@@ -620,6 +636,7 @@ pub struct StreamingRecorder {
     samples_per_packet: Option<usize>,
     write_latencies_us: Vec<u64>,
     latency_sample_count: u64,
+    sample_scratch: Vec<u8>,
 }
 
 impl StreamingRecorder {
@@ -669,6 +686,7 @@ impl StreamingRecorder {
             samples_per_packet: None,
             write_latencies_us: Vec::with_capacity(LATENCY_RESERVOIR_CAP),
             latency_sample_count: 0,
+            sample_scratch: Vec::new(),
         })
     }
 
@@ -693,14 +711,12 @@ impl StreamingRecorder {
 
         let start = std::time::Instant::now();
 
-        for sample in &block.data {
-            self.writer
-                .write_all(&sample.to_le_bytes())
-                .map_err(|source| RecorderError::Io {
-                    path: self.raw_path.clone(),
-                    source,
-                })?;
-        }
+        write_samples_le(
+            &mut self.writer,
+            &block.data,
+            &mut self.sample_scratch,
+            &self.raw_path,
+        )?;
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         self.latency_sample_count += 1;
@@ -1232,12 +1248,27 @@ impl fmt::Debug for KvrawReader {
 /// Minimal JSON parser for KVRAW metadata.  Avoids adding serde as a
 /// dependency — the JSON is always machine-generated with a known schema.
 fn parse_kvraw_json(json: &str) -> KvrawMetadata {
+    // Return the text immediately following `"key":` but only when the quoted
+    // key is in key position (directly followed by optional whitespace and a
+    // colon).  This prevents a *value* that happens to equal a key name (e.g.
+    // `"backend": "channel_count"`) from being picked up as that key.
+    let value_after = |key: &str| -> Option<&str> {
+        let needle = format!("\"{key}\"");
+        let mut search_from = 0;
+        while let Some(rel) = json[search_from..].find(&needle) {
+            let pos = search_from + rel;
+            let after = &json[pos + needle.len()..];
+            if let Some(rest) = after.trim_start().strip_prefix(':') {
+                return Some(rest.trim_start());
+            }
+            search_from = pos + needle.len();
+        }
+        None
+    };
+
     let get_str = |key: &str| -> String {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
+        value_after(key)
+            .and_then(|rest| {
                 let value = rest.strip_prefix('"')?;
                 let end = value.find('"')?;
                 Some(value[..end].to_string())
@@ -1246,11 +1277,8 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_u64 = |key: &str| -> u64 {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
+        value_after(key)
+            .and_then(|rest| {
                 // Extract numeric chars
                 let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                 num_str.parse().ok()
@@ -1259,11 +1287,8 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_f64 = |key: &str| -> f64 {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
+        value_after(key)
+            .and_then(|rest| {
                 let num_str: String = rest
                     .chars()
                     .take_while(|c| {
@@ -1281,30 +1306,17 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
     };
 
     let get_optional_u64 = |key: &str| -> Option<u64> {
-        json.find(&format!("\"{key}\"")).and_then(|pos| {
-            let after = &json[pos + key.len() + 2..];
-            let colon = after.find(':')?;
-            let rest = after[colon + 1..].trim_start();
-            if rest.starts_with("null") {
-                return None;
-            }
-            let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            num_str.parse().ok()
-        })
+        let rest = value_after(key)?;
+        if rest.starts_with("null") {
+            return None;
+        }
+        let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        num_str.parse().ok()
     };
 
     let get_bool = |key: &str| -> bool {
-        json.find(&format!("\"{key}\""))
-            .and_then(|pos| {
-                let after = &json[pos + key.len() + 2..];
-                let colon = after.find(':')?;
-                let rest = after[colon + 1..].trim_start();
-                if rest.starts_with("true") {
-                    Some(true)
-                } else {
-                    Some(false)
-                }
-            })
+        value_after(key)
+            .map(|rest| rest.starts_with("true"))
             .unwrap_or(false)
     };
 
@@ -1332,5 +1344,51 @@ fn parse_kvraw_json(json: &str) -> KvrawMetadata {
         first_packet_id: get_optional_u64("first_packet_id"),
         last_packet_id: get_optional_u64("last_packet_id"),
         clean_stop: get_bool("clean_stop"),
+    }
+}
+
+#[cfg(test)]
+mod json_parse_tests {
+    use super::parse_kvraw_json;
+
+    #[test]
+    fn parses_a_well_formed_metadata_header() {
+        let json = concat!(
+            "{\n",
+            "  \"format_version\": 2,\n",
+            "  \"data_offset_bytes\": 524,\n",
+            "  \"device_id\": \"dev-1\",\n",
+            "  \"backend\": \"simulator\",\n",
+            "  \"sample_rate\": 30000.0,\n",
+            "  \"channel_count\": 64,\n",
+            "  \"clean_stop\": true\n",
+            "}\n"
+        );
+        let meta = parse_kvraw_json(json);
+        assert_eq!(meta.format_version, 2);
+        assert_eq!(meta.data_offset_bytes, 524);
+        assert_eq!(meta.device_id, "dev-1");
+        assert_eq!(meta.backend, "simulator");
+        assert_eq!(meta.sample_rate, 30000.0);
+        assert_eq!(meta.channel_count, 64);
+        assert!(meta.clean_stop);
+    }
+
+    #[test]
+    fn key_lookup_ignores_a_value_that_matches_a_key_name() {
+        // The backend value is literally the string "channel_count", so it
+        // appears as the quoted substring `"channel_count"` *before* the real
+        // key.  A naive `find("\"channel_count\"")` would latch onto the value
+        // and then grab the next colon it sees; key-position matching must skip
+        // the value and read the genuine channel_count number.
+        let json = concat!(
+            "{\n",
+            "  \"backend\": \"channel_count\",\n",
+            "  \"channel_count\": 32\n",
+            "}\n"
+        );
+        let meta = parse_kvraw_json(json);
+        assert_eq!(meta.backend, "channel_count");
+        assert_eq!(meta.channel_count, 32);
     }
 }

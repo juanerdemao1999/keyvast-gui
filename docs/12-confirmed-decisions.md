@@ -90,3 +90,35 @@ crates/kv-gui
 This lets each part stay small, while still building as one project.
 
 The folder can stay named `51_keyvast_gui`. Rust crate names should use normal package names such as `kv-types`, `kv-core`, and `kv-cli`.
+
+## Build & Deployment Hardening
+
+These are properties of the shipped (release) build, not just debug tests.
+
+### Overflow checks in release (DA15)
+
+`[profile.release]` sets `overflow-checks = true`. Field/delivery builds are
+always release (the GUI alias runs `--release`), so without this an integer
+wrap in register-bit, byte-offset/seek, or timestamp math would silently
+corrupt data in vivo while debug tests panic — the classic "tested fine,
+exploded on site". The real-time cost on hot paths is negligible.
+
+Consequence for code: any arithmetic that is *meant* to wrap (e.g. a packet-id
+or sample-timestamp counter rolling over) must use explicit `wrapping_*`;
+counters that must not exceed a bound use `checked_*` / `saturating_*`. A plain
+`+`/`*`/`<<` that overflows now panics observably instead of producing bad
+data.
+
+### FrontPanel DLL dependency resolution (DA33)
+
+The Opal Kelly `okFrontPanel.dll` is loaded by absolute path, but it has its
+own transitive dependencies (the Visual C++ runtime and Opal Kelly helper
+DLLs). Plain `LoadLibrary` only searches the standard path, so a fresh
+bring-up machine missing those runtimes fails to load with an opaque error.
+
+The loader resolves the DLL to a fully qualified path and loads it with
+`LOAD_WITH_ALTERED_SEARCH_PATH`, which puts the DLL's own directory at the
+front of the dependency search order. Deployments should still bundle the
+required FrontPanel/VC++ runtime alongside `okFrontPanel.dll` (see
+"Host program should bundle the required FrontPanel runtime DLL" above) so the
+dependencies are present in that directory.

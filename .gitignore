@@ -1,5 +1,6 @@
-# Rust build output
+# Rust build output (root and any per-crate target dirs)
 /target/
+**/target/
 
 # Local IDE and editor state
 /.idea/

@@ -269,3 +269,114 @@ impl DisplayRing {
         pts
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a block where channel `ch` at sample `s` holds value
+    /// `(s * channel_count + ch)` as i16, so each ring slot is identifiable.
+    fn block(timestamp_start: u64, channel_count: usize, spc: usize) -> SampleBlock {
+        let mut data = Vec::with_capacity(channel_count * spc);
+        for s in 0..spc {
+            for ch in 0..channel_count {
+                data.push((s * channel_count + ch) as i16);
+            }
+        }
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start,
+            sample_rate: 30_000.0,
+            channel_count,
+            samples_per_channel: spc,
+            ttl_bits: 0,
+            data,
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn new_ring_is_empty_and_not_ready() {
+        let ring = DisplayRing::new(4, 30_000.0);
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+        assert_eq!(ring.channel_count, 4);
+        assert_eq!(ring.dwnsp, RING_DWNSP);
+        // 120 s * 30 kHz / 4 = 900_000.
+        assert_eq!(ring.capacity, 900_000);
+    }
+
+    #[test]
+    fn push_block_decimates_by_ring_dwnsp() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        // 16 samples at stride 4 -> ring slots for absolute samples 0,4,8,12.
+        ring.push_block(&block(0, 2, 16));
+        assert!(ring.ready);
+        assert_eq!(ring.len, 4);
+        // Channel 0 stores raw value (s * 2 + 0) for s in {0,4,8,12}.
+        assert_eq!(ring.last_n_samples(0, 4), vec![0, 8, 16, 24]);
+        // Channel 1 stores (s * 2 + 1).
+        assert_eq!(ring.last_n_samples(1, 4), vec![1, 9, 17, 25]);
+    }
+
+    #[test]
+    fn push_block_aligns_first_sample_to_stride_boundary() {
+        let mut ring = DisplayRing::new(1, 30_000.0);
+        // Start at 6: first ring-aligned absolute sample is 8.
+        ring.push_block(&block(6, 1, 10)); // covers abs 6..16, aligned: 8, 12
+        assert_eq!(ring.len, 2);
+        // value at abs 8 -> local sample 2 -> (2*1+0) = 2; abs 12 -> local 6 -> 6.
+        assert_eq!(ring.last_n_samples(0, 2), vec![2, 6]);
+    }
+
+    #[test]
+    fn push_block_rejects_channel_count_mismatch() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&block(0, 3, 16));
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+    }
+
+    #[test]
+    fn ring_evicts_oldest_when_over_capacity() {
+        // sample_rate 30 forces the minimum capacity floor of 1024.
+        let mut ring = DisplayRing::new(1, 30.0);
+        assert_eq!(ring.capacity, 1024);
+        // 5000 input samples -> 1250 ring-aligned slots (0,4,..,4996).
+        ring.push_block(&block(0, 1, 5000));
+        assert_eq!(ring.len, ring.capacity);
+        // 1250 - 1024 = 226 slots evicted, each advancing t0 by dwnsp (4).
+        assert_eq!(ring.t0, 226 * 4);
+    }
+
+    #[test]
+    fn reset_clears_state_but_keeps_capacity() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&block(0, 2, 16));
+        let cap = ring.capacity;
+        ring.reset();
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+        assert_eq!(ring.capacity, cap);
+        assert_eq!(ring.latest_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn collect_channel_returns_points_within_window() {
+        let mut ring = DisplayRing::new(1, 30_000.0);
+        ring.push_block(&block(0, 1, 30_000)); // 1 s of data
+        let ms_per_ring = RING_DWNSP as f64 * 1000.0 / 30_000.0;
+        let window_entries = (500.0 / ms_per_ring) as usize;
+        let pts = ring.collect_channel(0, 0.0, 500.0, 256, window_entries);
+        assert!(!pts.is_empty());
+        // Decimated well below the ~3750 ring slots spanning the window.
+        assert!(pts.len() < 512);
+        // Times stay inside the requested window (allow one ring slot of slack).
+        assert!(pts.iter().all(|p| p[0] >= 0.0 && p[0] <= 520.0));
+    }
+}

@@ -90,3 +90,31 @@ crates/kv-gui
 This lets each part stay small, while still building as one project.
 
 The folder can stay named `51_keyvast_gui`. Rust crate names should use normal package names such as `kv-types`, `kv-core`, and `kv-cli`.
+
+## Channel Map actually reorders the display (DA19)
+
+The CHANNEL MAP panel let the user pick a preset or custom order (e.g.
+`0,2,4,1,3,5`) and wrote it into `DisplaySettings::channel_order`, but the only
+consumer was a preview label. `display_to_physical` — the one function that
+turns a display lane into a physical channel — was marked `#[allow(dead_code)]`
+with no call sites, and `waveform.rs::collect_from_ring` read the ring with
+`phys_ch = start_ch + disp_pos` directly. The panel reported "map applied" while
+every consumer still used the raw acquisition order: depth profiles and
+electrode-site assignments were silently wrong with positive UI feedback.
+
+The waveform display path now maps each lane's **display index**
+(`start_ch + lane`) through `display_to_physical` before touching the ring:
+trace read/draw, the inline per-lane spike detection, the colored lane chips and
+axis labels, the zero-grid enable check, and hover all follow a non-identity
+map. The hover readout recovers its lane from the cursor's plot-Y instead of
+`hovered_ch - start_ch`, since under a reorder the physical channel is no longer
+`start_ch + lane`. Identity (`channel_order` empty) is unchanged:
+`display_to_physical(i) == i`.
+
+Scope: the FFT panel selects its channel by **physical** index by design
+(`FftPanelState::selected_channel`, "Which channel to analyze (physical
+index)"), so it is unaffected by display reordering and stays unambiguous.
+Recording likewise operates in **physical** index space — the Rec subset
+(DA20) and the channel→site provenance map (DA17) are keyed by physical
+channel, so the `.kvraw` stays in acquisition order with an explicit map rather
+than being silently permuted by a display preference.

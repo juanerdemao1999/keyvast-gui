@@ -136,7 +136,9 @@ impl DisplaySettings {
 
     /// Map a display position to a physical channel index.
     /// If `channel_order` is empty, returns the identity mapping.
-    #[allow(dead_code)] // inverse of physical_to_display, kept for symmetry
+    /// Consumed by the waveform display path (lanes, hover, labels, grid,
+    /// inline spike detection) so the Channel Map panel actually reorders
+    /// which physical channel each lane reads (DA19).
     pub fn display_to_physical(&self, display_pos: usize) -> usize {
         if self.channel_order.is_empty() {
             display_pos
@@ -1192,5 +1194,35 @@ fn format_large_number(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_to_physical_identity_when_order_empty() {
+        let d = DisplaySettings::default();
+        assert!(d.channel_order.is_empty());
+        for i in 0..8 {
+            assert_eq!(d.display_to_physical(i), i);
+        }
+    }
+
+    #[test]
+    fn display_to_physical_applies_non_identity_map() {
+        // A non-identity map must change which physical channel each display
+        // lane reads — the core DA19 guarantee.
+        let d = DisplaySettings {
+            channel_order: vec![3, 1, 0, 2],
+            ..Default::default()
+        };
+        assert_eq!(d.display_to_physical(0), 3);
+        assert_eq!(d.display_to_physical(1), 1);
+        assert_eq!(d.display_to_physical(2), 0);
+        assert_eq!(d.display_to_physical(3), 2);
+        // Out-of-range lane falls back to identity (no panic).
+        assert_eq!(d.display_to_physical(9), 9);
     }
 }

@@ -44,7 +44,16 @@ pub struct RecordingSummary {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchmarkSummary {
     pub measurement_kind: String,
+    /// Length of acquired signal in seconds (`written_samples / channels /
+    /// sample_rate`), i.e. how much data was captured — *not* how long the
+    /// run took on the wall clock.
     pub duration_seconds: f64,
+    /// Wall-clock time the run took to compute, when measured. Distinct from
+    /// `duration_seconds`; `None` for estimate-only summaries.
+    pub wall_clock_seconds: Option<f64>,
+    /// Signal duration the caller requested (e.g. `benchmark --duration`),
+    /// when applicable. `None` when the run is sized by block count instead.
+    pub requested_duration_seconds: Option<f64>,
     pub channel_count: usize,
     pub sample_rate: f64,
     pub expected_samples: u64,
@@ -470,6 +479,8 @@ fn benchmark_summary_json(summary: &BenchmarkSummary) -> String {
             "{{\n",
             "  \"measurement_kind\": \"{}\",\n",
             "  \"duration_seconds\": {},\n",
+            "  \"wall_clock_seconds\": {},\n",
+            "  \"requested_duration_seconds\": {},\n",
             "  \"channel_count\": {},\n",
             "  \"sample_rate\": {},\n",
             "  \"expected_samples\": {},\n",
@@ -490,6 +501,8 @@ fn benchmark_summary_json(summary: &BenchmarkSummary) -> String {
         ),
         escape_json_string(&summary.measurement_kind),
         format_metric(summary.duration_seconds),
+        format_optional_metric(summary.wall_clock_seconds),
+        format_optional_metric(summary.requested_duration_seconds),
         summary.channel_count,
         format_sample_rate(summary.sample_rate),
         summary.expected_samples,

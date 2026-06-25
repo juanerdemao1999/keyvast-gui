@@ -4,8 +4,28 @@
 
 use kv_rhd::{
     AuxCommandSlot, BoardPort, RHD_COMMAND_LIST_LEN, Rhd2000CommandType, Rhd2000Registers,
-    RhdChipType, create_rhd2000_command,
+    RhdChipType, RhdCommandError, create_rhd2000_command,
 };
+
+#[test]
+fn register6_reflects_configurable_zcheck_dac() {
+    let mut registers = Rhd2000Registers::open_ephys_default();
+    // Defaults to mid-scale.
+    assert_eq!(registers.register_value(6).expect("reg6"), 128);
+    registers.set_zcheck_dac(200);
+    assert_eq!(registers.register_value(6).expect("reg6"), 200);
+}
+
+#[test]
+fn register_value_out_of_range_is_a_write_fault() {
+    let registers = Rhd2000Registers::open_ephys_default();
+    match registers.register_value(22) {
+        Err(RhdCommandError::ArgumentOutOfRange { command_type, .. }) => {
+            assert_eq!(command_type, Rhd2000CommandType::RegisterWrite);
+        }
+        other => panic!("expected RegisterWrite ArgumentOutOfRange, got {other:?}"),
+    }
+}
 
 #[test]
 fn encodes_rhd2000_spi_commands_like_intan() {

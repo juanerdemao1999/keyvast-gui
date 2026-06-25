@@ -161,7 +161,7 @@ pub fn run_simulator_stream(
     let events = simulator_recording_events(&result.integrity);
     write_events_csv(&options.output_dir, &events)?;
 
-    let benchmark = streaming_benchmark_summary(&result, &streaming_config.device, None);
+    let benchmark = streaming_benchmark_summary(&result, &streaming_config.device, None, None);
     write_benchmark_summary(&options.output_dir, &benchmark)?;
 
     Ok(SimulatorStreamResult {
@@ -247,7 +247,12 @@ pub fn run_benchmark(options: BenchmarkOptions) -> Result<BenchmarkResult, CliEr
     let events = simulator_recording_events(&result.integrity);
     write_events_csv(&options.output_dir, &events)?;
 
-    let benchmark = streaming_benchmark_summary(&result, &device, process_metrics.as_ref());
+    let benchmark = streaming_benchmark_summary(
+        &result,
+        &device,
+        process_metrics.as_ref(),
+        Some(options.duration_seconds),
+    );
     write_benchmark_summary(&options.output_dir, &benchmark)?;
 
     Ok(BenchmarkResult {

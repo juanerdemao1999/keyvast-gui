@@ -18,6 +18,7 @@
 //! Mouse: scroll-wheel over the plot also adjusts the time window.
 
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use eframe::egui;
@@ -49,7 +50,7 @@ use crate::remote_api::{
 use crate::spike_overlay::SpikeSnippetStore;
 use crate::theme;
 use crate::toast::Toasts;
-use crate::trigger::{self, TriggerAction, TriggerConfig};
+use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 
 /// How long filter settings must stay unchanged before the full history
 /// is re-filtered (lets slider drags settle first).
@@ -195,6 +196,8 @@ pub struct KvApp {
     channel_map: ChannelMapState,
     // Phase 3 features
     trigger: TriggerConfig,
+    /// Rolling TTL transition history feeding the live TTL monitor tile.
+    ttl_history: TtlHistory,
     remote_api_state: RemoteApiState,
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
@@ -212,6 +215,9 @@ pub struct KvApp {
     ui_scale: f32,
     /// Set once after the first frame restores the saved window size (#15).
     window_restored: bool,
+    /// Window size persisted at startup, reused on the first frame so the
+    /// config file is read once (in `new`) rather than again in `update`.
+    restore_window_size: (f32, f32),
 }
 
 impl KvApp {
@@ -222,7 +228,9 @@ impl KvApp {
         // Restore persisted settings at startup (#15/#17).  Missing or invalid
         // files fall back to defaults, so this never blocks launch.
         let saved = config_persist::load_or_default();
-        let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let ui_scale = saved
+            .ui_scale
+            .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
         let start_source = match saved.last_source.as_str() {
             "device" => DataSource::Device,
             "playback" => DataSource::Playback,
@@ -256,7 +264,7 @@ impl KvApp {
             filters_last_frame: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
-            disp_ring_ap: DisplayRing::new(16, 30_000.0),
+            disp_ring_ap: DisplayRing::new(16, 30_000.0).with_peak_hold(),
             filter_chains_lfp: Vec::new(),
             filter_chains_ap: Vec::new(),
             tile_tree: Some(multiview::make_initial_tree(16)),
@@ -282,9 +290,10 @@ impl KvApp {
             fft: FftState::default(),
             channel_map: ChannelMapState::default(),
             trigger: TriggerConfig::default(),
+            ttl_history: TtlHistory::new(),
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
-            export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            export_format: kv_recorder::export_formats::ExportFormat::KeyvastNative,
             export_rx: None,
             export_status: None,
             record_channels: None,
@@ -292,6 +301,7 @@ impl KvApp {
             config_persist: ConfigPersistState::default(),
             ui_scale,
             window_restored: false,
+            restore_window_size: (saved.window_width, saved.window_height),
         };
 
         // Apply the persisted display/filter/recording settings to live state.
@@ -349,6 +359,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         self.snippet_store
             .reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
@@ -375,6 +386,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         // snippet_store will be reconfigured lazily on the first ingest_block()
         // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
@@ -653,7 +665,8 @@ impl KvApp {
             self.snippet_store.process_block(&ap_block);
         }
 
-        // Phase 3: Process trigger/gate logic
+        // Phase 3: feed the TTL monitor and process the recording gate.
+        self.ttl_history.push_block(&block);
         let trigger_action = self.trigger.process_block(&block);
         match trigger_action {
             TriggerAction::StartRecording => {
@@ -728,6 +741,11 @@ impl KvApp {
     /// True when an LFP tile exists in the layout.
     fn lfp_tile_open(&self) -> bool {
         self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
+    }
+
+    /// True when an FFT spectrum tile exists in the layout.
+    fn fft_tile_open(&self) -> bool {
+        self.tile_has_pane(|kind| matches!(kind, TileKind::FftSpectrum))
     }
 
     /// True when the AP band must be computed: an AP tile or a spike-overlay
@@ -891,6 +909,13 @@ impl KvApp {
                 // Recorder thread finalizes; state goes Idle via RecorderEvent::Stopped.
                 if let Some(ref pipeline) = self.live_pipeline {
                     let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Stop);
+                    self.recording_start_time = None;
+                    self.recorder_buffer_occupancy = 0.0;
+                } else {
+                    // No live pipeline (e.g. it was already torn down): there is
+                    // no recorder thread to emit RecorderEvent::Stopped, so reset
+                    // the recording state here instead of leaving it stuck.
+                    self.recording.state = RecordingState::Idle;
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
@@ -1204,19 +1229,17 @@ impl KvApp {
 
     /// Poll the live pipeline for new blocks and recorder events.
     fn tick_device(&mut self) {
-        if self.live_pipeline.is_none() {
-            return;
-        }
-
         // ── Collect recorder events and preview blocks while holding the borrow ──
         // We must release the borrow before calling self.ingest_block() or
         // mutating other self fields, so collect into locals first.
 
         let mut recorder_events: Vec<RecorderEvent> = Vec::new();
-        let mut preview_blocks: Vec<SampleBlock> = Vec::new();
+        let mut preview_blocks: Vec<Arc<SampleBlock>> = Vec::new();
 
         {
-            let pipeline = self.live_pipeline.as_mut().unwrap();
+            let Some(pipeline) = self.live_pipeline.as_mut() else {
+                return;
+            };
 
             while let Ok(event) = pipeline.event_rx.try_recv() {
                 recorder_events.push(event);
@@ -1269,7 +1292,7 @@ impl KvApp {
                     self.toasts.error(format!("Device error: {e}"));
                     self.device_error = Some(e);
                     self.live_pipeline = None;
-                    if self.recording.state == RecordingState::Recording {
+                    if self.recording.state != RecordingState::Idle {
                         self.recording.state = RecordingState::Idle;
                         self.recording_start_time = None;
                     }
@@ -1301,6 +1324,9 @@ impl KvApp {
         // ── Ingest all preview blocks ─────────────────────────────────────────
         let last_block = preview_blocks.last().cloned();
         for block in preview_blocks {
+            // Reuse the producer's allocation when the recorder has already
+            // released its copy; otherwise fall back to a single deep clone.
+            let block = Arc::try_unwrap(block).unwrap_or_else(|b| (*b).clone());
             self.ingest_block(block);
         }
 
@@ -1437,7 +1463,10 @@ impl KvApp {
                     ("G", "Toggle the waveform grid"),
                     ("F", "Toggle the performance overlay"),
                     ("[  ]", "Decrease / increase the time window"),
-                    ("1 \u{2013} 9", "Quick-set visible channel count (\u{00D7}4)"),
+                    (
+                        "1 \u{2013} 9",
+                        "Quick-set visible channel count (\u{00D7}4)",
+                    ),
                     ("+  \u{2212}", "Increase / decrease channel spacing"),
                     ("?  /  F1", "Toggle this help (Esc to close)"),
                 ];
@@ -1487,9 +1516,9 @@ impl eframe::App for KvApp {
         // config the rest of the settings come from.
         if !self.window_restored {
             self.window_restored = true;
-            let saved = config_persist::load_or_default();
-            let w = saved.window_width.clamp(640.0, 7680.0);
-            let h = saved.window_height.clamp(480.0, 4320.0);
+            let (sw, sh) = self.restore_window_size;
+            let w = sw.clamp(640.0, 7680.0);
+            let h = sh.clamp(480.0, 4320.0);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
 
@@ -1543,6 +1572,18 @@ impl eframe::App for KvApp {
 
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
+
+        // Refresh the FFT spectrum once per frame while an FFT view is open, so
+        // the view is self-contained and no longer depends on the sidebar
+        // section being expanded/enabled (#4a).
+        if self.fft_tile_open() {
+            let sr = self
+                .latest_block
+                .as_ref()
+                .map(|b| b.sample_rate)
+                .unwrap_or(30000.0);
+            self.fft.update_from_ring(&self.disp_ring, sr);
+        }
 
         // Detect filter settings change (user toggled in UI) — re-filter
         // history once the settings have been stable for the debounce window,
@@ -1890,7 +1931,10 @@ impl eframe::App for KvApp {
         // ── Device error banner ─────────────────────────────────
         // Surfaced when the acquisition source fails to open or read.
         // Dismissible; the GUI and any other mode keep running regardless.
-        if let Some(err) = self.device_error.clone() {
+        // Borrow the message instead of cloning it every frame; record the
+        // dismiss action in a local and apply it after the panel closure ends.
+        let mut dismiss_device_error = false;
+        if let Some(err) = self.device_error.as_ref() {
             egui::TopBottomPanel::top("device_error_banner")
                 .frame(
                     egui::Frame::new()
@@ -1907,11 +1951,14 @@ impl eframe::App for KvApp {
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.button("Dismiss").clicked() {
-                                self.device_error = None;
+                                dismiss_device_error = true;
                             }
                         });
                     });
                 });
+        }
+        if dismiss_device_error {
+            self.device_error = None;
         }
 
         // ── Bottom status bar ───────────────────────────────────
@@ -2002,7 +2049,7 @@ impl eframe::App for KvApp {
 
                             ui.add_space(4.0);
                             egui::CollapsingHeader::new(
-                                egui::RichText::new("EXPORT FORMAT")
+                                egui::RichText::new("DATA FORMAT")
                                     .size(11.0)
                                     .strong()
                                     .color(theme::TEXT_SECONDARY),
@@ -2010,7 +2057,21 @@ impl eframe::App for KvApp {
                             .default_open(false)
                             .show(ui, |ui| {
                                 use kv_recorder::export_formats::ExportFormat;
-                                ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Recordings are saved in the native Keyvast .kvraw format. \
+                                         Optionally convert a recording to another format below.",
+                                    )
+                                    .size(9.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::KeyvastNative,
+                                        egui::RichText::new("Keyvast .kvraw").size(10.0),
+                                    );
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::IntanRhd,
@@ -2030,30 +2091,43 @@ impl eframe::App for KvApp {
                                 );
                                 ui.add_space(2.0);
                                 let exporting = self.export_rx.is_some();
-                                if ui
-                                    .add_enabled(
-                                        !exporting,
-                                        egui::Button::new(
-                                            egui::RichText::new("Export .kvraw…").size(10.0),
-                                        ),
-                                    )
-                                    .on_hover_text("Convert a .kvraw recording to the selected format")
-                                    .clicked()
-                                    && let Some(path) = playback::pick_kvraw_file() {
-                                        self.start_export(path);
+                                if self.export_format.is_native() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Native format — recordings are already saved as .kvraw. \
+                                             Pick a third-party format above to convert.",
+                                        )
+                                        .size(9.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                } else {
+                                    if ui
+                                        .add_enabled(
+                                            !exporting,
+                                            egui::Button::new(
+                                                egui::RichText::new("Convert .kvraw…").size(10.0),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "Convert a .kvraw recording to the selected format",
+                                        )
+                                        .clicked()
+                                        && let Some(path) = playback::pick_kvraw_file() {
+                                            self.start_export(path);
+                                        }
+                                    if exporting {
+                                        ui.label(
+                                            egui::RichText::new("Converting…")
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                    } else if let Some(ref status) = self.export_status {
+                                        ui.label(
+                                            egui::RichText::new(status)
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
                                     }
-                                if exporting {
-                                    ui.label(
-                                        egui::RichText::new("Exporting…")
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
-                                } else if let Some(ref status) = self.export_status {
-                                    ui.label(
-                                        egui::RichText::new(status)
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
                                 }
                             });
 
@@ -2093,13 +2167,7 @@ impl eframe::App for KvApp {
                             );
 
                             ui.add_space(4.0);
-                            fft_panel::draw_fft_section(
-                                ui,
-                                &mut self.fft,
-                                &self.disp_ring,
-                                sr,
-                                total_ch,
-                            );
+                            fft_panel::draw_fft_section(ui, &mut self.fft, sr, total_ch);
                         }
                         SidebarTab::Tools => {
                             let can_measure = self.device.kind == DeviceKind::Rhd
@@ -2211,7 +2279,9 @@ impl eframe::App for KvApp {
                                 &mut self.recording.file_prefix,
                                 &mut self.remote_api_state.port,
                             );
-                            self.ui_scale = cfg.ui_scale.clamp(0.8, 1.6);
+                            self.ui_scale = cfg
+                                .ui_scale
+                                .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
                             self.config_persist.status_message = Some("Loaded".to_string());
                             self.config_persist.loaded = true;
                             self.toasts.success("Configuration loaded");
@@ -2269,6 +2339,8 @@ impl eframe::App for KvApp {
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
                         fft: &self.fft,
+                        trigger: &self.trigger,
+                        ttl_history: &self.ttl_history,
                         pending_add: &mut pending_add,
                         empty_hint,
                     };
@@ -2283,6 +2355,7 @@ impl eframe::App for KvApp {
                         AddViewRequest::Ap => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
                         AddViewRequest::Fft => TileKind::new_fft(),
+                        AddViewRequest::Ttl => TileKind::new_ttl_monitor(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }
@@ -2341,8 +2414,18 @@ fn export_kvraw(
     source: &std::path::Path,
     format: kv_recorder::export_formats::ExportFormat,
 ) -> Result<std::path::PathBuf, String> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
     use kv_recorder::KvrawReader;
-    use kv_recorder::export_formats::{self, ExportFormat};
+    use kv_recorder::export_formats::{self, ExportFormat, ExportHeader};
+
+    // Native format needs no conversion — just copy the .kvraw alongside.
+    if format.is_native() {
+        let output = source.with_extension("copy.kvraw");
+        std::fs::copy(source, &output).map_err(|e| e.to_string())?;
+        return Ok(output);
+    }
 
     let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
     let meta = reader.metadata().clone();
@@ -2350,54 +2433,165 @@ fn export_kvraw(
         return Err("kvraw file has no channels".to_string());
     }
     let total_frames = reader.total_frames();
+    if total_frames == 0 {
+        return Err("no data to export".to_string());
+    }
 
-    // Read in ~1 s chunks; the exporters re-chunk internally as needed.
+    let header = ExportHeader {
+        sample_rate: meta.sample_rate,
+        channel_count: meta.channel_count,
+    };
+    let notes = format!("exported from {}", source.display());
+
+    // Stream blocks straight from disk into the exporter. Reading happens lazily
+    // inside the iterator so the whole recording is never held in memory; a read
+    // failure is captured and surfaced after the exporter returns.
     const FRAMES_PER_CHUNK: usize = 30_000;
-    let mut blocks: Vec<SampleBlock> = Vec::new();
+    let read_err: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    let read_err_sink = Rc::clone(&read_err);
+    let channel_count = meta.channel_count;
+    let device_id = meta.device_id.clone();
+    let sample_rate = meta.sample_rate;
     let mut frame: u64 = 0;
     let mut packet_id: u64 = 0;
-    while frame < total_frames {
-        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
-        let data = reader.read_frames(frame, want).map_err(|e| e.to_string())?;
-        if data.is_empty() {
-            break;
+    let blocks = std::iter::from_fn(move || {
+        if frame >= total_frames {
+            return None;
         }
-        let frames_read = data.len() / meta.channel_count;
-        blocks.push(SampleBlock {
-            device_id: meta.device_id.clone(),
+        let want = FRAMES_PER_CHUNK.min((total_frames - frame) as usize);
+        match reader.read_frames(frame, want) {
+            Ok(data) => {
+                if data.is_empty() {
+                    return None;
+                }
+                let frames_read = data.len() / channel_count;
+                let block = SampleBlock {
+                    device_id: device_id.clone(),
+                    stream_id: 0,
+                    packet_id,
+                    timestamp_start: frame,
+                    sample_rate,
+                    channel_count,
+                    samples_per_channel: frames_read,
+                    ttl_bits: 0,
+                    data,
+                    aux_data: None,
+                    board_adc_data: None,
+                    ttl_in_per_sample: None,
+                    ttl_out_per_sample: None,
+                };
+                packet_id += 1;
+                frame += frames_read as u64;
+                Some(block)
+            }
+            Err(e) => {
+                *read_err_sink.borrow_mut() = Some(e.to_string());
+                None
+            }
+        }
+    });
+
+    let result = match format {
+        // Native is short-circuited above before any frames are read.
+        ExportFormat::KeyvastNative => unreachable!("native format handled before frame read"),
+        ExportFormat::IntanRhd => {
+            let output = source.with_extension(format.extension());
+            export_formats::export_intan_rhd_streaming(&output, header, blocks, &notes)
+        }
+        ExportFormat::FlatBinary => {
+            // Flat binary writes recording.bin + recording.meta.json into a directory.
+            let output_dir = source.with_extension("export");
+            export_formats::export_flat_binary_streaming(&output_dir, header, blocks, &notes)
+        }
+    };
+
+    if let Some(e) = read_err.borrow_mut().take() {
+        return Err(e);
+    }
+    result.map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panels::FilterSettings;
+    use kv_types::SampleBlock;
+
+    fn block_interleaved(
+        channel_count: usize,
+        samples_per_channel: usize,
+        data: Vec<i16>,
+    ) -> SampleBlock {
+        assert_eq!(data.len(), channel_count * samples_per_channel);
+        SampleBlock {
+            device_id: "test".to_string(),
             stream_id: 0,
-            packet_id,
-            timestamp_start: frame,
-            sample_rate: meta.sample_rate,
-            channel_count: meta.channel_count,
-            samples_per_channel: frames_read,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count,
+            samples_per_channel,
             ttl_bits: 0,
             data,
             aux_data: None,
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
-        });
-        packet_id += 1;
-        frame += frames_read as u64;
-    }
-    if blocks.is_empty() {
-        return Err("no data to export".to_string());
+        }
     }
 
-    let notes = format!("exported from {}", source.display());
-    match format {
-        ExportFormat::IntanRhd => {
-            let output = source.with_extension(format.extension());
-            export_formats::export_intan_rhd(&output, &blocks, &notes)
-        }
-        ExportFormat::FlatBinary => {
-            // Flat binary writes recording.bin + recording.meta.json into a directory.
-            let output_dir = source.with_extension("export");
-            export_formats::export_flat_binary(&output_dir, &blocks, &notes)
+    #[test]
+    fn build_filter_chains_sets_one_passthrough_chain_per_channel_when_disabled() {
+        let filters = FilterSettings::default();
+        let chains = KvApp::build_filter_chains(&filters, 30_000.0, 4);
+        assert_eq!(chains.len(), 4);
+        for chain in &chains {
+            assert!(!chain.hp_enabled);
+            assert!(!chain.lp_enabled);
+            assert!(!chain.notch_enabled);
         }
     }
-    .map_err(|e| e.to_string())
+
+    #[test]
+    fn build_filter_chains_enables_requested_stages() {
+        let filters = FilterSettings {
+            hp_enabled: true,
+            hp_cutoff_hz: 300.0,
+            lp_enabled: true,
+            lp_cutoff_hz: 5_000.0,
+            notch_enabled: true,
+            ..FilterSettings::default()
+        };
+        let chains = KvApp::build_filter_chains(&filters, 30_000.0, 2);
+        assert_eq!(chains.len(), 2);
+        for chain in &chains {
+            assert!(chain.hp_enabled);
+            assert!(chain.lp_enabled);
+            assert!(chain.notch_enabled);
+        }
+    }
+
+    #[test]
+    fn filter_block_with_chains_is_identity_when_car_off_and_chains_passthrough() {
+        // 2 channels, 2 samples, interleaved by sample: [s0c0, s0c1, s1c0, s1c1].
+        let block = block_interleaved(2, 2, vec![100, -200, 300, -400]);
+        let mut chains = vec![FilterChain::passthrough(); 2];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, false);
+        assert_eq!(out.data, block.data);
+    }
+
+    #[test]
+    fn filter_block_with_chains_subtracts_common_average_when_car_on() {
+        // Per time step the mean across channels is removed.
+        // s0 = [10, 20] -> mean 15 -> [-5, 5]; s1 = [30, 50] -> mean 40 -> [-10, 10].
+        let block = block_interleaved(2, 2, vec![10, 20, 30, 50]);
+        let mut chains = vec![FilterChain::passthrough(); 2];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, true);
+        assert_eq!(out.data, vec![-5, 5, -10, 10]);
+        // Metadata is preserved; only the samples change.
+        assert_eq!(out.channel_count, block.channel_count);
+        assert_eq!(out.samples_per_channel, block.samples_per_channel);
+    }
 }
 
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

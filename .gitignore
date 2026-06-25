@@ -1,5 +1,6 @@
-# Rust build output
+# Rust build output (root and any per-crate target dirs)
 /target/
+**/target/
 
 # Local IDE and editor state
 /.idea/
@@ -19,6 +20,20 @@ events.csv
 integrity.json
 benchmark.json
 log.txt
+kvlog.txt
+/captures/
+
+# FPGA bitfiles (proprietary, ~2.6 MB each)
+*.bit
+
+# Python scratch / diagnostics
+# These local-only scripts embed machine-specific paths (usernames, desktop
+# dirs) and have ad-hoc numpy/scipy/matplotlib deps — keep them out of the repo.
+__pycache__/
+*.pyc
+diag*.png
+diag_*.py
+compare_kvraw_vs_oe.py
 
 # OS noise
 Thumbs.db

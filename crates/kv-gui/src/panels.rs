@@ -271,11 +271,7 @@ impl Default for DeviceSettings {
 /// always pick another file, and `None` is returned when none can be located so
 /// nothing about acquisition is hard-coded.
 fn default_bitfile_path() -> Option<PathBuf> {
-    let bitfile_names = [
-        "keyvast_combined_download.bit",
-        "keyvast_260607_with_UART.bit",
-        "intan_rec_controller_7310.bit",
-    ];
+    let bitfile_names = kv_rhd::RHD_BITFILE_CANDIDATES;
 
     // 1. Search relative to the executable (works in deployed builds).
     if let Ok(exe) = std::env::current_exe()

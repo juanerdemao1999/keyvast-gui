@@ -5,8 +5,8 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder,
-    write_benchmark_summary, write_integrity_summary, write_log_file, write_recording,
+    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder, write_benchmark_summary,
+    write_integrity_summary, write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -329,8 +329,8 @@ fn streaming_recorder_writes_blocks_incrementally() {
     // Read the embedded JSON from the header (bytes 12..524 of the kvraw file)
     let kvraw_bytes = fs::read(output_dir.join("recording.kvraw")).expect("kvraw readable");
     let json_len = u32::from_le_bytes(kvraw_bytes[8..12].try_into().unwrap()) as usize;
-    let metadata = std::str::from_utf8(&kvraw_bytes[12..12 + json_len])
-        .expect("header JSON is valid UTF-8");
+    let metadata =
+        std::str::from_utf8(&kvraw_bytes[12..12 + json_len]).expect("header JSON is valid UTF-8");
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
@@ -379,7 +379,10 @@ fn streaming_recorder_matches_batch_recorder_output() {
     let batch_raw = fs::read(batch_dir.join("recording.kvraw")).expect("batch raw");
     let stream_raw = fs::read(stream_dir.join("recording.kvraw")).expect("stream raw");
     let stream_samples = &stream_raw[KVRAW_DATA_OFFSET as usize..];
-    assert_eq!(batch_raw, stream_samples, "sample data should be byte-identical");
+    assert_eq!(
+        batch_raw, stream_samples,
+        "sample data should be byte-identical"
+    );
 
     cleanup_dir(&batch_dir);
     cleanup_dir(&stream_dir);
@@ -476,7 +479,9 @@ fn kvraw_reader_round_trips_streaming_data() {
     assert_eq!(data.len(), ch * frames_to_read);
 
     // Read as per-channel vectors.
-    let channels = reader.read_channels(0, frames_to_read).expect("read channels");
+    let channels = reader
+        .read_channels(0, frames_to_read)
+        .expect("read channels");
     assert_eq!(channels.len(), ch);
     for c in &channels {
         assert_eq!(c.len(), frames_to_read);
@@ -488,6 +493,117 @@ fn kvraw_reader_round_trips_streaming_data() {
             assert_eq!(data[frame * ch + c], channels[c][frame]);
         }
     }
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvraw_reader_errors_on_legacy_file_without_metadata() {
+    use kv_recorder::KvrawReader;
+
+    // A non-v2 file (no KEYVAST magic) with no companion .json: the channel
+    // count and sample rate are unknown, so the reader must refuse rather than
+    // fabricate 64ch/30kHz defaults.
+    let output_dir = unique_output_dir("v1-no-meta");
+    fs::create_dir_all(&output_dir).expect("mkdir");
+    let raw_path = output_dir.join("legacy.kvraw");
+    fs::write(&raw_path, vec![0u8; 4096]).expect("write raw");
+
+    let error = KvrawReader::open(&raw_path).expect_err("missing metadata should be an error");
+    assert!(matches!(error, RecorderError::MissingMetadata { .. }));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvraw_reader_errors_on_truncated_v2_header() {
+    use kv_recorder::KvrawReader;
+
+    // KEYVAST magic followed by fewer than the 4 json-length bytes: the header
+    // is truncated and the reader should surface an I/O error, not panic.
+    let output_dir = unique_output_dir("v2-trunc");
+    fs::create_dir_all(&output_dir).expect("mkdir");
+    let raw_path = output_dir.join("trunc.kvraw");
+    let mut bytes = b"KEYVAST\n".to_vec();
+    bytes.extend_from_slice(&[0u8; 2]);
+    fs::write(&raw_path, bytes).expect("write raw");
+
+    let error = KvrawReader::open(&raw_path).expect_err("truncated header should be an error");
+    assert!(matches!(error, RecorderError::Io { .. }));
+
+    cleanup_dir(&output_dir);
+}
+
+// ---------- M34: StreamingRecorder consistency tests ----------
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_sample_rate() {
+    let output_dir = unique_output_dir("streaming-bad-sr");
+    let mut blocks = next_simulator_blocks(2);
+    blocks[1].sample_rate = 15_000.0;
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent sample_rate should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "sample_rate",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_channel_count() {
+    let output_dir = unique_output_dir("streaming-bad-ch");
+    let mut blocks = next_simulator_blocks(2);
+    blocks[1].channel_count = 32;
+    blocks[1].data = vec![0; 32 * blocks[1].samples_per_channel];
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent channel_count should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "channel_count",
+            ..
+        }
+    ));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
+    let output_dir = unique_output_dir("streaming-bad-spc");
+    let mut blocks = next_simulator_blocks(2);
+    let orig_ch = blocks[1].channel_count;
+    blocks[1].samples_per_channel *= 2;
+    blocks[1].data = vec![0; orig_ch * blocks[1].samples_per_channel];
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+    recorder.write_block(&blocks[0]).expect("first block");
+    let error = recorder
+        .write_block(&blocks[1])
+        .expect_err("inconsistent samples_per_channel should fail");
+
+    assert!(matches!(
+        error,
+        RecorderError::InconsistentBlockConfig {
+            field: "samples_per_channel",
+            ..
+        }
+    ));
 
     cleanup_dir(&output_dir);
 }

@@ -3,8 +3,9 @@ use std::fmt;
 use kv_types::{SampleBlock, SampleBlockError};
 
 use crate::protocol::{
-    AUX_CHANNELS_PER_STREAM, BOARD_ADC_CHANNELS, CHANNELS_PER_STREAM, RHYTHM_HEADER_MAGIC,
-    RhythmConfigError, RhythmDataConfig, bytes_per_block, raw_word_to_signed_count,
+    AUX_CHANNELS_PER_STREAM, BOARD_ADC_CHANNELS, CHANNELS_PER_STREAM, FrameLayout,
+    RHYTHM_HEADER_MAGIC, RHYTHM_TTL_LINE_COUNT, RhythmConfigError, RhythmDataConfig,
+    bytes_per_block, raw_word_to_signed_count,
 };
 
 // Index-based loops mirror the Rhythm wire layout (stream-major word order).
@@ -28,13 +29,18 @@ pub fn parse_rhythm_data_block(
     let channel_count = config.channel_count();
     let samples = config.samples_per_block;
     let streams = config.enabled_streams;
+    let layout = FrameLayout::new(streams);
     let mut data = Vec::with_capacity(channel_count.saturating_mul(samples));
     let mut offset = 0_usize;
     let mut timestamp_start = None;
 
     // Auxiliary data: [stream][aux_ch][sample]
     let mut aux_data: Vec<Vec<Vec<u16>>> = (0..streams)
-        .map(|_| (0..AUX_CHANNELS_PER_STREAM).map(|_| Vec::with_capacity(samples)).collect())
+        .map(|_| {
+            (0..AUX_CHANNELS_PER_STREAM)
+                .map(|_| Vec::with_capacity(samples))
+                .collect()
+        })
         .collect();
 
     // Board ADC: [adc_ch][sample]
@@ -47,7 +53,7 @@ pub fn parse_rhythm_data_block(
 
     for sample_index in 0..samples {
         let frame_offset = offset;
-        let header = read_u64_le(raw, &mut offset);
+        let header = read_u64_le(raw, &mut offset)?;
         if header != RHYTHM_HEADER_MAGIC {
             return Err(RhythmParseError::BadMagic {
                 sample_index,
@@ -56,7 +62,7 @@ pub fn parse_rhythm_data_block(
             });
         }
 
-        let timestamp = read_u32_le(raw, &mut offset);
+        let timestamp = read_u32_le(raw, &mut offset)?;
         let first_timestamp = *timestamp_start.get_or_insert(timestamp);
         let expected_timestamp = first_timestamp.wrapping_add(sample_index as u32);
         if timestamp != expected_timestamp {
@@ -70,7 +76,7 @@ pub fn parse_rhythm_data_block(
         // Parse auxiliary command results (3 words per stream).
         for aux_ch in 0..AUX_CHANNELS_PER_STREAM {
             for stream in 0..streams {
-                let word = read_u16_le(raw, &mut offset);
+                let word = read_u16_le(raw, &mut offset)?;
                 aux_data[stream][aux_ch].push(word);
             }
         }
@@ -79,25 +85,26 @@ pub fn parse_rhythm_data_block(
         let mut frame_samples = vec![0_i16; channel_count];
         for channel in 0..CHANNELS_PER_STREAM {
             for stream in 0..streams {
-                let word = read_u16_le(raw, &mut offset);
+                let word = read_u16_le(raw, &mut offset)?;
                 frame_samples[stream * CHANNELS_PER_STREAM + channel] =
                     raw_word_to_signed_count(word);
             }
         }
         data.extend_from_slice(&frame_samples);
 
-        // Skip filler word(s) that align each frame to a 4-stream boundary.
-        offset = offset.saturating_add((streams % 4) * 2);
+        // Skip filler word(s) that pad the active stream count up to a multiple
+        // of 4 (see `FrameLayout::filler_words`).
+        offset = offset.saturating_add(layout.filler_words() * 2);
 
         // Parse 8 board ADC channels.
         for adc_ch in 0..BOARD_ADC_CHANNELS {
-            let word = read_u16_le(raw, &mut offset);
+            let word = read_u16_le(raw, &mut offset)?;
             board_adc[adc_ch].push(word);
         }
 
         // Parse TTL input and TTL output words.
-        let ttl_in = read_u16_le(raw, &mut offset) as u32;
-        let ttl_out = read_u16_le(raw, &mut offset) as u32;
+        let ttl_in = read_u16_le(raw, &mut offset)? as u32;
+        let ttl_out = read_u16_le(raw, &mut offset)? as u32;
         ttl_in_vec.push(ttl_in);
         ttl_out_vec.push(ttl_out);
     }
@@ -121,7 +128,7 @@ pub fn parse_rhythm_data_block(
     };
 
     block
-        .validate_against_ttl_lines(16)
+        .validate_against_ttl_lines(RHYTHM_TTL_LINE_COUNT)
         .map_err(RhythmParseError::InvalidSampleBlock)?;
 
     Ok(block)
@@ -145,6 +152,9 @@ pub enum RhythmParseError {
         observed: u32,
     },
     InvalidSampleBlock(SampleBlockError),
+    BufferTruncated {
+        offset: usize,
+    },
 }
 
 impl fmt::Display for RhythmParseError {
@@ -174,6 +184,9 @@ impl fmt::Display for RhythmParseError {
             Self::InvalidSampleBlock(error) => {
                 write!(formatter, "parsed RHD sample block is invalid: {error}")
             }
+            Self::BufferTruncated { offset } => {
+                write!(formatter, "buffer truncated at byte offset {offset}")
+            }
         }
     }
 }
@@ -185,39 +198,46 @@ impl std::error::Error for RhythmParseError {
             Self::InvalidSampleBlock(error) => Some(error),
             Self::LengthMismatch { .. }
             | Self::BadMagic { .. }
-            | Self::TimestampDiscontinuity { .. } => None,
+            | Self::TimestampDiscontinuity { .. }
+            | Self::BufferTruncated { .. } => None,
         }
     }
 }
 
-fn read_u16_le(raw: &[u8], offset: &mut usize) -> u16 {
-    let value = u16::from_le_bytes([raw[*offset], raw[*offset + 1]]);
-    *offset += 2;
-    value
+fn read_u16_le(raw: &[u8], offset: &mut usize) -> Result<u16, RhythmParseError> {
+    let end = offset
+        .checked_add(2)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
+    let slice = raw
+        .get(*offset..end)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
+    let value = u16::from_le_bytes([slice[0], slice[1]]);
+    *offset = end;
+    Ok(value)
 }
 
-fn read_u32_le(raw: &[u8], offset: &mut usize) -> u32 {
-    let value = u32::from_le_bytes([
-        raw[*offset],
-        raw[*offset + 1],
-        raw[*offset + 2],
-        raw[*offset + 3],
-    ]);
-    *offset += 4;
-    value
+fn read_u32_le(raw: &[u8], offset: &mut usize) -> Result<u32, RhythmParseError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
+    let slice = raw
+        .get(*offset..end)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
+    let value = u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]);
+    *offset = end;
+    Ok(value)
 }
 
-fn read_u64_le(raw: &[u8], offset: &mut usize) -> u64 {
+fn read_u64_le(raw: &[u8], offset: &mut usize) -> Result<u64, RhythmParseError> {
+    let end = offset
+        .checked_add(8)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
+    let slice = raw
+        .get(*offset..end)
+        .ok_or(RhythmParseError::BufferTruncated { offset: *offset })?;
     let value = u64::from_le_bytes([
-        raw[*offset],
-        raw[*offset + 1],
-        raw[*offset + 2],
-        raw[*offset + 3],
-        raw[*offset + 4],
-        raw[*offset + 5],
-        raw[*offset + 6],
-        raw[*offset + 7],
+        slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
     ]);
-    *offset += 8;
-    value
+    *offset = end;
+    Ok(value)
 }

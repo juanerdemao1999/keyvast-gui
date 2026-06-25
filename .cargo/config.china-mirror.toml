@@ -1,0 +1,19 @@
+# Optional crates.io mirror for contributors on a China-side network.
+#
+# This is NOT loaded by default. Region-specific registry overrides do not
+# belong in the shared, auto-loaded `.cargo/config.toml` (they would silently
+# route every contributor's crates.io traffic through a single mirror). Opt in
+# only if you need it, by merging the block below into your *user* cargo config
+# (`~/.cargo/config.toml`) or by appending it to this repo's `.cargo/config.toml`
+# locally (do not commit that change).
+#
+# Active mirror below: TUNA (Tsinghua). rsproxy.cn and mirrors.ustc.edu.cn are
+# alternatives — swap the registry line if TUNA becomes slow:
+#   sparse+https://rsproxy.cn/index/
+#   sparse+https://mirrors.ustc.edu.cn/crates.io-index/
+
+[source.crates-io]
+replace-with = "tuna-sparse"
+
+[source.tuna-sparse]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"

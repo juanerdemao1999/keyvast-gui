@@ -1,8 +1,10 @@
 use std::{env, process::ExitCode};
 
-use kv_cli::{CommandResult, parse_args, run_command};
+use kv_cli::{CommandResult, install_ctrlc_handler, parse_args, run_command};
 
 fn main() -> ExitCode {
+    install_ctrlc_handler();
+
     match parse_args(env::args().skip(1)).and_then(run_command) {
         Ok(CommandResult::Record(result)) => {
             println!("output_dir={}", result.recording.output_dir.display());

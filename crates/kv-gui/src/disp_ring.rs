@@ -51,6 +51,12 @@ pub struct DisplayRing {
     next_expected: u64,
     /// Whether the ring has been initialized (received at least one block).
     pub ready: bool,
+    /// Peak-preserving mode. When set, each ring sample stores the most
+    /// extreme (largest |value|) input sample within its `dwnsp` window, and
+    /// `collect_channel_minmax` is used at render time. This keeps narrow
+    /// spikes visible in the high-pass / AP band, where plain last-sample
+    /// decimation would drop them (#4b).
+    pub peak_hold: bool,
 }
 
 // VecDeque<f32> alias for clarity
@@ -74,7 +80,14 @@ impl DisplayRing {
             channel_count,
             next_expected: 0,
             ready: false,
+            peak_hold: false,
         }
+    }
+
+    /// Enable peak-preserving decimation (see [`DisplayRing::peak_hold`]).
+    pub fn with_peak_hold(mut self) -> Self {
+        self.peak_hold = true;
+        self
     }
 
     /// Reset the ring (called on mode switch or channel-count change).
@@ -131,6 +144,7 @@ impl DisplayRing {
         }
 
         // Walk through ring-aligned positions within this block
+        let dwnsp_us = self.dwnsp;
         let mut abs = self.next_expected;
         while abs < block_start + spc as u64 {
             let s = (abs - block_start) as usize;
@@ -138,13 +152,36 @@ impl DisplayRing {
                 break;
             }
 
-            // Push one sample per channel
+            // Push one sample per channel. In peak-hold mode the stored value is
+            // the most extreme sample in the [s, s+dwnsp) window so narrow spikes
+            // survive ingestion-time decimation.
+            let w_end = if self.peak_hold {
+                (s + dwnsp_us).min(spc)
+            } else {
+                s + 1
+            };
             for ch in 0..ch_count {
-                let idx = s * ch_count + ch;
-                let v = if idx < block.data.len() {
-                    block.data[idx] as f32 * norm
+                let v = if self.peak_hold {
+                    let mut best = 0.0_f32;
+                    let mut best_abs = -1.0_f32;
+                    for w in s..w_end {
+                        let idx = w * ch_count + ch;
+                        if idx < block.data.len() {
+                            let val = block.data[idx] as f32 * norm;
+                            if val.abs() > best_abs {
+                                best_abs = val.abs();
+                                best = val;
+                            }
+                        }
+                    }
+                    best
                 } else {
-                    0.0
+                    let idx = s * ch_count + ch;
+                    if idx < block.data.len() {
+                        block.data[idx] as f32 * norm
+                    } else {
+                        0.0
+                    }
                 };
                 self.y[ch].push_back(v);
             }
@@ -170,23 +207,24 @@ impl DisplayRing {
         if self.len == 0 || !self.ready {
             return 0.0;
         }
-        (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0
-            / self.sample_rate
+        (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0 / self.sample_rate
     }
 
-    /// Extract the last `n` ring samples for `ch` as i16 values (de-normalized).
-    /// Used by FFT panel for spectrum computation.
-    pub fn last_n_samples(&self, ch: usize, n: usize) -> Vec<i16> {
+    /// Extract the last `n` ring samples for `ch` as de-normalized ADC counts
+    /// in `f64`. Used by the FFT panel, whose math is `f64` end-to-end, so we
+    /// avoid a lossy round-trip through `i16` that would only add quantization
+    /// error to the spectrum.
+    pub fn last_n_samples_f64(&self, ch: usize, n: usize) -> Vec<f64> {
         if ch >= self.channel_count || self.len == 0 || !self.ready {
             return Vec::new();
         }
         let ring = &self.y[ch];
         let avail = ring.len().min(n);
         let start = ring.len() - avail;
-        // Ring stores normalized f32 in [-1, 1]. Convert back to i16.
+        // Ring stores normalized f32 in [-1, 1]; scale back to ADC counts.
         ring.iter()
             .skip(start)
-            .map(|&v| (v as f64 * 32767.0).round() as i16)
+            .map(|&v| v as f64 * 32767.0)
             .collect()
     }
 
@@ -268,5 +306,204 @@ impl DisplayRing {
         }
 
         pts
+    }
+
+    /// Peak-preserving variant of [`DisplayRing::collect_channel`].
+    ///
+    /// Each render bucket of `stride2` ring samples emits both its minimum and
+    /// maximum sample (in time order), so the envelope of narrow features —
+    /// spikes in the AP band — is preserved instead of being skipped over by
+    /// last-sample decimation. Falls back to a single point per bucket when the
+    /// bucket holds only one sample.
+    pub fn collect_channel_minmax(
+        &self,
+        ch: usize,
+        t_left_ms: f64,
+        t_right_ms: f64,
+        max_points: usize,
+        window_ring_entries: usize,
+    ) -> Vec<[f64; 2]> {
+        if ch >= self.channel_count || self.len == 0 || !self.ready {
+            return Vec::new();
+        }
+
+        let ms_per_ring = self.dwnsp as f64 * 1000.0 / self.sample_rate;
+        let t0_ms = self.t0 as f64 * 1000.0 / self.sample_rate;
+
+        let f_start = ((t_left_ms - t0_ms) / ms_per_ring).floor() as i64;
+        let f_end = ((t_right_ms - t0_ms) / ms_per_ring).ceil() as i64 + 1;
+        let ri_start = f_start.clamp(0, self.len as i64) as usize;
+        let ri_end = f_end.clamp(0, self.len as i64) as usize;
+
+        if ri_end <= ri_start {
+            return Vec::new();
+        }
+
+        // Two points per bucket, so target half as many buckets as the point
+        // budget to keep the total comparable to `collect_channel`.
+        let bucket_budget = (max_points / 2).max(1);
+        let stride_denom = window_ring_entries.max(ri_end - ri_start);
+        let stride2 = (stride_denom / bucket_budget).max(1);
+
+        let deque = &self.y[ch];
+        let mut pts = Vec::with_capacity(ri_end.saturating_sub(ri_start).div_ceil(stride2) * 2);
+
+        let mut i = ri_start;
+        while i < ri_end {
+            let end = (i + stride2).min(ri_end);
+            let mut min_v = f32::INFINITY;
+            let mut max_v = f32::NEG_INFINITY;
+            let mut min_i = i;
+            let mut max_i = i;
+            let mut j = i;
+            while j < end {
+                let y = deque[j];
+                if y < min_v {
+                    min_v = y;
+                    min_i = j;
+                }
+                if y > max_v {
+                    max_v = y;
+                    max_i = j;
+                }
+                j += 1;
+            }
+            let t_min = t0_ms + min_i as f64 * ms_per_ring;
+            let t_max = t0_ms + max_i as f64 * ms_per_ring;
+            // Emit in time order so the rendered line never steps backwards.
+            if min_i <= max_i {
+                pts.push([t_min, min_v as f64]);
+                if max_i != min_i {
+                    pts.push([t_max, max_v as f64]);
+                }
+            } else {
+                pts.push([t_max, max_v as f64]);
+                pts.push([t_min, min_v as f64]);
+            }
+            i = end;
+        }
+
+        pts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert two sample slices match within the f32 round-trip tolerance.
+    /// Values are stored as normalized f32 then scaled back, so small
+    /// quantization error is expected.
+    fn assert_samples_eq(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 0.01, "got {a}, expected {e}");
+        }
+    }
+
+    /// Build a block where channel `ch` at sample `s` holds value
+    /// `(s * channel_count + ch)` as i16, so each ring slot is identifiable.
+    fn block(timestamp_start: u64, channel_count: usize, spc: usize) -> SampleBlock {
+        let mut data = Vec::with_capacity(channel_count * spc);
+        for s in 0..spc {
+            for ch in 0..channel_count {
+                data.push((s * channel_count + ch) as i16);
+            }
+        }
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start,
+            sample_rate: 30_000.0,
+            channel_count,
+            samples_per_channel: spc,
+            ttl_bits: 0,
+            data,
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn new_ring_is_empty_and_not_ready() {
+        let ring = DisplayRing::new(4, 30_000.0);
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+        assert_eq!(ring.channel_count, 4);
+        assert_eq!(ring.dwnsp, RING_DWNSP);
+        // 120 s * 30 kHz / 4 = 900_000.
+        assert_eq!(ring.capacity, 900_000);
+    }
+
+    #[test]
+    fn push_block_decimates_by_ring_dwnsp() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        // 16 samples at stride 4 -> ring slots for absolute samples 0,4,8,12.
+        ring.push_block(&block(0, 2, 16));
+        assert!(ring.ready);
+        assert_eq!(ring.len, 4);
+        // Channel 0 stores raw value (s * 2 + 0) for s in {0,4,8,12}.
+        assert_samples_eq(&ring.last_n_samples_f64(0, 4), &[0.0, 8.0, 16.0, 24.0]);
+        // Channel 1 stores (s * 2 + 1).
+        assert_samples_eq(&ring.last_n_samples_f64(1, 4), &[1.0, 9.0, 17.0, 25.0]);
+    }
+
+    #[test]
+    fn push_block_aligns_first_sample_to_stride_boundary() {
+        let mut ring = DisplayRing::new(1, 30_000.0);
+        // Start at 6: first ring-aligned absolute sample is 8.
+        ring.push_block(&block(6, 1, 10)); // covers abs 6..16, aligned: 8, 12
+        assert_eq!(ring.len, 2);
+        // value at abs 8 -> local sample 2 -> (2*1+0) = 2; abs 12 -> local 6 -> 6.
+        assert_samples_eq(&ring.last_n_samples_f64(0, 2), &[2.0, 6.0]);
+    }
+
+    #[test]
+    fn push_block_rejects_channel_count_mismatch() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&block(0, 3, 16));
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+    }
+
+    #[test]
+    fn ring_evicts_oldest_when_over_capacity() {
+        // sample_rate 30 forces the minimum capacity floor of 1024.
+        let mut ring = DisplayRing::new(1, 30.0);
+        assert_eq!(ring.capacity, 1024);
+        // 5000 input samples -> 1250 ring-aligned slots (0,4,..,4996).
+        ring.push_block(&block(0, 1, 5000));
+        assert_eq!(ring.len, ring.capacity);
+        // 1250 - 1024 = 226 slots evicted, each advancing t0 by dwnsp (4).
+        assert_eq!(ring.t0, 226 * 4);
+    }
+
+    #[test]
+    fn reset_clears_state_but_keeps_capacity() {
+        let mut ring = DisplayRing::new(2, 30_000.0);
+        ring.push_block(&block(0, 2, 16));
+        let cap = ring.capacity;
+        ring.reset();
+        assert!(!ring.ready);
+        assert_eq!(ring.len, 0);
+        assert_eq!(ring.capacity, cap);
+        assert_eq!(ring.latest_time_ms(), 0.0);
+    }
+
+    #[test]
+    fn collect_channel_returns_points_within_window() {
+        let mut ring = DisplayRing::new(1, 30_000.0);
+        ring.push_block(&block(0, 1, 30_000)); // 1 s of data
+        let ms_per_ring = RING_DWNSP as f64 * 1000.0 / 30_000.0;
+        let window_entries = (500.0 / ms_per_ring) as usize;
+        let pts = ring.collect_channel(0, 0.0, 500.0, 256, window_entries);
+        assert!(!pts.is_empty());
+        // Decimated well below the ~3750 ring slots spanning the window.
+        assert!(pts.len() < 512);
+        // Times stay inside the requested window (allow one ring slot of slack).
+        assert!(pts.iter().all(|p| p[0] >= 0.0 && p[0] <= 520.0));
     }
 }

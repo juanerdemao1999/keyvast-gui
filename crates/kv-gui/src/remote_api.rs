@@ -21,7 +21,7 @@
 //! - `ping` — Returns "pong" (connectivity check)
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -133,10 +133,18 @@ pub type CommandQueue = Arc<Mutex<VecDeque<(u64, RemoteCommand)>>>;
 /// Shared response queue for sending replies back to clients.
 pub type ResponseQueue = Arc<Mutex<VecDeque<RemoteResponse>>>;
 
+/// Maximum bytes per line from a remote client (64 KiB). Prevents a
+/// malicious or buggy client from exhausting memory.
+const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// Maximum pending commands / responses in the shared queues.
+const MAX_QUEUE_LEN: usize = 256;
+
 /// Handle to the running server (holds the stop flag and thread handle).
 pub struct RemoteApiHandle {
     stop_flag: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    bound_port: u16,
     pub commands: CommandQueue,
     pub responses: ResponseQueue,
     pub client_count: Arc<Mutex<usize>>,
@@ -147,7 +155,7 @@ impl RemoteApiHandle {
     pub fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::Relaxed);
         // Connect to self to unblock accept()
-        let _ = TcpStream::connect(format!("127.0.0.1:{}", DEFAULT_PORT));
+        let _ = TcpStream::connect(format!("127.0.0.1:{}", self.bound_port));
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
@@ -163,7 +171,7 @@ impl Drop for RemoteApiHandle {
 /// Start the remote API server on the given port.
 /// Returns a handle that the GUI polls for incoming commands.
 pub fn start_server(port: u16) -> Result<RemoteApiHandle, String> {
-    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
         .map_err(|e| format!("Failed to bind port {port}: {e}"))?;
 
     listener
@@ -187,6 +195,7 @@ pub fn start_server(port: u16) -> Result<RemoteApiHandle, String> {
     Ok(RemoteApiHandle {
         stop_flag,
         thread: Some(thread),
+        bound_port: port,
         commands,
         responses,
         client_count,
@@ -200,11 +209,9 @@ fn server_loop(
     responses: ResponseQueue,
     client_count: Arc<Mutex<usize>>,
 ) {
-    // Set a timeout so we can check the stop flag periodically
-    listener
-        .set_nonblocking(false)
-        .ok();
-
+    // The listener is already in blocking mode (set in `start_server`), so
+    // `incoming()` blocks until a connection arrives; the stop flag is checked
+    // on each accepted/errored connection.
     for stream in listener.incoming() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -240,7 +247,9 @@ fn handle_client(
     responses: ResponseQueue,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let Ok(reader_stream) = stream.try_clone() else { return; };
+    let Ok(reader_stream) = stream.try_clone() else {
+        return;
+    };
     let mut reader = BufReader::new(reader_stream);
     let mut writer = stream;
 
@@ -250,11 +259,19 @@ fn handle_client(
         }
 
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match reader
+            .by_ref()
+            .take(MAX_LINE_BYTES as u64)
+            .read_line(&mut line)
+        {
             Ok(0) => break, // connection closed
             Ok(_) => {
                 if let Some((id, cmd)) = parse_jsonrpc_request(&line) {
-                    lock_recover(&commands).push_back((id, cmd));
+                    let mut q = lock_recover(&commands);
+                    if q.len() >= MAX_QUEUE_LEN {
+                        q.pop_front();
+                    }
+                    q.push_back((id, cmd));
 
                     // Wait briefly for response (poll up to 100ms)
                     let mut response_sent = false;
@@ -286,8 +303,9 @@ fn handle_client(
                     let _ = writer.flush();
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut =>
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 continue;
             }
@@ -314,7 +332,8 @@ fn parse_jsonrpc_request(line: &str) -> Option<(u64, RemoteCommand)> {
         "get_status" => RemoteCommand::GetStatus,
         "get_channel_count" => RemoteCommand::GetChannelCount,
         "start_acquisition" => {
-            let mode = extract_string_from_params(line, "mode").unwrap_or_else(|| "demo".to_string());
+            let mode =
+                extract_string_from_params(line, "mode").unwrap_or_else(|| "demo".to_string());
             RemoteCommand::StartAcquisition { mode }
         }
         "stop_acquisition" => RemoteCommand::StopAcquisition,
@@ -324,7 +343,8 @@ fn parse_jsonrpc_request(line: &str) -> Option<(u64, RemoteCommand)> {
         }
         "stop_recording" => RemoteCommand::StopRecording,
         "set_display_mode" => {
-            let mode = extract_string_from_params(line, "mode").unwrap_or_else(|| "sweep".to_string());
+            let mode =
+                extract_string_from_params(line, "mode").unwrap_or_else(|| "sweep".to_string());
             RemoteCommand::SetDisplayMode { mode }
         }
         _ => return None,
@@ -342,7 +362,9 @@ fn extract_u64_field(json: &str, field: &str) -> Option<u64> {
     let after_colon = after_key.trim_start().strip_prefix(':')?;
     let num_start = after_colon.trim_start();
     // Parse number
-    let end = num_start.find(|c: char| !c.is_ascii_digit()).unwrap_or(num_start.len());
+    let end = num_start
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(num_start.len());
     num_start[..end].parse().ok()
 }
 
@@ -372,10 +394,7 @@ fn extract_string_from_params(json: &str, field: &str) -> Option<String> {
 /// Format a JSON-RPC 2.0 response.
 fn format_jsonrpc_response(id: u64, result: &Result<String, String>) -> String {
     match result {
-        Ok(value) => format!(
-            r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#,
-            value, id
-        ),
+        Ok(value) => format!(r#"{{"jsonrpc":"2.0","result":{},"id":{}}}"#, value, id),
         Err(msg) => format!(
             r#"{{"jsonrpc":"2.0","error":{{"code":-32000,"message":"{}"}},"id":{}}}"#,
             msg.replace('"', "\\\""),
@@ -456,7 +475,8 @@ pub fn draw_remote_api_section(ui: &mut egui::Ui, state: &mut RemoteApiState) {
         let (color, text) = if state.running {
             (
                 theme::ACCENT_GREEN,
-                format!("Listening on :{} ({} client{})",
+                format!(
+                    "Listening on :{} ({} client{})",
                     state.port,
                     state.client_count,
                     if state.client_count == 1 { "" } else { "s" }
@@ -496,7 +516,8 @@ mod tests {
 
     #[test]
     fn parse_start_acquisition() {
-        let req = r#"{"jsonrpc":"2.0","method":"start_acquisition","params":{"mode":"demo"},"id":42}"#;
+        let req =
+            r#"{"jsonrpc":"2.0","method":"start_acquisition","params":{"mode":"demo"},"id":42}"#;
         let (id, cmd) = parse_jsonrpc_request(req).unwrap();
         assert_eq!(id, 42);
         if let RemoteCommand::StartAcquisition { mode } = cmd {

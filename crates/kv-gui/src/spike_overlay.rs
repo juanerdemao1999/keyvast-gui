@@ -24,7 +24,7 @@
 use std::collections::VecDeque;
 
 use eframe::egui;
-use egui_plot::{Line, Plot, PlotPoints};
+use egui_plot::{Line, Plot, PlotPoint, PlotPoints};
 use kv_types::SampleBlock;
 
 use crate::theme;
@@ -60,11 +60,25 @@ pub struct SpikeChannel {
 
 impl SpikeChannel {
     pub fn new(ch: usize) -> Self {
-        Self { ch, y_scale: DEFAULT_Y_SCALE }
+        Self {
+            ch,
+            y_scale: DEFAULT_Y_SCALE,
+        }
     }
 }
 
 // ── Snippet ──────────────────────────────────────────────────────────
+
+/// Cache key for a snippet's rendered geometry. The geometry only changes when
+/// the display window, the channel's vertical scale, or its lane position
+/// changes — never per frame — so we rebuild only when this key changes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct GeomKey {
+    pre_bits: u32,
+    post_bits: u32,
+    y_scale_bits: u32,
+    disp_pos: usize,
+}
 
 /// One captured threshold-crossing waveform.
 pub struct SpikeSnippet {
@@ -72,12 +86,63 @@ pub struct SpikeSnippet {
     pub samples: Vec<f32>,
     /// Frames elapsed since capture — drives fade-out alpha.
     pub age_frames: u32,
+    /// Cached plot geometry, reused across frames while [`GeomKey`] is
+    /// unchanged. egui is immediate-mode, so this is borrowed each frame to
+    /// avoid rebuilding and re-allocating the point list when only the fade
+    /// alpha (a colour, not geometry) changes (#4c).
+    render_geom: Vec<PlotPoint>,
+    render_key: Option<GeomKey>,
 }
 
 impl SpikeSnippet {
+    fn new(samples: Vec<f32>) -> Self {
+        Self {
+            samples,
+            age_frames: 0,
+            render_geom: Vec::new(),
+            render_key: None,
+        }
+    }
+
     /// Opacity: 1.0 when fresh, linearly decays to 0.0 at FADE_FRAMES.
     pub fn alpha(&self) -> f32 {
         (1.0 - self.age_frames as f32 / FADE_FRAMES as f32).clamp(0.0, 1.0)
+    }
+
+    /// Rebuild [`Self::render_geom`] only if the layout parameters changed.
+    /// `y_scale` is applied here as a cheap multiplier so dragging the Y-scale
+    /// control no longer forces a full per-frame geometry recompute.
+    fn ensure_render_geom(
+        &mut self,
+        pre_ms: f32,
+        post_ms: f32,
+        ch_spacing: f64,
+        y_scale: f32,
+        disp_pos: usize,
+    ) {
+        let key = GeomKey {
+            pre_bits: pre_ms.to_bits(),
+            post_bits: post_ms.to_bits(),
+            y_scale_bits: y_scale.to_bits(),
+            disp_pos,
+        };
+        if self.render_key == Some(key) && !self.render_geom.is_empty() {
+            return;
+        }
+        let total = self.samples.len();
+        let x_left = -(pre_ms as f64);
+        let x_right = post_ms as f64;
+        let denom = total.saturating_sub(1).max(1) as f64;
+        let gain = ch_spacing * 0.4 * y_scale as f64;
+        let offset = disp_pos as f64 * ch_spacing;
+        self.render_geom.clear();
+        self.render_geom.reserve(total);
+        for (i, &v) in self.samples.iter().enumerate() {
+            let t_ms = x_left + (i as f64 / denom) * (x_right - x_left);
+            let y = v as f64 * gain - offset;
+            self.render_geom.push(PlotPoint::new(t_ms, y));
+        }
+        self.render_key = Some(key);
     }
 }
 
@@ -88,7 +153,7 @@ struct ChannelBuf {
     /// Ring of recent AP samples for the pre-crossing window.
     pre_ring: VecDeque<f32>,
     /// When Some: snapshot of pre-window taken at crossing; collecting post.
-    pending:  Option<(Vec<f32>, Vec<f32>)>, // (pre_snapshot, post_buf)
+    pending: Option<(Vec<f32>, Vec<f32>)>, // (pre_snapshot, post_buf)
     /// Remaining refractory samples after last detection.
     refractory: usize,
     /// Previous sample value (for negative-going edge detection).
@@ -175,7 +240,7 @@ impl ChannelBuf {
             if self.snippets.len() >= max_snippets {
                 self.snippets.pop_front();
             }
-            self.snippets.push_back(SpikeSnippet { samples, age_frames: 0 });
+            self.snippets.push_back(SpikeSnippet::new(samples));
         }
     }
 
@@ -184,7 +249,11 @@ impl ChannelBuf {
             s.age_frames = s.age_frames.saturating_add(1);
         }
         // Prune fully transparent snippets
-        while self.snippets.front().is_some_and(|s| s.age_frames >= FADE_FRAMES) {
+        while self
+            .snippets
+            .front()
+            .is_some_and(|s| s.age_frames >= FADE_FRAMES)
+        {
             self.snippets.pop_front();
         }
     }
@@ -211,11 +280,13 @@ pub struct SpikeSnippetStore {
 
 impl SpikeSnippetStore {
     pub fn new(channel_count: usize, sample_rate: f64) -> Self {
-        let pre_samples  = ms_to_samples(DEFAULT_PRE_MS,  sample_rate);
+        let pre_samples = ms_to_samples(DEFAULT_PRE_MS, sample_rate);
         let post_samples = ms_to_samples(DEFAULT_POST_MS, sample_rate);
-        let refractory   = ms_to_samples(1.0,             sample_rate);
+        let refractory = ms_to_samples(1.0, sample_rate);
         Self {
-            bufs: (0..channel_count).map(|_| ChannelBuf::new(pre_samples)).collect(),
+            bufs: (0..channel_count)
+                .map(|_| ChannelBuf::new(pre_samples))
+                .collect(),
             sigma: DEFAULT_SIGMA,
             pre_samples,
             post_samples,
@@ -227,19 +298,21 @@ impl SpikeSnippetStore {
 
     /// Called when channel count or sample rate changes.
     pub fn reconfigure(&mut self, channel_count: usize, sample_rate: f64) {
-        self.sample_rate     = sample_rate;
-        self.pre_samples     = ms_to_samples(DEFAULT_PRE_MS,  sample_rate);
-        self.post_samples    = ms_to_samples(DEFAULT_POST_MS, sample_rate);
+        self.sample_rate = sample_rate;
+        self.pre_samples = ms_to_samples(DEFAULT_PRE_MS, sample_rate);
+        self.post_samples = ms_to_samples(DEFAULT_POST_MS, sample_rate);
         self.refractory_samples = ms_to_samples(1.0, sample_rate);
-        self.bufs = (0..channel_count).map(|_| ChannelBuf::new(self.pre_samples)).collect();
+        self.bufs = (0..channel_count)
+            .map(|_| ChannelBuf::new(self.pre_samples))
+            .collect();
     }
 
     /// Update pre/post window sizes from ms values (rebuilds buffers).
     pub fn set_window_ms(&mut self, pre_ms: f32, post_ms: f32) {
-        let new_pre  = ms_to_samples(pre_ms,  self.sample_rate);
+        let new_pre = ms_to_samples(pre_ms, self.sample_rate);
         let new_post = ms_to_samples(post_ms, self.sample_rate);
         if new_pre != self.pre_samples || new_post != self.post_samples {
-            self.pre_samples  = new_pre;
+            self.pre_samples = new_pre;
             self.post_samples = new_post;
             for buf in &mut self.bufs {
                 buf.pre_ring = {
@@ -259,12 +332,12 @@ impl SpikeSnippetStore {
         if self.bufs.len() != ch {
             self.reconfigure(ch, block.sample_rate);
         }
-        let sigma       = self.sigma;
-        let pre         = self.pre_samples;
-        let post        = self.post_samples;
-        let refrac      = self.refractory_samples;
-        let max         = self.max_snippets;
-        let scale       = i16::MAX as f32;
+        let sigma = self.sigma;
+        let pre = self.pre_samples;
+        let post = self.post_samples;
+        let refrac = self.refractory_samples;
+        let max = self.max_snippets;
+        let scale = i16::MAX as f32;
 
         for s in 0..spc {
             for c in 0..ch {
@@ -283,12 +356,29 @@ impl SpikeSnippetStore {
 
     /// Return reference to snippets for a specific physical channel.
     pub fn snippets_for(&self, ch: usize) -> &VecDeque<SpikeSnippet> {
-        &self.bufs[ch.min(self.bufs.len().saturating_sub(1))].snippets
+        static EMPTY: VecDeque<SpikeSnippet> = VecDeque::new();
+        if self.bufs.is_empty() {
+            return &EMPTY;
+        }
+        &self.bufs[ch.min(self.bufs.len() - 1)].snippets
     }
 
-    pub fn channel_count(&self) -> usize { self.bufs.len() }
-    pub fn pre_ms(&self)  -> f32 { samples_to_ms(self.pre_samples,  self.sample_rate) }
-    pub fn post_ms(&self) -> f32 { samples_to_ms(self.post_samples, self.sample_rate) }
+    /// Mutable snippets for a channel — lets the renderer refresh each
+    /// snippet's cached geometry in place.
+    pub fn snippets_for_mut(&mut self, ch: usize) -> &mut VecDeque<SpikeSnippet> {
+        let idx = ch.min(self.bufs.len().saturating_sub(1));
+        &mut self.bufs[idx].snippets
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.bufs.len()
+    }
+    pub fn pre_ms(&self) -> f32 {
+        samples_to_ms(self.pre_samples, self.sample_rate)
+    }
+    pub fn post_ms(&self) -> f32 {
+        samples_to_ms(self.post_samples, self.sample_rate)
+    }
 }
 
 // ── Renderer ──────────────────────────────────────────────────────────
@@ -299,7 +389,7 @@ impl SpikeSnippetStore {
 /// Snippets are drawn as overlaid semi-transparent lines fading with age.
 pub fn draw_spike_overlay(
     ui: &mut egui::Ui,
-    store: &SpikeSnippetStore,
+    store: &mut SpikeSnippetStore,
     channels: &[SpikeChannel],
     show_grid: bool,
     tile_id_salt: usize,
@@ -315,38 +405,37 @@ pub fn draw_spike_overlay(
         return;
     }
 
-    let pre_ms  = store.pre_ms();
+    let pre_ms = store.pre_ms();
     let post_ms = store.post_ms();
-    let x_left  = -(pre_ms as f64);
-    let x_right =  post_ms as f64;
+    let x_left = -(pre_ms as f64);
+    let x_right = post_ms as f64;
     let ch_spacing = 2.5_f64;
     let n = channels.len();
     let y_min = -(n as f64) * ch_spacing + ch_spacing * 0.5;
     let y_max = ch_spacing * 0.5;
 
-    // Collect all trace lines before entering the Plot closure (avoids borrow issues)
-    let mut all_lines: Vec<(usize, f32, Vec<[f64; 2]>)> = Vec::new(); // (disp_pos, alpha, pts)
-
+    // Phase 1: refresh each visible snippet's cached geometry in place. This is
+    // a no-op unless the window / y-scale / lane position changed, so in steady
+    // state (only the fade alpha changing) nothing is rebuilt or reallocated.
     for (disp_pos, sc) in channels.iter().enumerate() {
-        let snippets = store.snippets_for(sc.ch);
-        for snippet in snippets {
+        let y_scale = sc.y_scale;
+        for snippet in store.snippets_for_mut(sc.ch) {
+            if snippet.alpha() < 0.02 {
+                continue;
+            }
+            snippet.ensure_render_geom(pre_ms, post_ms, ch_spacing, y_scale, disp_pos);
+        }
+    }
+
+    // Phase 2: borrow the cached geometry (no per-frame allocation) for drawing.
+    let mut all_lines: Vec<(usize, f32, &[PlotPoint])> = Vec::new(); // (disp_pos, alpha, pts)
+    for (disp_pos, sc) in channels.iter().enumerate() {
+        for snippet in store.snippets_for(sc.ch) {
             let alpha = snippet.alpha();
             if alpha < 0.02 {
                 continue;
             }
-            let total = snippet.samples.len().max(1);
-            let pts: Vec<[f64; 2]> = snippet
-                .samples
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| {
-                    let t_ms = x_left + (i as f64 / (total - 1) as f64) * (x_right - x_left);
-                    let y    = v as f64 * ch_spacing * 0.4 * sc.y_scale as f64
-                        - (disp_pos as f64) * ch_spacing;
-                    [t_ms, y]
-                })
-                .collect();
-            all_lines.push((disp_pos, alpha, pts));
+            all_lines.push((disp_pos, alpha, snippet.render_geom.as_slice()));
         }
     }
 
@@ -404,13 +493,14 @@ pub fn draw_spike_overlay(
             );
         }
 
-        // Snippet lines with fade-out
+        // Snippet lines with fade-out. Geometry is borrowed from each snippet's
+        // cache; only the colour (alpha) is recomputed per frame.
         for (disp_pos, alpha, pts) in all_lines {
             let base = theme::channel_color(channels[disp_pos].ch);
             let a = (alpha * 220.0) as u8;
             let color = egui::Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), a);
             plot_ui.line(
-                Line::new(PlotPoints::from(pts))
+                Line::new(PlotPoints::Borrowed(pts))
                     .color(color)
                     .width(1.0)
                     .name(""),

@@ -1,8 +1,12 @@
 use std::fmt;
 
-use kv_types::{DeviceBackendKind, DeviceConfig};
+use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig};
 
 pub const RHYTHM_HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
+
+/// Number of TTL digital input lines the Rhythm frame carries (one 16-bit TTL
+/// word per sample). Matches `kv_types::DEFAULT_TTL_LINE_COUNT`.
+pub const RHYTHM_TTL_LINE_COUNT: usize = DEFAULT_TTL_LINE_COUNT;
 pub const RHYTHM_BOARD_ID: u32 = 700;
 pub const CHANNELS_PER_STREAM: usize = 32;
 pub const SAMPLES_PER_USB_BLOCK: usize = 256;
@@ -10,6 +14,10 @@ pub const MAX_SUPPORTED_STREAMS: usize = 2;
 pub const DEFAULT_RHD_SAMPLE_RATE: f64 = 30_000.0;
 pub const USB3_BLOCK_SIZE_BYTES: usize = 1024;
 pub const RHD_AMPLIFIER_MICROVOLTS_PER_COUNT: f32 = 0.195;
+
+/// On-chip DAC reference voltage (volts) used by the RHD impedance-check
+/// current source. The peak DAC output is `128 * RHD_DAC_VREF_VOLTS / 256`.
+pub const RHD_DAC_VREF_VOLTS: f64 = 1.225;
 
 /// Number of auxiliary result words per stream per sample.
 pub const AUX_CHANNELS_PER_STREAM: usize = 3;
@@ -24,6 +32,31 @@ pub const RHD_VDD_VOLTS_PER_COUNT: f64 = 0.0000748;
 /// Open Ephys scale factor for auxiliary ADC inputs: 0.0000374 V/count.
 #[allow(dead_code)] // hardware bring-up reference
 pub const RHD_AUX_ADC_VOLTS_PER_COUNT: f64 = 0.0000374;
+
+/// Default device-ID string for Opal Kelly XEM7310 + Rhythm FPGA.
+pub const DEFAULT_RHD_DEVICE_ID: &str = "rhd-xem7310";
+
+/// Canonical, ordered list of FPGA bitfile names this backend can drive,
+/// most-preferred first. Single source of truth shared by the CLI default
+/// and the GUI's best-effort bitfile picker so the three components no longer
+/// disagree on which bitstreams exist.
+///
+/// On the KeyVast PCB the 8 RHD SPI buses are re-routed through the module-IO
+/// ring, so only a KeyVast bitstream (`keyvast_*`) reaches the headstage; the
+/// stock Intan build is kept as a last-resort fallback for a genuine Intan
+/// recording controller.
+pub const RHD_BITFILE_CANDIDATES: [&str; 3] = [
+    "keyvast_combined_download.bit",
+    DEFAULT_RHD_BITFILE_NAME,
+    "intan_rec_controller_7310.bit",
+];
+
+/// Default bitfile name used by the headless CLI smoke test (the UART-enabled
+/// KeyVast build). Also the second GUI candidate via [`RHD_BITFILE_CANDIDATES`].
+pub const DEFAULT_RHD_BITFILE_NAME: &str = "keyvast_260607_with_UART.bit";
+
+/// Default SPI cable length in meters (3 ft ≈ 0.9144 m).
+pub const DEFAULT_CABLE_LENGTH_METERS: f64 = 0.9144;
 
 /// RHD2132 16-channel headstage: amplifier channels are offset by this
 /// many channels from channel 0. The chip only populates the upper 16
@@ -112,13 +145,18 @@ impl RhythmDataConfig {
         let channel_count = self.channel_count();
         Ok(DeviceConfig {
             device_id: self.device_id.clone(),
+            // Transport kind is fixed to USB because the only Rhythm bring-up
+            // path is the Opal Kelly XEM7310 USB3 board; revisit if a non-USB
+            // transport is confirmed (project rule 1).
             backend: DeviceBackendKind::Usb,
             sample_rate: self.sample_rate,
             channel_count,
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
+            // The Rhythm frame always carries one TTL word per sample, so the
+            // digital inputs are always present at the protocol level.
             ttl_enabled: true,
-            ttl_line_count: 16,
+            ttl_line_count: RHYTHM_TTL_LINE_COUNT,
         })
     }
 
@@ -179,16 +217,90 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
     Ok(())
 }
 
+/// Bit mask with the low `enabled_streams` bits set.
+///
+/// Guards the shift so an `enabled_streams >= u32::BITS` can never trigger a
+/// shift-overflow panic (returns a full mask in that degenerate case).
+#[must_use]
+pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
+    if enabled_streams >= u32::BITS as usize {
+        u32::MAX
+    } else {
+        (1_u32 << enabled_streams) - 1
+    }
+}
+
+/// Word/byte layout of a single Rhythm USB data frame for a given number of
+/// enabled streams.
+///
+/// This is the single source of truth for the per-frame arithmetic. The parser
+/// and every MISO-scan / impedance analysis helper derive their offsets from
+/// here instead of re-deriving the magic/timestamp/aux/amp/filler layout inline,
+/// so a protocol change is a one-line edit rather than a six-way hunt.
+///
+/// Word order within a frame (each unit is one 16-bit word unless noted):
+/// `magic(4) | timestamp(2) | aux[aux_ch][stream] (3*streams) |
+///  amp[channel][stream] (32*streams) | filler | board_adc(8) | ttl_in(1) | ttl_out(1)`.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameLayout {
+    enabled_streams: usize,
+}
+
+impl FrameLayout {
+    pub fn new(enabled_streams: usize) -> Self {
+        Self { enabled_streams }
+    }
+
+    /// 16-bit filler words that pad the active stream count up to a multiple of
+    /// 4: `(4 - streams % 4) % 4`, not `streams % 4`.
+    pub fn filler_words(&self) -> usize {
+        (4 - self.enabled_streams % 4) % 4
+    }
+
+    /// Total number of 16-bit words in one frame.
+    pub fn words_per_frame(&self) -> usize {
+        4 + 2
+            + self.enabled_streams * (CHANNELS_PER_STREAM + AUX_CHANNELS_PER_STREAM)
+            + self.filler_words()
+            + BOARD_ADC_CHANNELS
+            + 2
+    }
+
+    /// Total number of bytes in one frame.
+    pub fn bytes_per_frame(&self) -> usize {
+        self.words_per_frame() * 2
+    }
+
+    /// Word offset of the first aux-command word (aux_ch 0, stream 0).
+    fn aux_base_words(&self) -> usize {
+        4 + 2
+    }
+
+    /// Word offset of the AuxCmd3 result word (aux_ch index 2) for `stream`.
+    /// Aux words are aux_ch-major, stream-minor, matching `parse_rhythm_data_block`.
+    pub fn auxcmd3_word_offset(&self, stream: usize) -> usize {
+        self.aux_base_words() + 2 * self.enabled_streams + stream
+    }
+
+    /// Word offset of the amplifier sample for intra-stream channel `intra_ch`
+    /// on `stream`. Amplifier words are channel-major, stream-minor.
+    pub fn amp_word_offset(&self, intra_ch: usize, stream: usize) -> usize {
+        self.aux_base_words()
+            + AUX_CHANNELS_PER_STREAM * self.enabled_streams
+            + intra_ch * self.enabled_streams
+            + stream
+    }
+
+    /// Byte offset of a frame-relative word at sample index `sample`.
+    pub fn word_byte_offset(&self, sample: usize, word_in_frame: usize) -> usize {
+        sample * self.bytes_per_frame() + word_in_frame * 2
+    }
+}
+
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    Ok(
-        4 + 2
-            + enabled_streams * (CHANNELS_PER_STREAM + 3)
-            + (enabled_streams % 4)
-            + 8
-            + 2,
-    )
+    Ok(FrameLayout::new(enabled_streams).words_per_frame())
 }
 
 pub fn bytes_per_block(
@@ -209,4 +321,3 @@ pub fn raw_word_to_signed_count(word: u16) -> i16 {
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
 }
-

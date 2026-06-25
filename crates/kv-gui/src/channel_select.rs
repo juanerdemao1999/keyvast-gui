@@ -513,8 +513,10 @@ mod tests {
 
     #[test]
     fn disabled_returns_all() {
-        let mut s = ChannelSelectState::default();
-        s.enabled = false;
+        let mut s = ChannelSelectState {
+            enabled: false,
+            ..Default::default()
+        };
         s.selected[0] = false;
         // Disabled ignores selection state
         assert_eq!(s.selected_count(), 16);
@@ -523,10 +525,11 @@ mod tests {
 
     #[test]
     fn select_subset() {
-        let mut s = ChannelSelectState::default();
-        s.enabled = true;
-        s.channel_count = 8;
-        s.selected = vec![false; 8];
+        let mut s = ChannelSelectState {
+            enabled: true,
+            channel_count: 8,
+            selected: vec![false; 8],
+        };
         s.selected[1] = true;
         s.selected[3] = true;
         s.selected[5] = true;
@@ -560,10 +563,11 @@ mod tests {
 
     #[test]
     fn select_range_works() {
-        let mut s = ChannelSelectState::default();
-        s.enabled = true;
-        s.channel_count = 8;
-        s.selected = vec![false; 8];
+        let mut s = ChannelSelectState {
+            enabled: true,
+            channel_count: 8,
+            selected: vec![false; 8],
+        };
         s.select_range(2, 5);
         assert_eq!(s.selected_indices(), vec![2, 3, 4]);
     }

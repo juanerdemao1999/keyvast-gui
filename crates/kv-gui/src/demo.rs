@@ -128,9 +128,24 @@ impl DemoGenerator {
         }
 
         let timestamp_start = self.global_sample;
-        self.global_sample += spc as u64;
+
+        // Synthesize a demo TTL gate on bit 0: a ~1 s-high / 1 s-low square
+        // wave so the TTL monitor and gated recording can be exercised without
+        // hardware. Per-sample resolution keeps the displayed edges crisp.
+        let half_period = sr.max(1.0) as u64; // 1 second per half-cycle
+        let ttl_per_sample: Vec<u32> = (0..spc)
+            .map(|s| {
+                let gs = timestamp_start + s as u64;
+                u32::from((gs / half_period).is_multiple_of(2))
+            })
+            .collect();
+        let ttl_last = ttl_per_sample.last().copied().unwrap_or(0);
+
+        // Saturate the running counters so an extremely long demo session can
+        // never panic on overflow (debug) or silently wrap (release).
+        self.global_sample = self.global_sample.saturating_add(spc as u64);
         let pid = self.packet_id;
-        self.packet_id += 1;
+        self.packet_id = self.packet_id.saturating_add(1);
 
         SampleBlock {
             device_id: "demo-neural".to_string(),
@@ -141,10 +156,10 @@ impl DemoGenerator {
             channel_count: ch_count,
             samples_per_channel: spc,
             data,
-            ttl_bits: 0,
+            ttl_bits: ttl_last,
             aux_data: None,
             board_adc_data: None,
-            ttl_in_per_sample: None,
+            ttl_in_per_sample: Some(ttl_per_sample),
             ttl_out_per_sample: None,
         }
     }
@@ -224,10 +239,10 @@ fn generate_sample(
         let offset = global_s.saturating_sub(spike_start);
         let spike_val = match offset {
             0 => -0.3 * cg.spike_amplitude,  // onset
-            1 => -cg.spike_amplitude,  // negative trough
-            2 =>  0.5 * cg.spike_amplitude,  // positive overshoot
+            1 => -cg.spike_amplitude,        // negative trough
+            2 => 0.5 * cg.spike_amplitude,   // positive overshoot
             3 => -0.15 * cg.spike_amplitude, // AHP
-            4 =>  0.0,                        // recovery
+            4 => 0.0,                        // recovery
             _ => 0.0,
         };
         value += spike_val;

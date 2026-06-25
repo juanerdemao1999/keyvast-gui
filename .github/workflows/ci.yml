@@ -1,8 +1,9 @@
 name: CI
 
-# CI auto-execution is disabled per request: the workflow no longer runs on
-# push or pull_request and can only be triggered manually from the Actions tab.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -14,25 +15,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # The committed .cargo/config.toml (crates.io mirror + http tweaks)
-      # is for China-side dev machines; GitHub runners use upstream defaults.
-      - run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude kv-gui
 
   lint:
-    name: Clippy + Windows check
+    name: Clippy + fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: rm -f .cargo/config.toml
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
           # kv-gui only builds for Windows (winit/eframe); clippy/check it
           # against the MSVC target without linking.
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --exclude kv-gui --all-targets -- -D warnings
       - run: cargo clippy -p kv-gui --target x86_64-pc-windows-msvc -- -D warnings
+
+  test-gui-windows:
+    name: Test kv-gui (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p kv-gui
+      - run: cargo test -p kv-gui

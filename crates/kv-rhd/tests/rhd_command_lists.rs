@@ -45,10 +45,14 @@ fn default_registers_match_open_ephys_rhd_30khz_settings() {
         })
         .collect::<Vec<_>>();
 
+    // RH1/RH2 DAC registers (8,10) encode the upper-bandwidth corner. The Open
+    // Ephys RHD plugin reference recording uses HighCut=7500 Hz (settings.xml),
+    // which the Intan resistor fit maps to rh1_dac1=22, rh2_dac1=23. (A 10 kHz
+    // corner would give 17/16 — that was the prior, non-matching value.)
     assert_eq!(
         values,
         vec![
-            222, 66, 4, 2, 156, 64, 128, 0, 17, 128, 16, 128, 44, 134, 255, 255, 255, 255, 255,
+            222, 66, 4, 2, 156, 64, 128, 0, 22, 128, 23, 128, 44, 134, 255, 255, 255, 255, 255,
             255, 255, 255,
         ]
     );
@@ -107,33 +111,35 @@ fn board_port_bit_shifts_match_frontpanel_bank_wires() {
 
 #[test]
 fn rhd_chip_type_from_register63_known_values() {
-    // num_amps = (reg63 >> 6) & 0x03
-    // 0 → Rhd2216 (16ch), 1 → Rhd2132 (32ch), 2 → Rhd2164 (64ch)
-    let rhd2216 = RhdChipType::from_register63(0b_00_000000).unwrap();
-    assert_eq!(rhd2216, RhdChipType::Rhd2216);
-    assert_eq!(rhd2216.channel_count(), 16);
-    assert_eq!(rhd2216.streams_per_headstage(), 1);
-
-    let rhd2132 = RhdChipType::from_register63(0b_01_000000).unwrap();
+    // RHD2000 ROM register 63 holds the Intan chip ID as a literal value
+    // (matching Open Ephys getDeviceId): 1 = RHD2132 (32ch), 2 = RHD2216 (16ch),
+    // 4 = RHD2164 (64ch).
+    let rhd2132 = RhdChipType::from_register63(1).unwrap();
     assert_eq!(rhd2132, RhdChipType::Rhd2132);
     assert_eq!(rhd2132.channel_count(), 32);
     assert_eq!(rhd2132.streams_per_headstage(), 1);
 
-    let rhd2164 = RhdChipType::from_register63(0b_10_000000).unwrap();
+    let rhd2216 = RhdChipType::from_register63(2).unwrap();
+    assert_eq!(rhd2216, RhdChipType::Rhd2216);
+    assert_eq!(rhd2216.channel_count(), 16);
+    assert_eq!(rhd2216.streams_per_headstage(), 1);
+
+    let rhd2164 = RhdChipType::from_register63(4).unwrap();
     assert_eq!(rhd2164, RhdChipType::Rhd2164);
     assert_eq!(rhd2164.channel_count(), 64);
     assert_eq!(rhd2164.streams_per_headstage(), 2);
 }
 
 #[test]
-fn rhd_chip_type_from_register63_with_revision_bits() {
-    // Lower 6 bits are die revision, should be ignored by chip-type dispatch.
-    let with_rev = RhdChipType::from_register63(0b_01_101010).unwrap();
-    assert_eq!(with_rev, RhdChipType::Rhd2132);
+fn rhd_chip_type_from_register63_ignores_high_byte() {
+    // Only the low byte carries the chip ID; any upper-byte status bits are masked.
+    let with_high = RhdChipType::from_register63(0xff00 | 1).unwrap();
+    assert_eq!(with_high, RhdChipType::Rhd2132);
 }
 
 #[test]
 fn rhd_chip_type_from_register63_unknown_returns_none() {
-    // num_amps == 3 is not a known chip type.
-    assert!(RhdChipType::from_register63(0b_11_000000).is_none());
+    // 3 is not a known Intan chip ID.
+    assert!(RhdChipType::from_register63(3).is_none());
+    assert!(RhdChipType::from_register63(0).is_none());
 }

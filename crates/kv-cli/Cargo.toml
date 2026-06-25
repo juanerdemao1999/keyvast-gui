@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ctrlc = "3.4"
+env_logger = "0.11"
 kv-buffer = { path = "../kv-buffer" }
 kv-core = { path = "../kv-core" }
 kv-integrity = { path = "../kv-integrity" }

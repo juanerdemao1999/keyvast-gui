@@ -1,16 +1,25 @@
 //! Rhythm/Keyvast FPGA data-plane board: FPGA bring-up and configuration.
 
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 use crate::backend::RhdReadError;
 use crate::commands::{AuxCommandSlot, BoardPort, RHD_ADC_CALIBRATION_SAMPLES, Rhd2000Registers};
-use crate::frame_analysis::aux_command_trigger_bit;
+use crate::frame_analysis::{amplifier_mean_raw_word, aux_command_trigger_bit};
 use crate::frontpanel::FrontPanelDevice;
-use crate::protocol::{DEFAULT_RHD_SAMPLE_RATE, RHYTHM_BOARD_ID, USB3_BLOCK_SIZE_BYTES};
+use crate::protocol::{
+    CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, MAX_SUPPORTED_STREAMS, RHYTHM_BOARD_ID,
+    RhdChipType, USB3_BLOCK_SIZE_BYTES,
+};
 
 pub(crate) const WIRE_IN_RESET_RUN: i32 = 0x00;
-pub(crate) const WIRE_IN_MAX_TIME_STEP_LSB: i32 = 0x01;
-pub(crate) const WIRE_IN_MAX_TIME_STEP_MSB: i32 = 0x02;
+// Open Ephys Rhythm USB3 writes the full 32-bit maxTimeStep to a SINGLE WireIn
+// (0x01). WireIn 0x02 is SerialDigitalInCntl, NOT a maxTimeStep high word —
+// writing the high bits there corrupted SPI/digital control and silenced the
+// amplifier MISO during continuous acquisition (maxTimeStep = u32::MAX), while
+// the short scan/calibration runs (small maxTimeStep, high word 0) worked.
+pub(crate) const WIRE_IN_MAX_TIME_STEP: i32 = 0x01;
 pub(crate) const WIRE_IN_DATA_FREQ_PLL: i32 = 0x03;
 pub(crate) const WIRE_IN_MISO_DELAY: i32 = 0x04;
 pub(crate) const WIRE_IN_CMD_RAM_ADDR: i32 = 0x05;
@@ -25,6 +34,15 @@ pub(crate) const WIRE_IN_DATA_STREAM_SEL_1234: i32 = 0x12;
 pub(crate) const WIRE_IN_DATA_STREAM_SEL_5678: i32 = 0x13;
 pub(crate) const WIRE_IN_DATA_STREAM_EN: i32 = 0x14;
 pub(crate) const WIRE_IN_TTL_OUT: i32 = 0x15;
+// Board analog/auxiliary plane (Intan Rhythm USB3). Open Ephys initializes these
+// to known-safe states in initializeBoard(); the GUI previously left them at FPGA
+// power-up defaults. DAC re-referencing (WireInDacReref) subtracts a common
+// reference from EVERY amplifier channel when enabled, and external fast settle
+// can hold the amplifiers in reset -- both corrupt all channels (including ones
+// shorted to REF) if left active.
+pub(crate) const WIRE_IN_DAC_REREF: i32 = 0x0e;
+pub(crate) const WIRE_IN_DAC_SOURCE_BASE: i32 = 0x16; // WireInDacSource1..8 = 0x16..=0x1d
+pub(crate) const WIRE_IN_DAC_MANUAL: i32 = 0x1e;
 pub(crate) const WIRE_IN_MULTI_USE: i32 = 0x1f;
 pub(crate) const WIRE_OUT_NUM_WORDS_LSB: i32 = 0x20;
 pub(crate) const WIRE_OUT_NUM_WORDS_MSB: i32 = 0x26;
@@ -34,8 +52,23 @@ pub(crate) const WIRE_OUT_BOARD_ID: i32 = 0x3e;
 pub(crate) const WIRE_OUT_BOARD_VERSION: i32 = 0x3f;
 pub(crate) const TRIG_IN_CONFIG: i32 = 0x40;
 pub(crate) const TRIG_IN_SPI_START: i32 = 0x41;
+pub(crate) const TRIG_IN_DAC_CONFIG: i32 = 0x42;
 pub(crate) const PIPE_OUT_DATA: i32 = 0xa0;
 pub(crate) const RAM_BURST_SIZE: u32 = 256;
+
+// KeyVast headstage power comes up over I2C (the MicroBlaze control plane)
+// *after* FPGA configuration: eFuse -> per-module DCDC -> per-module isolated
+// power, taking ~0.6 s and retried on a ~6 s cadence. The RHD scan must wait
+// for the rails and retry until the chip answers, rather than probing once
+// while the headstage is still unpowered (which silently fell back to Port A /
+// delay 0 -- the wrong MISO phase -- yielding half-scale 0x4000 data).
+const HEADSTAGE_POWER_SETTLE_MS: u64 = 1200;
+const SCAN_RETRY_MS: u64 = 600;
+// Total scan budget = HEADSTAGE_POWER_SETTLE_MS + SCAN_MAX_ATTEMPTS*SCAN_RETRY_MS
+// must comfortably exceed the worst-case KeyVast I2C power bring-up (~6 s retry
+// cadence). 1200 + 12*600 = 8.4 s leaves margin so a single missed cadence
+// window can't exhaust attempts before the rails are up.
+const SCAN_MAX_ATTEMPTS: u32 = 12;
 
 pub(crate) struct RhythmFrontPanelBoard {
     pub(crate) device: FrontPanelDevice,
@@ -49,7 +82,7 @@ impl RhythmFrontPanelBoard {
         bitfile_path: &Path,
         enabled_streams: usize,
         cable_length_meters: f64,
-    ) -> Result<Self, RhdReadError> {
+    ) -> Result<(Self, usize), RhdReadError> {
         device
             .configure_fpga(bitfile_path)
             .map_err(RhdReadError::FrontPanel)?;
@@ -80,6 +113,7 @@ impl RhythmFrontPanelBoard {
         board.reset_board()?;
         board.set_sample_rate_30khz()?;
         board.set_dsp_settle(false)?;
+        board.reset_board_analog_state()?;
         board.set_cable_length_meters(0, cable_length_meters)?;
         if enabled_streams > 1 {
             board.set_cable_length_meters(1, cable_length_meters)?;
@@ -88,13 +122,68 @@ impl RhythmFrontPanelBoard {
         board.set_default_data_sources()?;
         board.clear_ttl_out()?;
         log::info!("data plane configured; initializing RHD chips (ADC calibration)...");
-        board.initialize_rhd_chips(enabled_streams)?;
+        let detected_streams = board.initialize_rhd_chips(enabled_streams)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
         board.flush_fifo()?;
         log::info!("board configured and armed for continuous acquisition");
 
-        Ok(board)
+        Ok((board, detected_streams))
+    }
+
+    /// Put the board's analog/auxiliary plane into a known-safe state, mirroring
+    /// Open Ephys `Rhd2000EvalBoardUsb3::initializeBoard`. The GUI previously
+    /// relied on FPGA power-up defaults for these; if DAC re-referencing or
+    /// external fast settle come up enabled, they corrupt every amplifier channel
+    /// (a common reference subtracted from all channels, or periodic amplifier
+    /// resets) — visible even on channels shorted to REF. Uses the stock Intan
+    /// Rhythm USB3 WireIn/Trigger map (the loaded bitstream is intan_rec_controller).
+    fn reset_board_analog_state(&self) -> Result<(), RhdReadError> {
+        // Disable hardware DAC re-referencing (WireInDacReref bit 0x400).
+        self.device
+            .set_wire_in_value(WIRE_IN_DAC_REREF, 0x0000_0000, 0x0000_0400)
+            .map_err(RhdReadError::FrontPanel)?;
+        // Disable all 8 board DACs (WireInDacSource1..8 bit 0x800).
+        for dac in 0..8 {
+            self.device
+                .set_wire_in_value(WIRE_IN_DAC_SOURCE_BASE + dac, 0x0000_0000, 0x0000_0800)
+                .map_err(RhdReadError::FrontPanel)?;
+        }
+        // Park the manual DAC at midscale; zero DAC gain and audio noise-suppress
+        // (masked fields of WireInResetRun, leaving reset/run/dsp-settle bits intact).
+        self.device
+            .set_wire_in_value(WIRE_IN_DAC_MANUAL, 32_768, u32::MAX)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 0xe000)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0, 0x1fc0)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+
+        // Disable external (TTL-triggered) fast settle.
+        self.device
+            .set_wire_in_value(WIRE_IN_MULTI_USE, 0, u32::MAX)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        self.device
+            .activate_trigger_in(TRIG_IN_CONFIG, 6)
+            .map_err(RhdReadError::FrontPanel)?;
+
+        // Disable external digital-out on all 8 ports (TrigInDacConfig bits 16..23).
+        for port in 0..8 {
+            self.device
+                .set_wire_in_value(WIRE_IN_MULTI_USE, 0, u32::MAX)
+                .map_err(RhdReadError::FrontPanel)?;
+            self.device.update_wire_ins();
+            self.device
+                .activate_trigger_in(TRIG_IN_DAC_CONFIG, 16 + port)
+                .map_err(RhdReadError::FrontPanel)?;
+        }
+
+        log::info!("board analog plane reset: DAC re-ref off, DACs off, external fast-settle off");
+        Ok(())
     }
 
     pub(crate) fn reset_board(&self) -> Result<(), RhdReadError> {
@@ -190,13 +279,8 @@ impl RhythmFrontPanelBoard {
     }
 
     pub(crate) fn set_max_time_step(&self, max_time_step: u32) -> Result<(), RhdReadError> {
-        let lsb = max_time_step & 0x0000_ffff;
-        let msb = (max_time_step & 0xffff_0000) >> 16;
         self.device
-            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP_LSB, lsb, u32::MAX)
-            .map_err(RhdReadError::FrontPanel)?;
-        self.device
-            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP_MSB, msb, u32::MAX)
+            .set_wire_in_value(WIRE_IN_MAX_TIME_STEP, max_time_step, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;
         self.device.update_wire_ins();
         Ok(())
@@ -289,7 +373,10 @@ impl RhythmFrontPanelBoard {
         Ok(())
     }
 
-    pub(crate) fn initialize_rhd_chips(&self, enabled_streams: usize) -> Result<(), RhdReadError> {
+    pub(crate) fn initialize_rhd_chips(
+        &self,
+        enabled_streams: usize,
+    ) -> Result<usize, RhdReadError> {
         let mut registers = Rhd2000Registers::open_ephys_default();
         registers.set_dig_out_low();
 
@@ -340,7 +427,53 @@ impl RhythmFrontPanelBoard {
         // has a responding chip. AuxCmd3 bank 0 (register config + ADC calibrate) is
         // selected, so each probe run also configures/calibrates the chip found.
         log::info!("scanning all 8 SPI ports x MISO delays 0..15 to locate the headstage...");
-        let (stream_mask, delay) = self.scan_ports_for_headstage(enabled_streams)?;
+        // Wait for the headstage power rails (I2C bring-up) before probing, then
+        // re-scan until a chip answers -- the rails can lag FPGA config by up to a
+        // few seconds, and probing too early is exactly what dropped acquisition
+        // onto Port A / delay 0 (half-scale 0x4000 data).
+        thread::sleep(Duration::from_millis(HEADSTAGE_POWER_SETTLE_MS));
+        let mut attempt = 0_u32;
+        let (port, delay, chip_id, found) = loop {
+            attempt += 1;
+            let result = self.scan_ports_for_headstage(enabled_streams)?;
+            if result.3 {
+                log::info!("headstage located on scan attempt {attempt}");
+                break result;
+            }
+            if attempt >= SCAN_MAX_ATTEMPTS {
+                log::error!(
+                    "no responding RHD chip found after {attempt} scan attempts. Refusing to \
+                     arm acquisition on the Port A / delay 0 fallback (that records half-scale \
+                     0x4000 / flat data). Check the headstage is connected and powered, and \
+                     that this is a KeyVast bitstream."
+                );
+                return Err(RhdReadError::HeadstageNotFound);
+            }
+            log::info!(
+                "scan attempt {attempt}: headstage not responding yet (power may still be \
+                 ramping); retrying in {} ms",
+                SCAN_RETRY_MS
+            );
+            thread::sleep(Duration::from_millis(SCAN_RETRY_MS));
+        };
+
+        // Auto-detect the channel count from the chip's register-63 ID: RHD2164
+        // is dual-MISO (2 streams / 64ch); RHD2132 (32ch) and RHD2216 (16ch) are
+        // single-stream. Fall back to the requested count when nothing answered.
+        let chip = chip_id.and_then(|id| RhdChipType::from_register63(id as u16));
+        let detected_streams = match chip {
+            Some(c) => c.streams_per_headstage(),
+            None => enabled_streams.clamp(1, MAX_SUPPORTED_STREAMS),
+        };
+        if found {
+            log::info!(
+                "auto-detected chip {:?} -> {} data stream(s), {} amplifier channel(s)",
+                chip,
+                detected_streams,
+                detected_streams * CHANNELS_PER_STREAM,
+            );
+        }
+        let stream_mask = ((1_u32 << detected_streams) - 1) << (port as u32 * 4);
         self.enable_stream_mask(stream_mask)?;
         self.set_cable_delay_all_ports(delay)?;
 
@@ -349,10 +482,38 @@ impl RhythmFrontPanelBoard {
         self.set_continuous_run_mode(false)?;
         self.run()?;
         self.wait_until_not_running()?;
-        self.read_and_discard_samples(enabled_streams, RHD_ADC_CALIBRATION_SAMPLES)?;
+        self.read_and_discard_samples(detected_streams, RHD_ADC_CALIBRATION_SAMPLES)?;
 
         self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd3, 1)?;
-        Ok(())
+
+        // Defense-in-depth: confirm the committed MISO delay actually yields
+        // DSP-centered amplifier data (~0x8000). A mean near 0x4000 means the
+        // 16-bit word is sampled one SPI bit early (wrong sampling phase) -- the
+        // exact half-scale failure the power-settle/retry scan exists to prevent.
+        // The chip-ID check is a strong proxy for this, but promote the existing
+        // 0x4000 diagnostic from logging-only to a hard gate at commit time.
+        const VERIFY_SAMPLES: usize = 128;
+        self.set_max_time_step(VERIFY_SAMPLES as u32)?;
+        self.set_continuous_run_mode(false)?;
+        self.run()?;
+        self.wait_until_not_running()?;
+        let verify_raw = self.read_pipe_block(detected_streams, VERIFY_SAMPLES)?;
+        if let Some(mean) =
+            amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, 0)
+        {
+            log::info!("post-delay centering check: amp mean raw word = 0x{mean:04x}");
+            if (0x3000..=0x5000).contains(&mean) {
+                log::error!(
+                    "amplifier data is half-scale (mean 0x{mean:04x} ~ 0x4000): the committed \
+                     MISO delay is the wrong sampling phase. Refusing to record corrupt data."
+                );
+                return Err(RhdReadError::HalfScaleAmplifierData {
+                    mean_raw_word: mean,
+                });
+            }
+        }
+
+        Ok(detected_streams)
     }
 
     pub(crate) fn upload_command_list(

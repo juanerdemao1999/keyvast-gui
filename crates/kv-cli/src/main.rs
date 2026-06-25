@@ -3,6 +3,7 @@ use std::{env, process::ExitCode};
 use kv_cli::{CommandResult, install_ctrlc_handler, parse_args, run_command};
 
 fn main() -> ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     install_ctrlc_handler();
 
     match parse_args(env::args().skip(1)).and_then(run_command) {

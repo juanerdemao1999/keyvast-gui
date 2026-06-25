@@ -8,8 +8,8 @@ use crate::frontpanel::{FrontPanelError, FrontPanelLibrary};
 use crate::impedance;
 use crate::parser::{RhythmParseError, parse_rhythm_data_block};
 use crate::protocol::{
-    DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE, RhythmConfigError,
-    RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
+    CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID,
+    DEFAULT_RHD_SAMPLE_RATE, RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
 };
 use crate::rhythm_board::RhythmFrontPanelBoard;
 
@@ -65,17 +65,29 @@ impl RhdHardwareBackend {
         let device = library
             .open_device(options.serial.as_deref())
             .map_err(RhdReadError::FrontPanel)?;
-        let board = RhythmFrontPanelBoard::configure(
+        let (board, detected_streams) = RhythmFrontPanelBoard::configure(
             device,
             &options.bitfile_path,
             options.data.enabled_streams,
             options.cable_length_meters,
         )?;
 
+        let mut config = options.data;
+        if detected_streams != config.enabled_streams {
+            log::info!(
+                "auto-detect: using detected {} stream(s) / {} channels instead of the \
+                 requested {} stream(s)",
+                detected_streams,
+                detected_streams * CHANNELS_PER_STREAM,
+                config.enabled_streams,
+            );
+            config.enabled_streams = detected_streams;
+        }
+
         log::info!("RHD backend ready");
         Ok(Self {
             board,
-            config: options.data,
+            config,
             next_packet_id: 0,
             acquisition_started: false,
             logged_first_block: false,
@@ -149,6 +161,8 @@ pub enum RhdReadError {
     PllDcmTimeout,
     PllLockTimeout,
     FifoFlushIncomplete { remaining_words: u32 },
+    HeadstageNotFound,
+    HalfScaleAmplifierData { mean_raw_word: u32 },
     Cancelled,
 }
 
@@ -183,6 +197,15 @@ impl fmt::Display for RhdReadError {
                 formatter,
                 "FIFO flush incomplete: {remaining_words} words remaining"
             ),
+            Self::HeadstageNotFound => write!(
+                formatter,
+                "no responding RHD headstage found on any SPI port; check it is connected and powered"
+            ),
+            Self::HalfScaleAmplifierData { mean_raw_word } => write!(
+                formatter,
+                "amplifier data is half-scale (mean raw word 0x{mean_raw_word:04x} ~ 0x4000): \
+                 wrong MISO sampling phase"
+            ),
             Self::Cancelled => write!(formatter, "cancelled by Ctrl-C"),
         }
     }
@@ -203,6 +226,8 @@ impl std::error::Error for RhdReadError {
             | Self::PllDcmTimeout
             | Self::PllLockTimeout
             | Self::FifoFlushIncomplete { .. }
+            | Self::HeadstageNotFound
+            | Self::HalfScaleAmplifierData { .. }
             | Self::Cancelled => None,
         }
     }

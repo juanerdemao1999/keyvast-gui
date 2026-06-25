@@ -147,6 +147,69 @@ pub(crate) fn extract_channel_from_raw(
     out
 }
 
+/// Diagnostic: mean of the raw amplifier u16 words on `stream` over the second
+/// half of a probe block. A correctly-aligned RHD2000 with DSP on sits near the
+/// 0x8000 midscale; a value near 0x4000 means the 16-bit word is sampled one SPI
+/// bit early (right-shifted), i.e. a wrong MISO phase.
+pub(crate) fn amplifier_mean_raw_word(
+    raw: &[u8],
+    enabled_streams: usize,
+    samples: usize,
+    stream: usize,
+) -> Option<u32> {
+    if enabled_streams == 0 || samples == 0 || stream >= enabled_streams {
+        return None;
+    }
+    let layout = FrameLayout::new(enabled_streams);
+    let from = samples / 2;
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    for s in from..samples {
+        for intra in 0..CHANNELS_PER_STREAM {
+            let off = layout.word_byte_offset(s, layout.amp_word_offset(intra, stream));
+            if off + 2 > raw.len() {
+                return (n > 0).then(|| (sum / n) as u32);
+            }
+            sum += u16::from_le_bytes([raw[off], raw[off + 1]]) as u64;
+            n += 1;
+        }
+    }
+    (n > 0).then(|| (sum / n) as u32)
+}
+
+/// Diagnostic: locate the "INTAN" signature in the AuxCmd3 results for `stream`
+/// and return the register-63 chip-ID byte (1=RHD2132, 2=RHD2216, 4=RHD2164). In
+/// `create_command_list_register_config` the ROM read block is
+/// `[63, 62, 61, 60, 59, 48..55, 40('I'), 41('N'), 42('T'), 43('A'), 44('N')]`,
+/// so the reg-63 result lands exactly 13 result words before the 'I'.
+pub(crate) fn probe_chip_id(
+    raw: &[u8],
+    enabled_streams: usize,
+    samples: usize,
+    stream: usize,
+) -> Option<u8> {
+    if enabled_streams == 0 || samples < 18 || stream >= enabled_streams {
+        return None;
+    }
+    let layout = FrameLayout::new(enabled_streams);
+    let word_offset_in_frame = layout.auxcmd3_word_offset(stream);
+    let mut aux: Vec<u8> = Vec::with_capacity(samples);
+    for s in 0..samples {
+        let off = layout.word_byte_offset(s, word_offset_in_frame);
+        if off + 2 > raw.len() {
+            return None;
+        }
+        aux.push((u16::from_le_bytes([raw[off], raw[off + 1]]) & 0xff) as u8);
+    }
+    let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
+    for k in 13..aux.len().saturating_sub(4) {
+        if aux[k..k + 5] == pattern {
+            return Some(aux[k - 13]);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

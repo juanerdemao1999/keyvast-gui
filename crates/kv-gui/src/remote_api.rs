@@ -620,7 +620,10 @@ mod tests {
     fn push_response_caps_queue_length() {
         let responses: ResponseQueue = Arc::new(Mutex::new(VecDeque::new()));
         for id in 0..(MAX_QUEUE_LEN as u64 + 10) {
-            push_response(&responses, RemoteResponse::new(id, Ok("\"ok\"".to_string())));
+            push_response(
+                &responses,
+                RemoteResponse::new(id, Ok("\"ok\"".to_string())),
+            );
         }
         let q = lock_recover(&responses);
         assert_eq!(q.len(), MAX_QUEUE_LEN);

@@ -11,6 +11,10 @@ pub const DEFAULT_RHD_SAMPLE_RATE: f64 = 30_000.0;
 pub const USB3_BLOCK_SIZE_BYTES: usize = 1024;
 pub const RHD_AMPLIFIER_MICROVOLTS_PER_COUNT: f32 = 0.195;
 
+/// On-chip DAC reference voltage (volts) used by the RHD impedance-check
+/// current source. The peak DAC output is `128 * RHD_DAC_VREF_VOLTS / 256`.
+pub const RHD_DAC_VREF_VOLTS: f64 = 1.225;
+
 /// Number of auxiliary result words per stream per sample.
 pub const AUX_CHANNELS_PER_STREAM: usize = 3;
 
@@ -204,10 +208,27 @@ pub fn validate_sample_rate(sample_rate: f64) -> Result<(), RhythmConfigError> {
     Ok(())
 }
 
+/// Bit mask with the low `enabled_streams` bits set.
+///
+/// Guards the shift so an `enabled_streams >= u32::BITS` can never trigger a
+/// shift-overflow panic (returns a full mask in that degenerate case).
+#[must_use]
+pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
+    if enabled_streams >= u32::BITS as usize {
+        u32::MAX
+    } else {
+        (1_u32 << enabled_streams) - 1
+    }
+}
+
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2)
+    // The Rhythm FPGA pads the per-frame amplifier section so the active stream
+    // count rounds up to a multiple of 4; the number of 16-bit filler words is
+    // therefore `(4 - streams % 4) % 4`, not `streams % 4`.
+    let filler = (4 - enabled_streams % 4) % 4;
+    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + filler + 8 + 2)
 }
 
 pub fn bytes_per_block(

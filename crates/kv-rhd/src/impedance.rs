@@ -114,6 +114,7 @@ impl ImpedanceResult {
 /// Returns `(magnitude_ohms, phase_degrees)`.
 ///
 /// Port of Intan `measureComplexAmplitude` + `approximateSaturationVoltage`.
+#[must_use]
 pub fn compute_impedance(
     amplifier_data: &[i16],
     sample_rate: f64,
@@ -154,7 +155,7 @@ pub fn compute_impedance(
     // Convert voltage amplitude to impedance.
     // V_measured = I * Z, where I = Cs * (2π*f) * V_dac.
     // V_dac peak ≈ 128 * 1.225V / 256 ≈ 0.6125V (half-scale DAC output).
-    let v_dac_peak = 128.0 * 1.225 / 256.0; // ~0.6125 V
+    let v_dac_peak = 128.0 * crate::protocol::RHD_DAC_VREF_VOLTS / 256.0; // ~0.6125 V
     let cap_farads = cap_scale.capacitance_farads();
     let omega = two_pi * frequency;
     let i_current = cap_farads * omega * v_dac_peak; // Amps
@@ -179,6 +180,7 @@ pub fn compute_impedance(
 
 /// Select the best capacitor scale for a given impedance magnitude.
 /// Mirrors Intan's auto-range logic.
+#[must_use]
 pub fn auto_select_scale(magnitude_ohms: f64) -> ZcheckScale {
     if magnitude_ohms > 1_000_000.0 {
         ZcheckScale::Cs100fF

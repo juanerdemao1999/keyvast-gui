@@ -109,6 +109,57 @@ fn rejects_in_frame_timestamp_gap() {
     ));
 }
 
+#[test]
+fn single_stream_round_trips_through_the_4_stream_filler_padding() {
+    // streams=1 exercises the `(4 - streams % 4) % 4 == 3` filler branch that a
+    // multiple-of-4 stream count never hits.
+    assert_eq!(words_per_frame(1).expect("valid stream count"), 54);
+
+    let config = test_config(1, 2);
+    let raw = build_raw_block(&config, 10, 0x0003);
+    let block = parse_rhythm_data_block(2, &raw, &config).expect("single-stream block should parse");
+
+    assert_eq!(block.channel_count, 32);
+    assert_eq!(block.samples_per_channel, 2);
+    assert_eq!(block.timestamp_start, 10);
+    assert_eq!(block.data.len(), 64);
+    // sample 0 stream 0: value == channel index (0..31).
+    assert_eq!(block.data[0], 0);
+    assert_eq!(block.data[31], 31);
+    // sample 1 stream 0: value == 100 + channel index.
+    assert_eq!(block.data[32], 100);
+    assert_eq!(block.data[63], 131);
+}
+
+#[test]
+fn timestamps_wrap_across_the_u32_boundary_without_a_discontinuity() {
+    let config = test_config(1, 2);
+    // First frame timestamp is u32::MAX; the second wraps to 0.
+    let raw = build_raw_block(&config, u32::MAX, 0);
+    let block = parse_rhythm_data_block(0, &raw, &config)
+        .expect("a 32-bit timestamp wrap is continuous, not a gap");
+    assert_eq!(block.timestamp_start, u32::MAX as u64);
+}
+
+#[test]
+fn rejects_bad_magic_in_a_non_first_frame() {
+    let config = test_config(1, 3);
+    let mut raw = build_raw_block(&config, 0, 0);
+    // Corrupt the magic header of the second frame.
+    let second_frame_magic = words_per_frame(1).expect("valid words") * 2;
+    raw[second_frame_magic] ^= 0xff;
+
+    let error = parse_rhythm_data_block(0, &raw, &config)
+        .expect_err("corrupt magic in a later frame should be rejected");
+    assert!(matches!(
+        error,
+        RhythmParseError::BadMagic {
+            sample_index: 1,
+            ..
+        }
+    ));
+}
+
 fn test_config(enabled_streams: usize, samples_per_block: usize) -> RhythmDataConfig {
     RhythmDataConfig {
         device_id: "rhd-test".to_string(),
@@ -143,7 +194,7 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
             }
         }
 
-        for _ in 0..(config.enabled_streams % 4) {
+        for _ in 0..((4 - config.enabled_streams % 4) % 4) {
             raw.extend_from_slice(&0_u16.to_le_bytes());
         }
 

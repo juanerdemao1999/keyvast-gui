@@ -136,7 +136,7 @@ impl RhythmFrontPanelBoard {
         const PROBE_SAMPLES: usize = 128;
         const PORT_LETTERS: [char; 8] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
-        let stream_bits = (1_u32 << enabled_streams) - 1;
+        let stream_bits = crate::protocol::stream_enable_mask(enabled_streams);
 
         // (port index, chosen delay, has_chip_id)
         let mut best: Option<(usize, u32, bool)> = None;

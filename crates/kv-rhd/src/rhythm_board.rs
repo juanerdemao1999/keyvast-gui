@@ -211,11 +211,7 @@ impl RhythmFrontPanelBoard {
     }
 
     pub(crate) fn enable_streams(&self, enabled_streams: usize) -> Result<(), RhdReadError> {
-        let mask = if enabled_streams == 0 {
-            0
-        } else {
-            (1_u32 << enabled_streams) - 1
-        };
+        let mask = crate::protocol::stream_enable_mask(enabled_streams);
         self.device
             .set_wire_in_value(WIRE_IN_DATA_STREAM_EN, mask, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;

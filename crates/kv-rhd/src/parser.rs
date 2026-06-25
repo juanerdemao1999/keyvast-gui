@@ -90,8 +90,9 @@ pub fn parse_rhythm_data_block(
         }
         data.extend_from_slice(&frame_samples);
 
-        // Skip filler word(s) that align each frame to a 4-stream boundary.
-        offset = offset.saturating_add((streams % 4) * 2);
+        // Skip filler word(s) that pad the active stream count up to a multiple
+        // of 4 (see `words_per_frame`): `(4 - streams % 4) % 4` words.
+        offset = offset.saturating_add(((4 - streams % 4) % 4) * 2);
 
         // Parse 8 board ADC channels.
         for adc_ch in 0..BOARD_ADC_CHANNELS {

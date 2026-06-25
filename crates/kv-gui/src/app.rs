@@ -56,6 +56,15 @@ use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 /// is re-filtered (lets slider drags settle first).
 const REFILTER_DEBOUNCE_MS: u64 = 150;
 
+/// How often the recording disk-space guard samples free space (DA18). A
+/// filesystem query is cheap but not free, so we poll seconds apart rather
+/// than per frame.
+const DISK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Minimum spacing between low-disk-space warning toasts so the operator isn't
+/// spammed every poll while the volume drains.
+const DISK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +177,10 @@ pub struct KvApp {
     recorder_buffer_occupancy: f64,
     /// Latest error from the recorder thread (None = no error / dismissed).
     recording_error: Option<String>,
+    /// Last time the recording disk-space guard sampled free space (DA18).
+    last_disk_check: Option<Instant>,
+    /// Last time a low-disk-space warning toast was shown (rate-limits it).
+    last_disk_warn: Option<Instant>,
     theme_applied: bool,
     /// When true, the waveform display is frozen at the current view but
     /// acquisition and recording continue uninterrupted.
@@ -276,6 +289,8 @@ impl KvApp {
             recording_start_time: None,
             recorder_buffer_occupancy: 0.0,
             recording_error: None,
+            last_disk_check: None,
+            last_disk_warn: None,
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
@@ -866,6 +881,31 @@ impl KvApp {
     /// and the remote API). Captures the channel selection at start so a
     /// mid-recording selection change cannot change the file's layout.
     fn begin_recording(&mut self) {
+        // Pre-flight disk-space check (DA18): refuse to start a recording that
+        // the volume clearly cannot sustain, instead of beginning one that will
+        // truncate when the disk fills.
+        let free = crate::diskspace::free_bytes(&self.recording.output_dir);
+        if let crate::diskspace::StartDecision::Block { free_bytes } =
+            crate::diskspace::evaluate_start(free, None)
+        {
+            let msg = format!(
+                "Not enough free disk space to start recording: {} free \
+                 (need at least {})",
+                theme::format_bytes(free_bytes),
+                theme::format_bytes(crate::diskspace::RECORDING_MIN_START_FREE_BYTES),
+            );
+            log::warn!("{msg}");
+            self.toasts.error(msg.clone());
+            self.recording_error = Some(msg);
+            // Drop back to Idle so an Armed/triggered start doesn't get stuck.
+            if self.recording.state == RecordingState::Armed {
+                self.recording.state = RecordingState::Idle;
+            }
+            return;
+        }
+        self.last_disk_check = None;
+        self.last_disk_warn = None;
+
         let channels = self.channel_select.recording_selection();
         match self.mode {
             AcqMode::Device => {
@@ -947,6 +987,54 @@ impl KvApp {
                 self.recording.state = RecordingState::Idle;
                 self.recording_start_time = None;
                 self.recorder_buffer_occupancy = 0.0;
+            }
+        }
+    }
+
+    /// Periodically sample free disk space while recording and act on it
+    /// (DA18): warn as the volume gets low, then cleanly auto-stop (normal
+    /// finalize) before a full disk truncates the file. Self-throttling, so it
+    /// is safe to call every frame.
+    fn poll_recording_disk_space(&mut self) {
+        if self.recording.state != RecordingState::Recording {
+            self.last_disk_check = None;
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_disk_check
+            && now.duration_since(last) < DISK_CHECK_INTERVAL
+        {
+            return;
+        }
+        self.last_disk_check = Some(now);
+
+        let free = crate::diskspace::free_bytes(&self.recording.output_dir);
+        match crate::diskspace::evaluate_recording(free) {
+            crate::diskspace::RecordingDiskStatus::Ok => {}
+            crate::diskspace::RecordingDiskStatus::Low { free_bytes } => {
+                let warn_due = self
+                    .last_disk_warn
+                    .map(|t| now.duration_since(t) >= DISK_WARN_INTERVAL)
+                    .unwrap_or(true);
+                if warn_due {
+                    self.last_disk_warn = Some(now);
+                    self.toasts.warning(format!(
+                        "Low disk space: {} free — recording will auto-stop near {}",
+                        theme::format_bytes(free_bytes),
+                        theme::format_bytes(crate::diskspace::RECORDING_STOP_FREE_BYTES),
+                    ));
+                }
+            }
+            crate::diskspace::RecordingDiskStatus::Critical { free_bytes } => {
+                let msg = format!(
+                    "Disk nearly full ({} free) — recording stopped and finalized to \
+                     avoid a truncated file",
+                    theme::format_bytes(free_bytes),
+                );
+                log::warn!("{msg}");
+                self.toasts.error(msg.clone());
+                self.recording_error = Some(msg);
+                self.stop_recording();
             }
         }
     }
@@ -1547,6 +1635,10 @@ impl eframe::App for KvApp {
 
         // Handle keyboard shortcuts
         self.handle_keys(ctx);
+
+        // Recording disk-space guard: warn as the volume gets low and cleanly
+        // auto-stop before it fills (DA18). Self-throttled internally.
+        self.poll_recording_disk_space();
 
         // Tick the live source (acquisition runs regardless of display pause).
         // Skipped while playing back an offline recording so the two sources

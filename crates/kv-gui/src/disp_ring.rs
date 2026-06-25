@@ -173,19 +173,21 @@ impl DisplayRing {
         (self.t0 + (self.len as u64 - 1) * self.dwnsp as u64) as f64 * 1000.0 / self.sample_rate
     }
 
-    /// Extract the last `n` ring samples for `ch` as i16 values (de-normalized).
-    /// Used by FFT panel for spectrum computation.
-    pub fn last_n_samples(&self, ch: usize, n: usize) -> Vec<i16> {
+    /// Extract the last `n` ring samples for `ch` as de-normalized ADC counts
+    /// in `f64`. Used by the FFT panel, whose math is `f64` end-to-end, so we
+    /// avoid a lossy round-trip through `i16` that would only add quantization
+    /// error to the spectrum.
+    pub fn last_n_samples_f64(&self, ch: usize, n: usize) -> Vec<f64> {
         if ch >= self.channel_count || self.len == 0 || !self.ready {
             return Vec::new();
         }
         let ring = &self.y[ch];
         let avail = ring.len().min(n);
         let start = ring.len() - avail;
-        // Ring stores normalized f32 in [-1, 1]. Convert back to i16.
+        // Ring stores normalized f32 in [-1, 1]; scale back to ADC counts.
         ring.iter()
             .skip(start)
-            .map(|&v| (v as f64 * 32767.0).round() as i16)
+            .map(|&v| v as f64 * 32767.0)
             .collect()
     }
 
@@ -274,6 +276,16 @@ impl DisplayRing {
 mod tests {
     use super::*;
 
+    /// Assert two sample slices match within the f32 round-trip tolerance.
+    /// Values are stored as normalized f32 then scaled back, so small
+    /// quantization error is expected.
+    fn assert_samples_eq(actual: &[f64], expected: &[f64]) {
+        assert_eq!(actual.len(), expected.len());
+        for (a, e) in actual.iter().zip(expected) {
+            assert!((a - e).abs() < 0.01, "got {a}, expected {e}");
+        }
+    }
+
     /// Build a block where channel `ch` at sample `s` holds value
     /// `(s * channel_count + ch)` as i16, so each ring slot is identifiable.
     fn block(timestamp_start: u64, channel_count: usize, spc: usize) -> SampleBlock {
@@ -319,9 +331,9 @@ mod tests {
         assert!(ring.ready);
         assert_eq!(ring.len, 4);
         // Channel 0 stores raw value (s * 2 + 0) for s in {0,4,8,12}.
-        assert_eq!(ring.last_n_samples(0, 4), vec![0, 8, 16, 24]);
+        assert_samples_eq(&ring.last_n_samples_f64(0, 4), &[0.0, 8.0, 16.0, 24.0]);
         // Channel 1 stores (s * 2 + 1).
-        assert_eq!(ring.last_n_samples(1, 4), vec![1, 9, 17, 25]);
+        assert_samples_eq(&ring.last_n_samples_f64(1, 4), &[1.0, 9.0, 17.0, 25.0]);
     }
 
     #[test]
@@ -331,7 +343,7 @@ mod tests {
         ring.push_block(&block(6, 1, 10)); // covers abs 6..16, aligned: 8, 12
         assert_eq!(ring.len, 2);
         // value at abs 8 -> local sample 2 -> (2*1+0) = 2; abs 12 -> local 6 -> 6.
-        assert_eq!(ring.last_n_samples(0, 2), vec![2, 6]);
+        assert_samples_eq(&ring.last_n_samples_f64(0, 2), &[2.0, 6.0]);
     }
 
     #[test]

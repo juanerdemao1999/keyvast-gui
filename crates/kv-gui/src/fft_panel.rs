@@ -67,7 +67,7 @@ pub fn compute_spectrum(
     let ring_sr = hardware_sample_rate / RING_DWNSP as f64;
 
     // Extract the most recent `fft_size` samples for this channel from the ring.
-    let raw = ring.last_n_samples(channel, fft_size);
+    let raw = ring.last_n_samples_f64(channel, fft_size);
     if raw.len() < fft_size {
         return Vec::new();
     }
@@ -87,7 +87,7 @@ pub fn compute_spectrum(
 
     for (i, &sample) in raw.iter().enumerate().take(n) {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
-        real.push(sample as f64 * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64 * w);
+        real.push(sample * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64 * w);
     }
 
     // In-place radix-2 FFT.

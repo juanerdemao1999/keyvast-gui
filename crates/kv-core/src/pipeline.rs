@@ -493,7 +493,19 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    use kv_simulator::SimulatorBackend;
+    use kv_simulator::{SimulatorBackend, SimulatorError};
+
+    /// Let the pipeline pull blocks straight off the simulator backend instead
+    /// of through a hand-written closure wrapper. The trait lives in `kv-core`,
+    /// so the impl stays test-only here to avoid a `kv-core` <-> `kv-simulator`
+    /// dependency cycle.
+    impl AcquisitionSource for SimulatorBackend {
+        type Error = SimulatorError;
+
+        fn read_block(&mut self) -> Result<SampleBlock, Self::Error> {
+            self.next_block()
+        }
+    }
 
     /// `producer_loop` should emit a `BufferOverflow` event for every push that
     /// drops a block, carrying the cumulative dropped-block count and the
@@ -517,10 +529,9 @@ mod tests {
         ));
 
         let (tx, rx) = mpsc::channel();
-        let mut simulator = SimulatorBackend::default();
-        let source = move || simulator.next_block().map_err(|e| e.to_string());
+        let simulator = SimulatorBackend::default();
 
-        producer_loop(source, 3, &shared, Some(tx));
+        producer_loop(simulator, 3, &shared, Some(tx));
 
         let events: Vec<AcquisitionEvent> = rx.iter().collect();
         assert_eq!(events.len(), 2, "two of three pushes overflow capacity 1");
@@ -561,10 +572,9 @@ mod tests {
         ));
 
         let (tx, rx) = mpsc::channel();
-        let mut simulator = SimulatorBackend::default();
-        let source = move || simulator.next_block().map_err(|e| e.to_string());
+        let simulator = SimulatorBackend::default();
 
-        producer_loop(source, 4, &shared, Some(tx));
+        producer_loop(simulator, 4, &shared, Some(tx));
 
         assert_eq!(rx.iter().count(), 0);
     }

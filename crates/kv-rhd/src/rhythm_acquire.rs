@@ -146,8 +146,15 @@ impl RhythmFrontPanelBoard {
         let mut best: Option<(usize, u32, bool, Option<u8>)> = None;
 
         for (port, &port_letter) in PORT_LETTERS.iter().enumerate() {
+            let port_mask = crate::protocol::port_stream_mask(stream_bits, port).ok_or(
+                RhdReadError::StreamMaskOverflow {
+                    mask: stream_bits,
+                    port,
+                },
+            )?;
+            self.enable_stream_mask(port_mask)?;
+            // `port_stream_mask` succeeded, so `4 * port` is < u32::BITS and fits.
             let first_stream = (port * 4) as u32;
-            self.enable_stream_mask(stream_bits << first_stream)?;
 
             // Delays where chip ID was verified (strong validation).
             let mut id_verified_delays: Vec<u32> = Vec::new();

@@ -155,6 +155,7 @@ pub enum RhdReadError {
     Parse(RhythmParseError),
     UnexpectedBoardId { expected: u32, observed: u32 },
     InvalidPort { port_index: usize },
+    StreamMaskOverflow { mask: u32, port: usize },
     NotEnoughFifoWords { needed: u32, available: u32 },
     ShortPipeRead { expected: usize, observed: usize },
     SpiStillRunning,
@@ -180,6 +181,10 @@ impl fmt::Display for RhdReadError {
             Self::InvalidPort { port_index } => {
                 write!(formatter, "invalid Rhythm SPI port index {port_index}")
             }
+            Self::StreamMaskOverflow { mask, port } => write!(
+                formatter,
+                "stream-enable mask 0x{mask:08x} overflows u32 when shifted to SPI port {port}"
+            ),
             Self::NotEnoughFifoWords { needed, available } => write!(
                 formatter,
                 "not enough words in Rhythm FIFO: needed {needed}, available {available}"
@@ -220,6 +225,7 @@ impl std::error::Error for RhdReadError {
             Self::Parse(error) => Some(error),
             Self::UnexpectedBoardId { .. }
             | Self::InvalidPort { .. }
+            | Self::StreamMaskOverflow { .. }
             | Self::NotEnoughFifoWords { .. }
             | Self::ShortPipeRead { .. }
             | Self::SpiStillRunning

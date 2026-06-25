@@ -3,7 +3,7 @@
 //! and have no hardware dependency, which keeps them unit-testable.
 
 use crate::commands::AuxCommandSlot;
-use crate::protocol::CHANNELS_PER_STREAM;
+use crate::protocol::{CHANNELS_PER_STREAM, FrameLayout};
 
 pub(crate) fn aux_command_trigger_bit(slot: AuxCommandSlot) -> i32 {
     match slot {
@@ -42,23 +42,14 @@ pub(crate) fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, sample
         return false;
     }
 
-    // Frame layout per sample (in bytes):
-    //   8 (magic) + 4 (timestamp) + 3*enabled_streams*2 (aux results)
-    //   + CHANNELS_PER_STREAM*enabled_streams*2 (amplifier)
-    //   + (enabled_streams%4)*2 (pad) + 8*2 (board ADC) + 2 (TTL in) + 2 (TTL out)
-    let frame_bytes =
-        (4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2) * 2;
-
-    // AuxCmd3 results start after magic(8) + timestamp(4) + AuxCmd1(streams*2) + AuxCmd2(streams*2)
-    let auxcmd3_base = 12 + 2 * enabled_streams * 2;
-
+    let layout = FrameLayout::new(enabled_streams);
     let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
 
     for stream in 0..enabled_streams {
-        let word_offset_in_frame = auxcmd3_base + stream * 2;
+        let word_offset_in_frame = layout.auxcmd3_word_offset(stream);
         let mut aux_bytes: Vec<u8> = Vec::with_capacity(samples);
         for s in 0..samples {
-            let off = s * frame_bytes + word_offset_in_frame;
+            let off = layout.word_byte_offset(s, word_offset_in_frame);
             if off + 2 > raw.len() {
                 return false;
             }
@@ -85,6 +76,7 @@ pub(crate) fn min_stream_railed_fraction(
     if enabled_streams == 0 || samples == 0 {
         return 1.0;
     }
+    let layout = FrameLayout::new(enabled_streams);
     let mut railed = vec![0_usize; enabled_streams];
     let mut total = vec![0_usize; enabled_streams];
     let evaluate_from = samples / 2;
@@ -109,7 +101,7 @@ pub(crate) fn min_stream_railed_fraction(
                 }
             }
         }
-        offset += (enabled_streams % 4) * 2; // alignment padding
+        offset += layout.filler_words() * 2; // alignment padding
         offset += 8 * 2; // auxiliary ADC slots
         offset += 2; // TTL in
         offset += 2; // TTL out
@@ -140,23 +132,12 @@ pub(crate) fn extract_channel_from_raw(
 
     let stream = ch / CHANNELS_PER_STREAM;
     let intra_ch = ch % CHANNELS_PER_STREAM;
-
-    // Frame layout (in u16 words): 4 (magic) + 2 (timestamp)
-    // + 3*enabled_streams (aux) + CHANNELS_PER_STREAM*enabled_streams (amp)
-    // + (enabled_streams%4) (pad) + 8 (board ADC) + 1 (TTL in) + 1 (TTL out)
-    let frame_words =
-        4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + (enabled_streams % 4) + 8 + 2;
-    let frame_bytes = frame_words * 2;
-
-    // Amplifier data starts after magic(4w) + timestamp(2w) + aux(3*streams w).
-    let amp_base_words = 4 + 2 + 3 * enabled_streams;
+    let layout = FrameLayout::new(enabled_streams);
+    let word_idx = layout.amp_word_offset(intra_ch, stream);
 
     let mut out = Vec::with_capacity(samples);
     for s in 0..samples {
-        // Within the amplifier section: data is channel-major, stream-minor.
-        // Word index = amp_base + (intra_ch * enabled_streams + stream)
-        let word_idx = amp_base_words + intra_ch * enabled_streams + stream;
-        let byte_off = s * frame_bytes + word_idx * 2;
+        let byte_off = layout.word_byte_offset(s, word_idx);
         if byte_off + 2 > raw.len() {
             break;
         }
@@ -170,21 +151,20 @@ pub(crate) fn extract_channel_from_raw(
 mod tests {
     use super::*;
 
-    /// Word count of one frame for `streams` enabled streams. Mirrors
-    /// `protocol::words_per_frame`.
+    /// Word count of one frame for `streams` enabled streams.
     fn frame_words(streams: usize) -> usize {
-        4 + 2 + streams * (CHANNELS_PER_STREAM + 3) + (streams % 4) + 8 + 2
+        FrameLayout::new(streams).words_per_frame()
     }
 
     /// Word offset (within a frame) of the amplifier sample for a given
     /// intra-stream channel and stream. Channel-major, stream-minor.
     fn amp_word(streams: usize, intra_ch: usize, stream: usize) -> usize {
-        (4 + 2 + 3 * streams) + intra_ch * streams + stream
+        FrameLayout::new(streams).amp_word_offset(intra_ch, stream)
     }
 
     /// Word offset (within a frame) of the AuxCmd3 result for a stream.
     fn aux3_word(streams: usize, stream: usize) -> usize {
-        6 + 2 * streams + stream
+        FrameLayout::new(streams).auxcmd3_word_offset(stream)
     }
 
     fn to_bytes(words: &[u16]) -> Vec<u8> {

@@ -1,8 +1,12 @@
 use std::fmt;
 
-use kv_types::{DeviceBackendKind, DeviceConfig};
+use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig};
 
 pub const RHYTHM_HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
+
+/// Number of TTL digital input lines the Rhythm frame carries (one 16-bit TTL
+/// word per sample). Matches `kv_types::DEFAULT_TTL_LINE_COUNT`.
+pub const RHYTHM_TTL_LINE_COUNT: usize = DEFAULT_TTL_LINE_COUNT;
 pub const RHYTHM_BOARD_ID: u32 = 700;
 pub const CHANNELS_PER_STREAM: usize = 32;
 pub const SAMPLES_PER_USB_BLOCK: usize = 256;
@@ -141,13 +145,18 @@ impl RhythmDataConfig {
         let channel_count = self.channel_count();
         Ok(DeviceConfig {
             device_id: self.device_id.clone(),
+            // Transport kind is fixed to USB because the only Rhythm bring-up
+            // path is the Opal Kelly XEM7310 USB3 board; revisit if a non-USB
+            // transport is confirmed (project rule 1).
             backend: DeviceBackendKind::Usb,
             sample_rate: self.sample_rate,
             channel_count,
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
+            // The Rhythm frame always carries one TTL word per sample, so the
+            // digital inputs are always present at the protocol level.
             ttl_enabled: true,
-            ttl_line_count: 16,
+            ttl_line_count: RHYTHM_TTL_LINE_COUNT,
         })
     }
 
@@ -221,14 +230,77 @@ pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
     }
 }
 
+/// Word/byte layout of a single Rhythm USB data frame for a given number of
+/// enabled streams.
+///
+/// This is the single source of truth for the per-frame arithmetic. The parser
+/// and every MISO-scan / impedance analysis helper derive their offsets from
+/// here instead of re-deriving the magic/timestamp/aux/amp/filler layout inline,
+/// so a protocol change is a one-line edit rather than a six-way hunt.
+///
+/// Word order within a frame (each unit is one 16-bit word unless noted):
+/// `magic(4) | timestamp(2) | aux[aux_ch][stream] (3*streams) |
+///  amp[channel][stream] (32*streams) | filler | board_adc(8) | ttl_in(1) | ttl_out(1)`.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameLayout {
+    enabled_streams: usize,
+}
+
+impl FrameLayout {
+    pub fn new(enabled_streams: usize) -> Self {
+        Self { enabled_streams }
+    }
+
+    /// 16-bit filler words that pad the active stream count up to a multiple of
+    /// 4: `(4 - streams % 4) % 4`, not `streams % 4`.
+    pub fn filler_words(&self) -> usize {
+        (4 - self.enabled_streams % 4) % 4
+    }
+
+    /// Total number of 16-bit words in one frame.
+    pub fn words_per_frame(&self) -> usize {
+        4 + 2
+            + self.enabled_streams * (CHANNELS_PER_STREAM + AUX_CHANNELS_PER_STREAM)
+            + self.filler_words()
+            + BOARD_ADC_CHANNELS
+            + 2
+    }
+
+    /// Total number of bytes in one frame.
+    pub fn bytes_per_frame(&self) -> usize {
+        self.words_per_frame() * 2
+    }
+
+    /// Word offset of the first aux-command word (aux_ch 0, stream 0).
+    fn aux_base_words(&self) -> usize {
+        4 + 2
+    }
+
+    /// Word offset of the AuxCmd3 result word (aux_ch index 2) for `stream`.
+    /// Aux words are aux_ch-major, stream-minor, matching `parse_rhythm_data_block`.
+    pub fn auxcmd3_word_offset(&self, stream: usize) -> usize {
+        self.aux_base_words() + 2 * self.enabled_streams + stream
+    }
+
+    /// Word offset of the amplifier sample for intra-stream channel `intra_ch`
+    /// on `stream`. Amplifier words are channel-major, stream-minor.
+    pub fn amp_word_offset(&self, intra_ch: usize, stream: usize) -> usize {
+        self.aux_base_words()
+            + AUX_CHANNELS_PER_STREAM * self.enabled_streams
+            + intra_ch * self.enabled_streams
+            + stream
+    }
+
+    /// Byte offset of a frame-relative word at sample index `sample`.
+    pub fn word_byte_offset(&self, sample: usize, word_in_frame: usize) -> usize {
+        sample * self.bytes_per_frame() + word_in_frame * 2
+    }
+}
+
 pub fn words_per_frame(enabled_streams: usize) -> Result<usize, RhythmConfigError> {
     validate_stream_count(enabled_streams)?;
 
-    // The Rhythm FPGA pads the per-frame amplifier section so the active stream
-    // count rounds up to a multiple of 4; the number of 16-bit filler words is
-    // therefore `(4 - streams % 4) % 4`, not `streams % 4`.
-    let filler = (4 - enabled_streams % 4) % 4;
-    Ok(4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + filler + 8 + 2)
+    Ok(FrameLayout::new(enabled_streams).words_per_frame())
 }
 
 pub fn bytes_per_block(

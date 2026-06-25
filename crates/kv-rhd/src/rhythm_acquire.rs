@@ -362,36 +362,57 @@ impl RhythmFrontPanelBoard {
     }
 
     // ------------------------------------------------------------------
-    // Stub methods for features that Open Ephys supports but keyvast has
-    // not yet wired up.  They are marked `#[allow(dead_code)]` until the
-    // GUI or a command interface calls them.
+    // Unimplemented FPGA control features.
+    //
+    // Open Ephys' `rhd2000evalboard` exposes these on the stock Intan
+    // RhythmUSB3 (XEM7310) bitstream, but the KeyVast bitstream
+    // (`keyvast_*.bit`) re-routes the SPI buses through the module-IO ring
+    // and has not been confirmed to map these WireIn endpoints to the same
+    // addresses. Per project rule 1, the exact endpoint addresses are TBD
+    // until verified against the running KeyVast FPGA, so these are
+    // deliberately no-ops (returning `Ok(())`) rather than writing a guessed
+    // address that could collide with another control register.
+    //
+    // Each stub documents the Open Ephys reference endpoint so the wiring is
+    // a lookup-and-confirm step once hardware is available. They are marked
+    // `#[allow(dead_code)]` until the GUI or a command interface calls them.
     // ------------------------------------------------------------------
 
-    /// Set the on-chip DAC for impedance testing waveform generation.
+    /// Set an on-chip DAC threshold/level (used for the impedance-check
+    /// waveform and spike-threshold DAC outputs).
+    ///
+    /// Open Ephys reference: `setDacThreshold` drives `WireInDacSource1..8`
+    /// (one endpoint per DAC) plus `WireInDacManual` and a `TrigIn` strobe.
+    /// KeyVast endpoint addresses unconfirmed — see module note above.
     #[allow(dead_code)]
     pub(crate) fn set_dac_threshold(
         &self,
         _dac_channel: u8,
         _threshold: u16,
     ) -> Result<(), RhdReadError> {
-        // TODO: WireInDacSource1..8 + WireInDacManual + TrigIn bits.
         Ok(())
     }
 
-    /// Enable/disable an on-board LED.
+    /// Enable/disable an on-board status LED.
+    ///
+    /// Open Ephys reference: `setLedDisplay` writes the 8-bit LED bitmask to
+    /// the `WireInLedDisplay` endpoint. KeyVast endpoint address unconfirmed —
+    /// see module note above.
     #[allow(dead_code)]
     pub(crate) fn set_led(&self, _led_index: u8, _on: bool) -> Result<(), RhdReadError> {
-        // TODO: WireInLedDisplay register.
         Ok(())
     }
 
-    /// Trigger external fast-settle (blanking) via the FPGA logic line.
+    /// Trigger external fast-settle (amplifier blanking) on a logic channel.
+    ///
+    /// Open Ephys reference: `setExternalFastSettleChannel` writes the
+    /// `WireInExternalFastSettle` endpoint (enable bit + channel select).
+    /// KeyVast endpoint address unconfirmed — see module note above.
     #[allow(dead_code)]
     pub(crate) fn set_external_fast_settle_channel(
         &self,
         _channel: u8,
     ) -> Result<(), RhdReadError> {
-        // TODO: WireInExternalFastSettle.
         Ok(())
     }
 }

@@ -3,8 +3,9 @@ use std::fmt;
 use kv_types::{SampleBlock, SampleBlockError};
 
 use crate::protocol::{
-    AUX_CHANNELS_PER_STREAM, BOARD_ADC_CHANNELS, CHANNELS_PER_STREAM, RHYTHM_HEADER_MAGIC,
-    RhythmConfigError, RhythmDataConfig, bytes_per_block, raw_word_to_signed_count,
+    AUX_CHANNELS_PER_STREAM, BOARD_ADC_CHANNELS, CHANNELS_PER_STREAM, FrameLayout,
+    RHYTHM_HEADER_MAGIC, RHYTHM_TTL_LINE_COUNT, RhythmConfigError, RhythmDataConfig,
+    bytes_per_block, raw_word_to_signed_count,
 };
 
 // Index-based loops mirror the Rhythm wire layout (stream-major word order).
@@ -28,6 +29,7 @@ pub fn parse_rhythm_data_block(
     let channel_count = config.channel_count();
     let samples = config.samples_per_block;
     let streams = config.enabled_streams;
+    let layout = FrameLayout::new(streams);
     let mut data = Vec::with_capacity(channel_count.saturating_mul(samples));
     let mut offset = 0_usize;
     let mut timestamp_start = None;
@@ -91,8 +93,8 @@ pub fn parse_rhythm_data_block(
         data.extend_from_slice(&frame_samples);
 
         // Skip filler word(s) that pad the active stream count up to a multiple
-        // of 4 (see `words_per_frame`): `(4 - streams % 4) % 4` words.
-        offset = offset.saturating_add(((4 - streams % 4) % 4) * 2);
+        // of 4 (see `FrameLayout::filler_words`).
+        offset = offset.saturating_add(layout.filler_words() * 2);
 
         // Parse 8 board ADC channels.
         for adc_ch in 0..BOARD_ADC_CHANNELS {
@@ -126,7 +128,7 @@ pub fn parse_rhythm_data_block(
     };
 
     block
-        .validate_against_ttl_lines(16)
+        .validate_against_ttl_lines(RHYTHM_TTL_LINE_COUNT)
         .map_err(RhythmParseError::InvalidSampleBlock)?;
 
     Ok(block)

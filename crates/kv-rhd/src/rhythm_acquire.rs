@@ -21,6 +21,11 @@ impl RhythmFrontPanelBoard {
     }
 
     pub(crate) fn start_continuous_acquisition(&self) -> Result<(), RhdReadError> {
+        // Acquisition is armed lazily on the first read_block(), well after board
+        // bring-up (ADC calibration, port scanning) has already advanced the FPGA
+        // sample-timestamp counter. Pulse the FPGA logic reset first so the first
+        // acquired block starts at t=0 instead of inheriting bring-up residue.
+        self.reset_fpga_timestamp()?;
         self.set_max_time_step(u32::MAX)?;
         self.set_continuous_run_mode(true)?;
         self.run()

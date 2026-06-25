@@ -186,6 +186,24 @@ impl RhythmFrontPanelBoard {
         Ok(())
     }
 
+    /// Pulse the FPGA logic reset (WireInResetRun bit 0) on its own. In the
+    /// Rhythm design this zeroes the sample-timestamp counter and resets the
+    /// data-output FIFO state machine without disturbing the PLL, stream-enable,
+    /// cable-delay or per-channel command configuration already programmed into
+    /// the FPGA. Used to clear bring-up residue right before arming continuous
+    /// acquisition (see `start_continuous_acquisition`).
+    pub(crate) fn reset_fpga_timestamp(&self) -> Result<(), RhdReadError> {
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0x01, 0x01)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0x00, 0x01)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        Ok(())
+    }
+
     pub(crate) fn reset_board(&self) -> Result<(), RhdReadError> {
         self.device
             .set_wire_in_value(WIRE_IN_RESET_RUN, 0x01, 0x01)

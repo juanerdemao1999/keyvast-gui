@@ -145,16 +145,23 @@ where
     let rhd_block_len = RHD_SAMPLES_PER_BLOCK * channel_count;
     let mut buf_samples: Vec<i16> = Vec::with_capacity(rhd_block_len);
     let mut buf_timestamps: Vec<u32> = Vec::with_capacity(RHD_SAMPLES_PER_BLOCK);
-    let mut ts = 0u32;
+    // Tracks the most recently written sample timestamp so trailing padding can
+    // continue the sequence. Seeded from the data itself below.
+    let mut last_ts = 0u32;
 
     for block in blocks {
         let block = block.borrow();
         for s in 0..block.samples_per_channel {
+            // Preserve the real FPGA sample timestamp (32-bit, zero-extended in
+            // `timestamp_start`) rather than a synthetic 0-based counter, so the
+            // exported .rhd carries true acquisition time — including the
+            // hardware counter's natural ~39.7h wrap.
+            let ts = block.timestamp_start.wrapping_add(s as u64) as u32;
             buf_timestamps.push(ts);
+            last_ts = ts;
             for ch in 0..block.channel_count {
                 buf_samples.push(block.data[s * block.channel_count + ch]);
             }
-            ts = ts.wrapping_add(1);
 
             if buf_timestamps.len() == RHD_SAMPLES_PER_BLOCK {
                 write_rhd_data_block(
@@ -175,7 +182,7 @@ where
     if !buf_timestamps.is_empty() {
         let valid = buf_timestamps.len();
         let pad_samples = RHD_SAMPLES_PER_BLOCK - valid;
-        buf_timestamps.extend((0..pad_samples).map(|i| ts.wrapping_add(i as u32)));
+        buf_timestamps.extend((0..pad_samples).map(|i| last_ts.wrapping_add(i as u32 + 1)));
         buf_samples.extend(std::iter::repeat_n(0i16, pad_samples * channel_count));
         write_rhd_data_block(
             &mut w,
@@ -593,6 +600,47 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([data[amp_start], data[amp_start + 1]]),
             (raw0 as i32 + 32_768) as u16
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intan_rhd_uses_real_block_timestamp() {
+        let dir = std::env::temp_dir().join("kv_intan_realts_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let channels = 1;
+        let mut blocks = make_test_blocks(channels, RHD_SAMPLES_PER_BLOCK, 1);
+        // Real FPGA counter value the block was acquired at.
+        blocks[0].timestamp_start = 1_000;
+        let rhd_path = dir.join("realts.rhd");
+        export_intan_rhd(&rhd_path, &blocks, "test").unwrap();
+        let data = fs::read(&rhd_path).unwrap();
+
+        let ts_bytes = RHD_SAMPLES_PER_BLOCK * 4;
+        let amp_bytes = channels * RHD_SAMPLES_PER_BLOCK * 2;
+        let block_start = data.len() - ts_bytes - amp_bytes;
+
+        // First exported timestamp equals the block's real start, not 0.
+        assert_eq!(
+            u32::from_le_bytes([
+                data[block_start],
+                data[block_start + 1],
+                data[block_start + 2],
+                data[block_start + 3],
+            ]),
+            1_000
+        );
+        // Subsequent samples increment from the real start.
+        assert_eq!(
+            u32::from_le_bytes([
+                data[block_start + 4],
+                data[block_start + 5],
+                data[block_start + 6],
+                data[block_start + 7],
+            ]),
+            1_001
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -498,14 +498,25 @@ impl RhythmFrontPanelBoard {
         self.run()?;
         self.wait_until_not_running()?;
         let verify_raw = self.read_pipe_block(detected_streams, VERIFY_SAMPLES)?;
-        if let Some(mean) =
-            amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, 0)
-        {
-            log::info!("post-delay centering check: amp mean raw word = 0x{mean:04x}");
+        // Gate every detected stream, not just stream 0: on a dual-MISO RHD2164
+        // the upper 32 channels live on stream 1, and a delay chosen from
+        // stream-0 data can leave that half railed/half-scale while stream 0
+        // looks centered. Checking only stream 0 let the upper half record
+        // corrupt 0x4000 data with a clean bring-up report (DA8).
+        for stream in 0..detected_streams {
+            let Some(mean) =
+                amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, stream)
+            else {
+                continue;
+            };
+            log::info!(
+                "post-delay centering check: stream {stream} amp mean raw word = 0x{mean:04x}"
+            );
             if (0x3000..=0x5000).contains(&mean) {
                 log::error!(
-                    "amplifier data is half-scale (mean 0x{mean:04x} ~ 0x4000): the committed \
-                     MISO delay is the wrong sampling phase. Refusing to record corrupt data."
+                    "amplifier data is half-scale on stream {stream} (mean 0x{mean:04x} ~ 0x4000): \
+                     the committed MISO delay is the wrong sampling phase for this stream. \
+                     Refusing to record corrupt data."
                 );
                 return Err(RhdReadError::HalfScaleAmplifierData {
                     mean_raw_word: mean,

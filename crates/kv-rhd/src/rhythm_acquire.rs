@@ -13,6 +13,76 @@ use crate::protocol::{RhythmDataConfig, USB3_BLOCK_SIZE_BYTES, bytes_per_block};
 use crate::rhythm_board::RhythmFrontPanelBoard;
 use crate::rhythm_board::*;
 
+/// One MISO-delay probe result for a single port during the headstage scan.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DelayProbe {
+    /// MISO cable delay under test (0..16).
+    pub delay: u32,
+    /// Register-63 chip ID matched the expected RHD pattern at this delay.
+    pub has_id: bool,
+    /// Fraction of amplifier words pinned to a rail (idle-high 0xFFFF / 0x0000)
+    /// for the quietest stream — 0.0 = clean, 1.0 = fully railed.
+    pub railed: f64,
+}
+
+/// Maximum railed fraction tolerated for a probe to be *accepted* during the
+/// port scan. A chip-ID match alone is not sufficient: a delay whose data is
+/// mostly rail-pinned is the wrong sampling phase (or an open/dead line) and is
+/// rejected even when register 63 happens to read back a valid chip ID (DA25).
+pub(crate) const MAX_ACCEPT_RAILED_FRACTION: f64 = 0.5;
+
+/// Pick the MISO delay for one port from its per-delay probes.
+///
+/// Returns `(chosen_delay, validated_by_id, railed_at_chosen)` or `None` when no
+/// delay qualifies. A chip-ID-verified delay must *also* be below the railed
+/// gate to count (DA25); only if no clean chip-ID delay exists do we fall back
+/// to low-railed-only delays. `railed_at_chosen` is exposed so ports can be
+/// ranked by signal quality rather than scan position (DA24).
+pub(crate) fn choose_port_delay(probes: &[DelayProbe]) -> Option<(u32, bool, f64)> {
+    let id_delays: Vec<&DelayProbe> = probes
+        .iter()
+        .filter(|p| p.has_id && p.railed < MAX_ACCEPT_RAILED_FRACTION)
+        .collect();
+    let (candidates, by_id) = if !id_delays.is_empty() {
+        (id_delays, true)
+    } else {
+        let low: Vec<&DelayProbe> = probes
+            .iter()
+            .filter(|p| p.railed < MAX_ACCEPT_RAILED_FRACTION)
+            .collect();
+        (low, false)
+    };
+    // Open Ephys DeviceThread::scanPorts indexSecondGoodDelay: with >2 good
+    // delays take the second (timing margin), otherwise the first. `probes` are
+    // swept in ascending delay order, so `candidates` stays ordered.
+    let chosen = if candidates.len() > 2 {
+        candidates[1]
+    } else {
+        *candidates.first()?
+    };
+    Some((chosen.delay, by_id, chosen.railed))
+}
+
+/// Decide whether a freshly-scanned port should replace the current best (DA24).
+///
+/// Ranking is by validation tier first (a chip-ID-verified port always beats a
+/// fraction-only port), then by signal quality (lower railed fraction at the
+/// chosen delay) within the same tier. Scan order is never the tiebreaker, so a
+/// later reflection/cross-talk port can no longer overwrite the real headstage
+/// by last-wins.
+pub(crate) fn port_is_better(
+    cand_by_id: bool,
+    cand_railed: f64,
+    best_by_id: bool,
+    best_railed: f64,
+) -> bool {
+    match (cand_by_id, best_by_id) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => cand_railed < best_railed,
+    }
+}
+
 impl RhythmFrontPanelBoard {
     pub(crate) fn run(&self) -> Result<(), RhdReadError> {
         self.device
@@ -142,17 +212,15 @@ impl RhythmFrontPanelBoard {
 
         let stream_bits = crate::protocol::stream_enable_mask(enabled_streams);
 
-        // (port index, chosen delay, has_chip_id, chip-ID byte)
-        let mut best: Option<(usize, u32, bool, Option<u8>)> = None;
+        // (port index, chosen delay, has_chip_id, chip-ID byte, railed quality)
+        let mut best: Option<(usize, u32, bool, Option<u8>, f64)> = None;
 
         for (port, &port_letter) in PORT_LETTERS.iter().enumerate() {
             let first_stream = (port * 4) as u32;
             self.enable_stream_mask(stream_bits << first_stream)?;
 
-            // Delays where chip ID was verified (strong validation).
-            let mut id_verified_delays: Vec<u32> = Vec::new();
-            // Delays where railed fraction < 50% (weak fallback).
-            let mut low_railed_delays: Vec<u32> = Vec::new();
+            // Per-delay probe results for this port (ascending delay order).
+            let mut probes: Vec<DelayProbe> = Vec::with_capacity(16);
             // First register-63 chip ID seen on a chip-ID-verified delay.
             let mut port_chip_id: Option<u8> = None;
 
@@ -165,11 +233,13 @@ impl RhythmFrontPanelBoard {
                 let raw = self.read_pipe_block(enabled_streams, PROBE_SAMPLES)?;
 
                 let has_id = verify_chip_id_in_probe(&raw, enabled_streams, PROBE_SAMPLES);
-                if has_id {
-                    id_verified_delays.push(delay);
-                }
-
                 let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
+                probes.push(DelayProbe {
+                    delay,
+                    has_id,
+                    railed,
+                });
+
                 if railed < 0.9 || has_id {
                     let amp_mean = amplifier_mean_raw_word(&raw, enabled_streams, PROBE_SAMPLES, 0);
                     let chip_id = probe_chip_id(&raw, enabled_streams, PROBE_SAMPLES, 0);
@@ -184,32 +254,19 @@ impl RhythmFrontPanelBoard {
                             .map(|m| format!("0x{m:04x}"))
                             .unwrap_or_else(|| "n/a".to_string()),
                     );
-                    if has_id && port_chip_id.is_none() {
+                    // Only adopt a chip ID from a delay that also passes the
+                    // railed gate, so a mostly-railed but ID-matching phase
+                    // can't supply the reported chip ID (DA25).
+                    if has_id && railed < MAX_ACCEPT_RAILED_FRACTION && port_chip_id.is_none() {
                         port_chip_id = chip_id;
                     }
                 }
-                if railed < 0.5 {
-                    low_railed_delays.push(delay);
-                }
             }
 
-            // Prefer chip-ID-verified delays; fall back to low-railed delays.
-            let (good_delays, validated_by_id) = if !id_verified_delays.is_empty() {
-                (id_verified_delays, true)
-            } else {
-                (low_railed_delays, false)
-            };
-
-            // Match Open Ephys DeviceThread::scanPorts exactly: 1-2 good delays ->
-            // the first; >2 -> the SECOND good delay (indexSecondGoodDelay), NOT the
-            // middle. good_delays is in ascending order, so index 1 is the second.
-            // On this rig the second good delay (5 for good delays 4-7) reads
-            // measurably quieter in the 5-300 Hz / mains band than the middle (6).
-            let chosen_delay = if good_delays.len() > 2 {
-                good_delays[1]
-            } else if let Some(&d) = good_delays.first() {
-                d
-            } else {
+            // Choose this port's delay with the railed gate applied per delay
+            // (DA25). Returns the chosen delay's railed fraction for ranking.
+            let Some((chosen_delay, validated_by_id, quality_railed)) = choose_port_delay(&probes)
+            else {
                 continue;
             };
 
@@ -219,29 +276,35 @@ impl RhythmFrontPanelBoard {
                 "railed fraction"
             };
             log::info!(
-                "port {} ({}): {} good delays ({} verified) @ chosen delay {}  <- responding",
+                "port {} ({}): chosen delay {} via {} (railed {:.3})  <- responding",
                 port_letter,
                 stream_range_label(first_stream, enabled_streams),
-                good_delays.len(),
-                method,
                 chosen_delay,
+                method,
+                quality_railed,
             );
 
-            // Prefer chip-ID-verified ports over railed-fraction-only ports.
-            let dominated = best
+            // Rank ports by validation tier then signal quality, never by scan
+            // position, so a later reflection/cross-talk port can't overwrite the
+            // real headstage by last-wins (DA24).
+            let replace = best
                 .as_ref()
-                .is_some_and(|&(_, _, prev_id, _)| prev_id && !validated_by_id);
-            if !dominated
-                && best
-                    .as_ref()
-                    .is_none_or(|&(_, _, prev_id, _)| validated_by_id >= prev_id)
-            {
-                best = Some((port, chosen_delay, validated_by_id, port_chip_id));
+                .is_none_or(|&(_, _, best_id, _, best_railed)| {
+                    port_is_better(validated_by_id, quality_railed, best_id, best_railed)
+                });
+            if replace {
+                best = Some((
+                    port,
+                    chosen_delay,
+                    validated_by_id,
+                    port_chip_id,
+                    quality_railed,
+                ));
             }
         }
 
         match best {
-            Some((port, delay, _, chip_id)) => {
+            Some((port, delay, _, chip_id, _)) => {
                 let first_stream = (port * 4) as u32;
                 log::info!(
                     "FOUND headstage on port {} ({}) at MISO delay {} (chip ID {:?})",
@@ -435,5 +498,78 @@ impl RhythmFrontPanelBoard {
         _channel: u8,
     ) -> Result<(), RhdReadError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scan_decision_tests {
+    use super::*;
+
+    fn probe(delay: u32, has_id: bool, railed: f64) -> DelayProbe {
+        DelayProbe {
+            delay,
+            has_id,
+            railed,
+        }
+    }
+
+    #[test]
+    fn railed_chip_id_delay_is_rejected() {
+        // A delay whose register 63 matches but whose data is mostly railed must
+        // not be accepted on chip-ID alone; a cleaner non-ID delay wins instead
+        // of the railed ID delay (DA25).
+        let probes = [probe(3, true, 0.95), probe(7, false, 0.10)];
+        let (delay, by_id, railed) = choose_port_delay(&probes).unwrap();
+        assert_eq!(delay, 7);
+        assert!(!by_id);
+        assert!((railed - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn clean_chip_id_delay_is_preferred_over_low_railed() {
+        // With a chip-ID delay that also passes the railed gate, the strong
+        // (by-id) path is taken even though a slightly cleaner non-id delay exists.
+        let probes = [probe(4, true, 0.20), probe(9, false, 0.05)];
+        let (delay, by_id, _) = choose_port_delay(&probes).unwrap();
+        assert_eq!(delay, 4);
+        assert!(by_id);
+    }
+
+    #[test]
+    fn no_qualifying_delay_returns_none() {
+        let probes = [probe(0, true, 0.99), probe(1, false, 0.80)];
+        assert!(choose_port_delay(&probes).is_none());
+    }
+
+    #[test]
+    fn second_good_delay_chosen_when_more_than_two() {
+        // >2 good delays -> indexSecondGoodDelay (ascending order, index 1).
+        let probes = [
+            probe(4, true, 0.10),
+            probe(5, true, 0.10),
+            probe(6, true, 0.10),
+            probe(7, true, 0.10),
+        ];
+        let (delay, by_id, _) = choose_port_delay(&probes).unwrap();
+        assert_eq!(delay, 5);
+        assert!(by_id);
+    }
+
+    #[test]
+    fn chip_id_port_beats_fraction_only_port_regardless_of_quality() {
+        // A fraction-only port with very clean data does NOT displace a
+        // chip-ID-verified port (validation tier dominates) (DA24).
+        assert!(!port_is_better(false, 0.01, true, 0.40));
+        assert!(port_is_better(true, 0.40, false, 0.01));
+    }
+
+    #[test]
+    fn cleaner_port_wins_within_same_tier_not_last_wins() {
+        // Same validation tier: the lower railed fraction wins, so a later
+        // (worse) reflection/cross-talk port can't overwrite a cleaner earlier
+        // port by scan order (DA24).
+        assert!(port_is_better(true, 0.05, true, 0.30));
+        assert!(!port_is_better(true, 0.30, true, 0.05));
+        assert!(!port_is_better(true, 0.05, true, 0.05));
     }
 }

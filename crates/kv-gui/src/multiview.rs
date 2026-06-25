@@ -67,6 +67,8 @@ pub enum TileKind {
     },
     /// FFT spectrum view for a selected channel.
     FftSpectrum,
+    /// Live TTL digital-logic monitor (gate input visualisation).
+    TtlMonitor,
 }
 
 impl TileKind {
@@ -109,6 +111,10 @@ impl TileKind {
     pub fn new_fft() -> Self {
         Self::FftSpectrum
     }
+
+    pub fn new_ttl_monitor() -> Self {
+        Self::TtlMonitor
+    }
 }
 
 // ── Add-view request (set during top_bar_right_ui, processed after tree.ui) ─
@@ -118,6 +124,7 @@ pub enum AddViewRequest {
     Ap,
     SpikeOverlay,
     Fft,
+    Ttl,
 }
 
 // ── Behavior ─────────────────────────────────────────────────────────
@@ -147,6 +154,9 @@ pub struct KvTileBehavior<'a> {
     pub snippet_store: &'a mut SpikeSnippetStore,
     // FFT state
     pub fft: &'a crate::fft_panel::FftState,
+    // TTL gate state + history (for the TTL monitor tile)
+    pub trigger: &'a crate::trigger::TriggerConfig,
+    pub ttl_history: &'a crate::trigger::TtlHistory,
     // Add-view request: set by top_bar_right_ui, consumed by app.rs after tree.ui()
     pub pending_add: &'a mut Option<AddViewRequest>,
     // Source-aware subtitle for the "No Data" placeholder (e.g. "Press Start…"
@@ -232,6 +242,11 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 crate::fft_panel::draw_fft_plot(ui, self.fft, sr);
                 UiResponse::None
             }
+
+            TileKind::TtlMonitor => {
+                crate::trigger::draw_ttl_monitor(ui, self.ttl_history, self.trigger);
+                UiResponse::None
+            }
         }
     }
 
@@ -256,6 +271,7 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
                 format!("Spike Overlay  ({} ch)", channels.len()).into()
             }
             TileKind::FftSpectrum => "FFT Spectrum".into(),
+            TileKind::TtlMonitor => "TTL Monitor".into(),
         }
     }
 
@@ -342,6 +358,13 @@ impl<'a> KvTileBehavior<'a> {
             .clicked()
         {
             *self.pending_add = Some(AddViewRequest::Fft);
+            ui.close_menu();
+        }
+        if ui
+            .button(egui::RichText::new("TTL Monitor").size(11.0))
+            .clicked()
+        {
+            *self.pending_add = Some(AddViewRequest::Ttl);
             ui.close_menu();
         }
     }
@@ -731,14 +754,8 @@ impl<'a> KvTileBehavior<'a> {
         ui.separator();
 
         // ── Snippet plot ─────────────────────────────────────────────
-        // Reborrow &mut as & for the read-only renderer.
-        spike_overlay::draw_spike_overlay(
-            ui,
-            &*self.snippet_store,
-            channels,
-            *show_grid,
-            tile_salt,
-        );
+        // Renderer needs &mut to refresh each snippet's cached geometry.
+        spike_overlay::draw_spike_overlay(ui, self.snippet_store, channels, *show_grid, tile_salt);
     }
 }
 

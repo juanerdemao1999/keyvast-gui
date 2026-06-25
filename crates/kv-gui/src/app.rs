@@ -50,7 +50,7 @@ use crate::remote_api::{
 use crate::spike_overlay::SpikeSnippetStore;
 use crate::theme;
 use crate::toast::Toasts;
-use crate::trigger::{self, TriggerAction, TriggerConfig};
+use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 
 /// How long filter settings must stay unchanged before the full history
 /// is re-filtered (lets slider drags settle first).
@@ -196,6 +196,8 @@ pub struct KvApp {
     channel_map: ChannelMapState,
     // Phase 3 features
     trigger: TriggerConfig,
+    /// Rolling TTL transition history feeding the live TTL monitor tile.
+    ttl_history: TtlHistory,
     remote_api_state: RemoteApiState,
     remote_api_handle: Option<RemoteApiHandle>,
     /// Export format (for recording panel UI)
@@ -226,7 +228,9 @@ impl KvApp {
         // Restore persisted settings at startup (#15/#17).  Missing or invalid
         // files fall back to defaults, so this never blocks launch.
         let saved = config_persist::load_or_default();
-        let ui_scale = saved.ui_scale.clamp(0.8, 1.6);
+        let ui_scale = saved
+            .ui_scale
+            .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
         let start_source = match saved.last_source.as_str() {
             "device" => DataSource::Device,
             "playback" => DataSource::Playback,
@@ -260,7 +264,7 @@ impl KvApp {
             filters_last_frame: filters,
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
-            disp_ring_ap: DisplayRing::new(16, 30_000.0),
+            disp_ring_ap: DisplayRing::new(16, 30_000.0).with_peak_hold(),
             filter_chains_lfp: Vec::new(),
             filter_chains_ap: Vec::new(),
             tile_tree: Some(multiview::make_initial_tree(16)),
@@ -286,9 +290,10 @@ impl KvApp {
             fft: FftState::default(),
             channel_map: ChannelMapState::default(),
             trigger: TriggerConfig::default(),
+            ttl_history: TtlHistory::new(),
             remote_api_state: RemoteApiState::default(),
             remote_api_handle: None,
-            export_format: kv_recorder::export_formats::ExportFormat::IntanRhd,
+            export_format: kv_recorder::export_formats::ExportFormat::KeyvastNative,
             export_rx: None,
             export_status: None,
             record_channels: None,
@@ -354,6 +359,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         self.snippet_store
             .reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
@@ -380,6 +386,7 @@ impl KvApp {
         self.disp_ring.reset();
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
+        self.ttl_history.clear();
         // snippet_store will be reconfigured lazily on the first ingest_block()
         // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
@@ -658,7 +665,8 @@ impl KvApp {
             self.snippet_store.process_block(&ap_block);
         }
 
-        // Phase 3: Process trigger/gate logic
+        // Phase 3: feed the TTL monitor and process the recording gate.
+        self.ttl_history.push_block(&block);
         let trigger_action = self.trigger.process_block(&block);
         match trigger_action {
             TriggerAction::StartRecording => {
@@ -733,6 +741,11 @@ impl KvApp {
     /// True when an LFP tile exists in the layout.
     fn lfp_tile_open(&self) -> bool {
         self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
+    }
+
+    /// True when an FFT spectrum tile exists in the layout.
+    fn fft_tile_open(&self) -> bool {
+        self.tile_has_pane(|kind| matches!(kind, TileKind::FftSpectrum))
     }
 
     /// True when the AP band must be computed: an AP tile or a spike-overlay
@@ -1560,6 +1573,18 @@ impl eframe::App for KvApp {
         // Advance snippet ages each frame (drives fade-out animation).
         self.snippet_store.advance_frames();
 
+        // Refresh the FFT spectrum once per frame while an FFT view is open, so
+        // the view is self-contained and no longer depends on the sidebar
+        // section being expanded/enabled (#4a).
+        if self.fft_tile_open() {
+            let sr = self
+                .latest_block
+                .as_ref()
+                .map(|b| b.sample_rate)
+                .unwrap_or(30000.0);
+            self.fft.update_from_ring(&self.disp_ring, sr);
+        }
+
         // Detect filter settings change (user toggled in UI) — re-filter
         // history once the settings have been stable for the debounce window,
         // so dragging a cutoff slider doesn't re-filter 10k blocks per frame.
@@ -2024,7 +2049,7 @@ impl eframe::App for KvApp {
 
                             ui.add_space(4.0);
                             egui::CollapsingHeader::new(
-                                egui::RichText::new("EXPORT FORMAT")
+                                egui::RichText::new("DATA FORMAT")
                                     .size(11.0)
                                     .strong()
                                     .color(theme::TEXT_SECONDARY),
@@ -2032,7 +2057,21 @@ impl eframe::App for KvApp {
                             .default_open(false)
                             .show(ui, |ui| {
                                 use kv_recorder::export_formats::ExportFormat;
-                                ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Recordings are saved in the native Keyvast .kvraw format. \
+                                         Optionally convert a recording to another format below.",
+                                    )
+                                    .size(9.0)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                ui.add_space(2.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.selectable_value(
+                                        &mut self.export_format,
+                                        ExportFormat::KeyvastNative,
+                                        egui::RichText::new("Keyvast .kvraw").size(10.0),
+                                    );
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::IntanRhd,
@@ -2052,30 +2091,43 @@ impl eframe::App for KvApp {
                                 );
                                 ui.add_space(2.0);
                                 let exporting = self.export_rx.is_some();
-                                if ui
-                                    .add_enabled(
-                                        !exporting,
-                                        egui::Button::new(
-                                            egui::RichText::new("Export .kvraw…").size(10.0),
-                                        ),
-                                    )
-                                    .on_hover_text("Convert a .kvraw recording to the selected format")
-                                    .clicked()
-                                    && let Some(path) = playback::pick_kvraw_file() {
-                                        self.start_export(path);
+                                if self.export_format.is_native() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Native format — recordings are already saved as .kvraw. \
+                                             Pick a third-party format above to convert.",
+                                        )
+                                        .size(9.0)
+                                        .color(theme::TEXT_DIM),
+                                    );
+                                } else {
+                                    if ui
+                                        .add_enabled(
+                                            !exporting,
+                                            egui::Button::new(
+                                                egui::RichText::new("Convert .kvraw…").size(10.0),
+                                            ),
+                                        )
+                                        .on_hover_text(
+                                            "Convert a .kvraw recording to the selected format",
+                                        )
+                                        .clicked()
+                                        && let Some(path) = playback::pick_kvraw_file() {
+                                            self.start_export(path);
+                                        }
+                                    if exporting {
+                                        ui.label(
+                                            egui::RichText::new("Converting…")
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
+                                    } else if let Some(ref status) = self.export_status {
+                                        ui.label(
+                                            egui::RichText::new(status)
+                                                .size(9.0)
+                                                .color(theme::TEXT_DIM),
+                                        );
                                     }
-                                if exporting {
-                                    ui.label(
-                                        egui::RichText::new("Exporting…")
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
-                                } else if let Some(ref status) = self.export_status {
-                                    ui.label(
-                                        egui::RichText::new(status)
-                                            .size(9.0)
-                                            .color(theme::TEXT_DIM),
-                                    );
                                 }
                             });
 
@@ -2115,13 +2167,7 @@ impl eframe::App for KvApp {
                             );
 
                             ui.add_space(4.0);
-                            fft_panel::draw_fft_section(
-                                ui,
-                                &mut self.fft,
-                                &self.disp_ring,
-                                sr,
-                                total_ch,
-                            );
+                            fft_panel::draw_fft_section(ui, &mut self.fft, sr, total_ch);
                         }
                         SidebarTab::Tools => {
                             let can_measure = self.device.kind == DeviceKind::Rhd
@@ -2233,7 +2279,9 @@ impl eframe::App for KvApp {
                                 &mut self.recording.file_prefix,
                                 &mut self.remote_api_state.port,
                             );
-                            self.ui_scale = cfg.ui_scale.clamp(0.8, 1.6);
+                            self.ui_scale = cfg
+                                .ui_scale
+                                .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
                             self.config_persist.status_message = Some("Loaded".to_string());
                             self.config_persist.loaded = true;
                             self.toasts.success("Configuration loaded");
@@ -2291,6 +2339,8 @@ impl eframe::App for KvApp {
                         block_history_len: self.block_history.len(),
                         snippet_store: &mut self.snippet_store,
                         fft: &self.fft,
+                        trigger: &self.trigger,
+                        ttl_history: &self.ttl_history,
                         pending_add: &mut pending_add,
                         empty_hint,
                     };
@@ -2305,6 +2355,7 @@ impl eframe::App for KvApp {
                         AddViewRequest::Ap => TileKind::new_ap(visible),
                         AddViewRequest::SpikeOverlay => TileKind::new_spike_overlay(),
                         AddViewRequest::Fft => TileKind::new_fft(),
+                        AddViewRequest::Ttl => TileKind::new_ttl_monitor(),
                     };
                     multiview::add_view_to_tree(&mut tree, kind);
                 }
@@ -2368,6 +2419,13 @@ fn export_kvraw(
 
     use kv_recorder::KvrawReader;
     use kv_recorder::export_formats::{self, ExportFormat, ExportHeader};
+
+    // Native format needs no conversion — just copy the .kvraw alongside.
+    if format.is_native() {
+        let output = source.with_extension("copy.kvraw");
+        std::fs::copy(source, &output).map_err(|e| e.to_string())?;
+        return Ok(output);
+    }
 
     let mut reader = KvrawReader::open(source).map_err(|e| e.to_string())?;
     let meta = reader.metadata().clone();
@@ -2434,6 +2492,8 @@ fn export_kvraw(
     });
 
     let result = match format {
+        // Native is short-circuited above before any frames are read.
+        ExportFormat::KeyvastNative => unreachable!("native format handled before frame read"),
         ExportFormat::IntanRhd => {
             let output = source.with_extension(format.extension());
             export_formats::export_intan_rhd_streaming(&output, header, blocks, &notes)

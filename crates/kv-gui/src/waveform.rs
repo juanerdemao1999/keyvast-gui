@@ -681,13 +681,25 @@ fn collect_from_ring(
         }
 
         // Read display-ready points from the ring using the PHYSICAL channel index.
-        let mut pts = ring.collect_channel(
-            phys_ch,
-            t_left_ms,
-            t_right_ms,
-            MAX_DISPLAY_POINTS,
-            window_ring_entries,
-        );
+        // Peak-hold rings (AP band) use the envelope variant so narrow spikes
+        // are not skipped by decimation (#4b).
+        let mut pts = if ring.peak_hold {
+            ring.collect_channel_minmax(
+                phys_ch,
+                t_left_ms,
+                t_right_ms,
+                MAX_DISPLAY_POINTS,
+                window_ring_entries,
+            )
+        } else {
+            ring.collect_channel(
+                phys_ch,
+                t_left_ms,
+                t_right_ms,
+                MAX_DISPLAY_POINTS,
+                window_ring_entries,
+            )
+        };
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
         let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {

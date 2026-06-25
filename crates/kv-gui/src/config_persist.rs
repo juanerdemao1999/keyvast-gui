@@ -15,6 +15,13 @@ use eframe::egui;
 use crate::panels::{DisplayMode, DisplaySettings, FilterSettings};
 use crate::theme;
 
+// ── UI scale bounds ─────────────────────────────────────────────────
+
+/// Minimum UI scale factor (`set_pixels_per_point`).
+pub const UI_SCALE_MIN: f32 = 0.8;
+/// Maximum UI scale factor — also the first-launch default.
+pub const UI_SCALE_MAX: f32 = 1.6;
+
 // ── Config data model ───────────────────────────────────────────────
 
 /// Subset of application settings that are persisted across sessions.
@@ -70,7 +77,7 @@ impl Default for PersistentConfig {
             output_dir: "recordings".to_string(),
             file_prefix: "session".to_string(),
             remote_port: 4444,
-            ui_scale: 1.0,
+            ui_scale: UI_SCALE_MAX,
             window_width: 1200.0,
             window_height: 800.0,
             last_source: "demo".to_string(),
@@ -373,12 +380,12 @@ pub fn draw_config_section(
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("UI scale").size(10.0));
             ui.add(
-                egui::Slider::new(ui_scale, 0.8..=1.6)
+                egui::Slider::new(ui_scale, UI_SCALE_MIN..=UI_SCALE_MAX)
                     .step_by(0.05)
                     .fixed_decimals(2),
             );
             if ui.button(egui::RichText::new("Reset").size(10.0)).clicked() {
-                *ui_scale = 1.0;
+                *ui_scale = UI_SCALE_MAX;
             }
         });
 

@@ -547,7 +547,7 @@ Resources/intan_rec_controller_7310.bit
 
 ```text
 Opal Kelly board: XEM7310-A75
-Keyvast bitfile to use: D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit
+Keyvast bitfile to use: keyvast_260607_with_UART.bit
 Windows package should bundle the FrontPanel runtime DLL where possible
 First live acquisition target: up to two 32-channel RHD headstages
 Display scaling should follow Open Ephys / Intan RHD conventions
@@ -566,7 +566,7 @@ Display scaling should follow Open Ephys / Intan RHD conventions
 Add a real hardware backend crate such as `kv-driver` or `kv-rhd` that implements the existing `kv-core::AcquisitionSource` contract and returns `SampleBlock`. Start with a CLI smoke command before wiring the GUI:
 
 ```text
-kv-acq rhd-smoke --bitfile D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit --blocks 10
+kv-acq rhd-smoke --bitfile keyvast_260607_with_UART.bit --blocks 10
 ```
 
 The smoke command should open the first XEM7310-A75, upload the bitfile, verify FrontPanel + board id, initialize Rhythm, enable streams for the first two 32-channel headstages, read from BTPipeOut `0xA0`, validate magic/timestamps, and write existing `kvraw` output.
@@ -971,7 +971,7 @@ Implemented first RHD hardware integration layer:
 
 - New CLI command:
   - `kv-acq rhd-smoke`
-  - Hardware mode: downloads `D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit` by default and reads Rhythm USB blocks.
+  - Hardware mode: downloads `keyvast_260607_with_UART.bit` by default and reads Rhythm USB blocks.
   - Offline mode: `kv-acq rhd-smoke --raw-input capture.bin` parses raw Rhythm USB bytes and writes normal `recording.kvraw`, `integrity.json`, `events.csv`, `log.txt`, and `benchmark.json`.
 
 - Build/network follow-up:

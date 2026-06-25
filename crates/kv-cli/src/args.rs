@@ -318,7 +318,7 @@ pub(crate) fn default_rhd_bitfile_path() -> PathBuf {
         .join("..")
         .join("..")
         .join("..")
-        .join("keyvast_260607_with_UART.bit")
+        .join(kv_rhd::DEFAULT_RHD_BITFILE_NAME)
 }
 
 pub(crate) fn parse_benchmark_preset(name: &str) -> Result<BenchmarkPreset, CliError> {

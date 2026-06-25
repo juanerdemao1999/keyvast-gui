@@ -28,6 +28,25 @@ pub const RHD_AUX_ADC_VOLTS_PER_COUNT: f64 = 0.0000374;
 /// Default device-ID string for Opal Kelly XEM7310 + Rhythm FPGA.
 pub const DEFAULT_RHD_DEVICE_ID: &str = "rhd-xem7310";
 
+/// Canonical, ordered list of FPGA bitfile names this backend can drive,
+/// most-preferred first. Single source of truth shared by the CLI default
+/// and the GUI's best-effort bitfile picker so the three components no longer
+/// disagree on which bitstreams exist.
+///
+/// On the KeyVast PCB the 8 RHD SPI buses are re-routed through the module-IO
+/// ring, so only a KeyVast bitstream (`keyvast_*`) reaches the headstage; the
+/// stock Intan build is kept as a last-resort fallback for a genuine Intan
+/// recording controller.
+pub const RHD_BITFILE_CANDIDATES: [&str; 3] = [
+    "keyvast_combined_download.bit",
+    DEFAULT_RHD_BITFILE_NAME,
+    "intan_rec_controller_7310.bit",
+];
+
+/// Default bitfile name used by the headless CLI smoke test (the UART-enabled
+/// KeyVast build). Also the second GUI candidate via [`RHD_BITFILE_CANDIDATES`].
+pub const DEFAULT_RHD_BITFILE_NAME: &str = "keyvast_260607_with_UART.bit";
+
 /// Default SPI cable length in meters (3 ft ≈ 0.9144 m).
 pub const DEFAULT_CABLE_LENGTH_METERS: f64 = 0.9144;
 

@@ -32,7 +32,9 @@ Future connector: USB Type-C
 Future transport: USB-based data transfer
 First hardware module: Opal Kelly XEM7310-A75
 First hardware protocol: Opal Kelly FrontPanel / Intan Rhythm USB3-style endpoints
-First hardware bit file: D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit
+First hardware bit file: keyvast_260607_with_UART.bit (provide the path at runtime via --bitfile / the GUI picker)
+  Canonical candidate order lives in code: kv_rhd::RHD_BITFILE_CANDIDATES
+  [keyvast_combined_download.bit, keyvast_260607_with_UART.bit, intan_rec_controller_7310.bit]
 Host program should bundle the required FrontPanel runtime DLL for convenience
 First live hardware channel target: up to two 32-channel RHD headstages
 Register map: use Rhythm USB3 / FrontPanel endpoints unless the Keyvast bitfile changes them

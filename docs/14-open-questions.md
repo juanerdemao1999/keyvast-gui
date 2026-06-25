@@ -306,7 +306,7 @@ Needed for first hardware bring-up, but keep behind a hardware backend.
 Known for first hardware bring-up:
 
 ```text
-Use the Keyvast bitfile D:\11111\1case\104_keyvast_gui\keyvast_260607_with_UART.bit.
+Use a Keyvast bitfile (default keyvast_260607_with_UART.bit; see kv_rhd::RHD_BITFILE_CANDIDATES). Pass the path at runtime via --bitfile or the GUI picker.
 The FPGA design currently embeds an Intan Rhythm USB3-style data plane.
 Expected FrontPanel data endpoint is BTPipeOut 0xA0.
 Expected frame magic is 0xd7a22aaa38132a53.

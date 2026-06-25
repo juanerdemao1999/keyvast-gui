@@ -26,9 +26,13 @@ kvlog.txt
 *.bit
 
 # Python scratch / diagnostics
+# These local-only scripts embed machine-specific paths (usernames, desktop
+# dirs) and have ad-hoc numpy/scipy/matplotlib deps — keep them out of the repo.
 __pycache__/
 *.pyc
 diag*.png
+diag_*.py
+compare_kvraw_vs_oe.py
 
 # OS noise
 Thumbs.db

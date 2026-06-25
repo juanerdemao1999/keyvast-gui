@@ -156,11 +156,14 @@ pub struct SimulatorStreamResult {
     pub max_write_latency_us: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RhdSmokeOptions {
     pub output_dir: PathBuf,
     pub blocks: usize,
     pub enabled_streams: usize,
+    /// Hardware sample rate to program into the RHD/FPGA PLL. Must be one of the
+    /// Rhythm-supported rates; the recorded sample_rate reflects this value.
+    pub sample_rate: f64,
     pub raw_input: Option<PathBuf>,
     pub bitfile_path: PathBuf,
     pub frontpanel_dll_path: Option<PathBuf>,

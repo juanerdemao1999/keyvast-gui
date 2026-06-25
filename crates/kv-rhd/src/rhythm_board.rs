@@ -9,8 +9,7 @@ use crate::commands::{AuxCommandSlot, BoardPort, RHD_ADC_CALIBRATION_SAMPLES, Rh
 use crate::frame_analysis::{amplifier_mean_raw_word, aux_command_trigger_bit};
 use crate::frontpanel::FrontPanelDevice;
 use crate::protocol::{
-    CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, MAX_SUPPORTED_STREAMS, RHYTHM_BOARD_ID,
-    RhdChipType, USB3_BLOCK_SIZE_BYTES,
+    CHANNELS_PER_STREAM, MAX_SUPPORTED_STREAMS, RHYTHM_BOARD_ID, RhdChipType, USB3_BLOCK_SIZE_BYTES,
 };
 
 pub(crate) const WIRE_IN_RESET_RUN: i32 = 0x00;
@@ -82,6 +81,7 @@ impl RhythmFrontPanelBoard {
         bitfile_path: &Path,
         enabled_streams: usize,
         cable_length_meters: f64,
+        sample_rate: f64,
     ) -> Result<(Self, usize), RhdReadError> {
         device
             .configure_fpga(bitfile_path)
@@ -111,18 +111,23 @@ impl RhythmFrontPanelBoard {
             board_version,
         };
         board.reset_board()?;
-        board.set_sample_rate_30khz()?;
+        // Program the requested rate (not a hardcoded 30 kHz) and reject rates
+        // the PLL table cannot hit, so the recorded sample_rate always matches
+        // what the hardware actually runs (DA9).
+        if !board.set_sample_rate(sample_rate)? {
+            return Err(RhdReadError::UnsupportedSampleRate { sample_rate });
+        }
         board.set_dsp_settle(false)?;
         board.reset_board_analog_state()?;
-        board.set_cable_length_meters(0, cable_length_meters)?;
+        board.set_cable_length_meters(0, cable_length_meters, sample_rate)?;
         if enabled_streams > 1 {
-            board.set_cable_length_meters(1, cable_length_meters)?;
+            board.set_cable_length_meters(1, cable_length_meters, sample_rate)?;
         }
         board.enable_streams(enabled_streams)?;
         board.set_default_data_sources()?;
         board.clear_ttl_out()?;
         log::info!("data plane configured; initializing RHD chips (ADC calibration)...");
-        let detected_streams = board.initialize_rhd_chips(enabled_streams)?;
+        let detected_streams = board.initialize_rhd_chips(enabled_streams, sample_rate)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
         board.flush_fifo()?;
@@ -274,10 +279,6 @@ impl RhythmFrontPanelBoard {
         Ok(true)
     }
 
-    pub(crate) fn set_sample_rate_30khz(&self) -> Result<bool, RhdReadError> {
-        self.set_sample_rate(30000.0)
-    }
-
     pub(crate) fn set_max_time_step(&self, max_time_step: u32) -> Result<(), RhdReadError> {
         self.device
             .set_wire_in_value(WIRE_IN_MAX_TIME_STEP, max_time_step, u32::MAX)
@@ -376,8 +377,12 @@ impl RhythmFrontPanelBoard {
     pub(crate) fn initialize_rhd_chips(
         &self,
         enabled_streams: usize,
+        sample_rate: f64,
     ) -> Result<usize, RhdReadError> {
-        let mut registers = Rhd2000Registers::open_ephys_default();
+        // MUX/ADC bias and DSP cutoff scale with the sample rate, so build the
+        // register set from the rate actually programmed above rather than a
+        // fixed 30 kHz default (DA9).
+        let mut registers = Rhd2000Registers::new(sample_rate);
         registers.set_dig_out_low();
 
         let dig_out = registers
@@ -609,6 +614,7 @@ impl RhythmFrontPanelBoard {
         &self,
         port_index: usize,
         length_meters: f64,
+        sample_rate: f64,
     ) -> Result<(), RhdReadError> {
         let speed_of_light = 299_792_458.0_f64;
         let xilinx_lvds_output_delay = 1.9e-9_f64;
@@ -616,7 +622,10 @@ impl RhythmFrontPanelBoard {
         let rhd2000_delay = 9.0e-9_f64;
         let miso_settle_time = 6.7e-9_f64;
 
-        let t_step = 1.0 / (2800.0 * DEFAULT_RHD_SAMPLE_RATE);
+        // MISO timing scales with the per-channel SPI clock, which tracks the
+        // actual sample rate; using a fixed 30 kHz constant mis-times the MISO
+        // delay at any other rate (DA40).
+        let t_step = 1.0 / (2800.0 * sample_rate);
         let cable_velocity = 0.555 * speed_of_light;
         let distance = 2.0 * length_meters;
         let time_delay = distance / cable_velocity

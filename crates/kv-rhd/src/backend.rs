@@ -70,6 +70,7 @@ impl RhdHardwareBackend {
             &options.bitfile_path,
             options.data.enabled_streams,
             options.cable_length_meters,
+            options.data.sample_rate,
         )?;
 
         let mut config = options.data;
@@ -154,6 +155,7 @@ pub enum RhdReadError {
     FrontPanel(FrontPanelError),
     Parse(RhythmParseError),
     UnexpectedBoardId { expected: u32, observed: u32 },
+    UnsupportedSampleRate { sample_rate: f64 },
     InvalidPort { port_index: usize },
     NotEnoughFifoWords { needed: u32, available: u32 },
     ShortPipeRead { expected: usize, observed: usize },
@@ -176,6 +178,11 @@ impl fmt::Display for RhdReadError {
             Self::UnexpectedBoardId { expected, observed } => write!(
                 formatter,
                 "unexpected Rhythm board id: expected {expected}, observed {observed}"
+            ),
+            Self::UnsupportedSampleRate { sample_rate } => write!(
+                formatter,
+                "unsupported RHD sample rate {sample_rate} Hz: not in the Rhythm PLL table \
+                 (supported: 1000-30000 Hz in the Intan/Open Ephys step set)"
             ),
             Self::InvalidPort { port_index } => {
                 write!(formatter, "invalid Rhythm SPI port index {port_index}")
@@ -219,6 +226,7 @@ impl std::error::Error for RhdReadError {
             Self::FrontPanel(error) => Some(error),
             Self::Parse(error) => Some(error),
             Self::UnexpectedBoardId { .. }
+            | Self::UnsupportedSampleRate { .. }
             | Self::InvalidPort { .. }
             | Self::NotEnoughFifoWords { .. }
             | Self::ShortPipeRead { .. }

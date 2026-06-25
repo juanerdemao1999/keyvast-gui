@@ -497,13 +497,16 @@ mod tests {
         else {
             panic!("expected BackendRead error");
         };
-        assert_eq!(blocks.len(), 3, "blocks before the failure must be retained");
+        assert_eq!(
+            blocks.len(),
+            3,
+            "blocks before the failure must be retained"
+        );
 
         persist_partial_simulator_recording(&output_dir, &blocks, &summary)
             .expect("partial recording should be finalized");
 
-        let expected_bytes =
-            (3 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64 * 2;
+        let expected_bytes = (3 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64 * 2;
         assert_eq!(
             fs::metadata(output_dir.join("recording.kvraw"))
                 .expect("partial raw recording should exist")

@@ -80,6 +80,10 @@ pub enum RecorderEvent {
     /// Periodic buffer health report (sent ~5/s while running).
     /// `occupancy` is 0.0..=1.0 (buffered / capacity).
     BufferStatus { occupancy: f64 },
+    /// A consumer queue overflowed and the oldest block(s) were dropped.
+    /// `dropped_blocks` is the cumulative count across all consumers and
+    /// `occupancy` is the worst-case fill level at the time of the drop.
+    BufferOverflow { dropped_blocks: u64, occupancy: f64 },
     /// The acquisition source (simulator or hardware) failed to open or to
     /// produce a block. Carries a human-readable message for the GUI banner.
     /// The producer thread has stopped by the time this is sent.
@@ -265,19 +269,23 @@ fn producer_loop(
                 // Push original into shared fanout (recorder gets its slot)
                 // and notify the recorder thread via condvar.
                 {
-                    if let Some(overflow) = shared
+                    let overflow = shared
                         .0
                         .lock()
                         .expect("buffer lock poisoned")
-                        .push_arc(block)
-                    {
+                        .push_arc(block);
+                    shared.1.notify_one();
+                    if let Some(overflow) = overflow {
                         log::warn!(
                             "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
                             overflow.dropped_blocks,
                             overflow.buffer_occupancy * 100.0
                         );
+                        let _ = event_tx.send(RecorderEvent::BufferOverflow {
+                            dropped_blocks: overflow.dropped_blocks,
+                            occupancy: overflow.buffer_occupancy,
+                        });
                     }
-                    shared.1.notify_one();
                 }
             }
             Err(message) => {

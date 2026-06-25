@@ -166,6 +166,8 @@ pub struct KvApp {
     recording_start_time: Option<Instant>,
     /// Recorder buffer fill level (0.0 = empty, 1.0 = full), updated ~5/s.
     recorder_buffer_occupancy: f64,
+    /// Cumulative blocks dropped by fanout-buffer overflow this session.
+    recorder_dropped_blocks: u64,
     /// Latest error from the recorder thread (None = no error / dismissed).
     recording_error: Option<String>,
     theme_applied: bool,
@@ -275,6 +277,7 @@ impl KvApp {
             active_recorder: None,
             recording_start_time: None,
             recorder_buffer_occupancy: 0.0,
+            recorder_dropped_blocks: 0,
             recording_error: None,
             theme_applied: false,
             display_paused: false,
@@ -396,6 +399,7 @@ impl KvApp {
         match self.build_pipeline_source() {
             Ok(source) => {
                 self.device_error = None;
+                self.recorder_dropped_blocks = 0;
                 self.live_pipeline = Some(live_pipeline::start_live_pipeline(source));
             }
             Err(message) => {
@@ -1285,6 +1289,13 @@ impl KvApp {
                 RecorderEvent::BufferStatus { occupancy } => {
                     self.recorder_buffer_occupancy = occupancy;
                 }
+                RecorderEvent::BufferOverflow {
+                    dropped_blocks,
+                    occupancy,
+                } => {
+                    self.recorder_dropped_blocks = dropped_blocks;
+                    self.recorder_buffer_occupancy = occupancy;
+                }
                 RecorderEvent::SourceError(e) => {
                     // The producer (device) thread has stopped. Surface the
                     // error and tear down the pipeline so the UI shows
@@ -1311,14 +1322,21 @@ impl KvApp {
             let mut responses: Vec<RemoteResponse> = Vec::new();
             for (id, cmd) in remote_cmds {
                 let result = self.handle_remote_command(&cmd);
-                responses.push(RemoteResponse { id, result });
+                responses.push(RemoteResponse::new(id, result));
             }
             if let Some(ref handle) = self.remote_api_handle {
                 let mut resp_q = remote_api::lock_recover(&handle.responses);
                 for r in responses {
-                    resp_q.push_back(r);
+                    remote_api::push_response_capped(&mut resp_q, r);
                 }
             }
+        }
+
+        // Sweep orphaned responses whose client already timed out, so the
+        // response queue cannot grow without bound if clients disconnect.
+        if let Some(ref handle) = self.remote_api_handle {
+            let mut resp_q = remote_api::lock_recover(&handle.responses);
+            remote_api::sweep_stale_responses(&mut resp_q, Instant::now());
         }
 
         // ── Ingest all preview blocks ─────────────────────────────────────────
@@ -2040,6 +2058,7 @@ impl eframe::App for KvApp {
                                 self.latest_block.as_ref(),
                                 rec_elapsed_secs,
                                 self.recorder_buffer_occupancy,
+                                self.recorder_dropped_blocks,
                                 self.recording_error.as_deref(),
                                 &mut dismiss_error,
                             );

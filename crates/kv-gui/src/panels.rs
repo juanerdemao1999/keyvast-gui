@@ -325,6 +325,8 @@ pub fn draw_acquire_core(
     rec_elapsed_secs: Option<f64>,
     // Recorder buffer fill level 0.0..=1.0 (from live pipeline).
     buffer_occupancy: f64,
+    // Cumulative blocks dropped by fanout-buffer overflow this session.
+    dropped_blocks: u64,
     // Last recorder error message, if any.
     recording_error: Option<&str>,
     // Set to true by the panel when the user clicks "dismiss error".
@@ -342,6 +344,7 @@ pub fn draw_acquire_core(
         toggle_rec,
         rec_elapsed_secs,
         buffer_occupancy,
+        dropped_blocks,
         recording_error,
         dismiss_error,
         block,
@@ -775,6 +778,7 @@ fn draw_recording_section(
     toggle_rec: &mut bool,
     rec_elapsed_secs: Option<f64>,
     buffer_occupancy: f64,
+    dropped_blocks: u64,
     recording_error: Option<&str>,
     dismiss_error: &mut bool,
     block: Option<&SampleBlock>,
@@ -973,6 +977,13 @@ fn draw_recording_section(
             if buffer_occupancy > 0.75 {
                 ui.label(
                     egui::RichText::new("⚠ Disk may be too slow")
+                        .size(9.0)
+                        .color(theme::ACCENT_RED),
+                );
+            }
+            if dropped_blocks > 0 {
+                ui.label(
+                    egui::RichText::new(format!("⚠ Dropped {dropped_blocks} blocks"))
                         .size(9.0)
                         .color(theme::ACCENT_RED),
                 );

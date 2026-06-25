@@ -90,3 +90,30 @@ crates/kv-gui
 This lets each part stay small, while still building as one project.
 
 The folder can stay named `51_keyvast_gui`. Rust crate names should use normal package names such as `kv-types`, `kv-core`, and `kv-cli`.
+
+## Spike badge counts are zoom-independent (DA37)
+
+The waveform spike-count badge ran detection on the points returned by
+`ring.collect_channel`, which are decimated **twice**: once by `RING_DWNSP`
+(=4) at ingestion and again by the render-time `stride2 = window / max_points`.
+On a wide window (e.g. 60 s) each display point spans hundreds of raw samples, so
+a ~1 ms spike lands between points and the refractory was computed from
+`sample_rate / RING_DWNSP`, ignoring stride2 entirely. The result: the count
+changed with the **zoom level** rather than the firing rate, and the sigma was
+derived from decimated (often LFP-dominated) data — so an operator using the
+badge for activity confirmation or probe localization could read a false
+"silent here" or a phantom rate.
+
+Detection moved into a pure `detect_spikes(pts, window_secs, sigma_mult)` that
+derives its sample rate from the **actual** point density
+(`pts.len() / window_secs`), i.e. after both decimation stages. The 1 ms
+refractory is therefore expressed in true milliseconds regardless of zoom, and
+when the effective rate falls below `SPIKE_MIN_DETECT_HZ` (1000 Hz, ≈1 point per
+millisecond) the function returns `None` and the badge is **suppressed** instead
+of reporting an aliased number. The `sample_rate` argument to `collect_from_ring`
+is now unused and was removed.
+
+This is the pragmatic half of the audit's fix (gate the badge to resolvable
+windows + make the detection rate explicit). A dedicated minimally-decimated
+AP-band / snippet stream for sorting-grade detection at any zoom remains future
+work; the display ring is a render structure, not a spike-sorting source.

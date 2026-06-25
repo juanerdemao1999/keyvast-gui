@@ -19,7 +19,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::disp_ring::{DisplayRing, RING_DWNSP};
+use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
@@ -36,6 +36,12 @@ const MAX_DISPLAY_POINTS: usize = 2000;
 
 /// Default vertical spacing (in normalized units) between channel baselines.
 pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
+
+/// Minimum *effective* sample rate (after RING_DWNSP + render stride2) at which
+/// the spike-count badge is trusted. Below this the display points are too
+/// sparse to resolve a ~1 ms spike, so the count would alias and drift with the
+/// zoom level — the badge is suppressed instead of showing a wrong number (DA37).
+const SPIKE_MIN_DETECT_HZ: f64 = 1000.0;
 
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
@@ -139,16 +145,7 @@ pub fn draw_waveform_area(
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
     let traces = collect_from_ring(
-        ring,
-        settings,
-        filters,
-        start_ch,
-        visible,
-        block.sample_rate,
-        x_left,
-        x_right,
-        gain,
-        ch_spacing,
+        ring, settings, filters, start_ch, visible, x_left, x_right, gain, ch_spacing,
     );
 
     // Y axis bounds
@@ -657,7 +654,6 @@ fn collect_from_ring(
     filters: &FilterSettings,
     start_ch: usize,
     visible: usize,
-    sample_rate: f64,
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
@@ -702,29 +698,16 @@ fn collect_from_ring(
         };
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
-        let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
-            let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-            let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
-            let sig = var.sqrt();
-            let thresh = -filters.spike_threshold_sigma * sig;
-            let ring_sr = sample_rate / RING_DWNSP as f64;
-            let refractory = (ring_sr * 0.001).max(1.0) as usize;
-            let mut count = 0u32;
-            let mut last_cross: Option<usize> = None;
-            let mut prev = 0.0_f64;
-            for (i, p) in pts.iter().enumerate() {
-                let centered = p[1] - mean;
-                if i > 0
-                    && prev >= thresh
-                    && centered < thresh
-                    && last_cross.is_none_or(|l| i - l >= refractory)
-                {
-                    count = count.saturating_add(1);
-                    last_cross = Some(i);
-                }
-                prev = centered;
+        // The refractory window and a resolvability gate are derived from the
+        // *effective* sample rate of `pts` (after RING_DWNSP and the render-time
+        // stride2), so counts no longer drift with the zoom level and a coarse
+        // window suppresses the badge instead of reporting aliased garbage (DA37).
+        let window_secs = (t_right_ms - t_left_ms) / 1000.0;
+        let (sigma, spike_count) = if filters.spike_threshold_enabled {
+            match detect_spikes(&pts, window_secs, filters.spike_threshold_sigma) {
+                Some((sig, count)) => (Some(sig), count),
+                None => (None, 0),
             }
-            (Some(sig), count)
         } else {
             (None, 0)
         };
@@ -740,6 +723,50 @@ fn collect_from_ring(
         });
     }
     traces
+}
+
+/// Negative-going threshold spike detection on the decimated display points.
+///
+/// Returns `(sigma, count)` or `None` when the points are too coarse to
+/// resolve spikes. The effective sample rate is derived from the *actual*
+/// point density (`pts.len() / window_secs`) — i.e. after both `RING_DWNSP`
+/// and the render-time stride2 — so the refractory window is expressed in true
+/// milliseconds and the count no longer changes with the zoom level. When the
+/// effective rate falls below `SPIKE_MIN_DETECT_HZ` the badge is suppressed
+/// rather than reporting an aliased number (DA37).
+fn detect_spikes(pts: &[[f64; 2]], window_secs: f64, sigma_mult: f64) -> Option<(f64, u32)> {
+    if pts.len() < 2 || window_secs <= 0.0 {
+        return None;
+    }
+    let det_sr = pts.len() as f64 / window_secs;
+    if det_sr < SPIKE_MIN_DETECT_HZ {
+        return None;
+    }
+
+    let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
+    let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
+    let sig = var.sqrt();
+    let thresh = -sigma_mult * sig;
+
+    // 1 ms refractory expressed in *display points* at the effective rate.
+    let refractory = (det_sr * 0.001).round().max(1.0) as usize;
+
+    let mut count = 0u32;
+    let mut last_cross: Option<usize> = None;
+    let mut prev = 0.0_f64;
+    for (i, p) in pts.iter().enumerate() {
+        let centered = p[1] - mean;
+        if i > 0
+            && prev >= thresh
+            && centered < thresh
+            && last_cross.is_none_or(|l| i - l >= refractory)
+        {
+            count = count.saturating_add(1);
+            last_cross = Some(i);
+        }
+        prev = centered;
+    }
+    Some((sig, count))
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
@@ -776,4 +803,66 @@ fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build `[time, value]` points from raw values (time is unused by detection).
+    fn pts(values: &[f64]) -> Vec<[f64; 2]> {
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| [i as f64, v])
+            .collect()
+    }
+
+    #[test]
+    fn detect_spikes_suppressed_when_window_too_coarse() {
+        // 100 points over a 60 s window => ~1.7 Hz effective rate, far below the
+        // resolvability floor: the badge must be suppressed, not aliased (DA37).
+        let mut v = vec![0.0; 100];
+        v[50] = -10.0; // a clear dip that would cross any threshold
+        assert_eq!(detect_spikes(&pts(&v), 60.0, 4.0), None);
+    }
+
+    #[test]
+    fn detect_spikes_counts_when_resolvable() {
+        // 1000 points over 0.1 s => 10 kHz effective rate (well resolved).
+        // Three well-separated negative dips below -4 sigma.
+        let mut v = vec![0.0; 1000];
+        for &i in &[100usize, 400, 700] {
+            v[i] = -20.0;
+        }
+        let (sigma, count) = detect_spikes(&pts(&v), 0.1, 4.0).expect("resolvable");
+        assert!(sigma > 0.0);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn detect_spikes_refractory_merges_adjacent_dips() {
+        // Two dips one point apart fall inside the 1 ms refractory (10 points at
+        // 10 kHz) and count once, not twice.
+        let mut v = vec![0.0; 1000];
+        v[500] = -20.0;
+        v[501] = -20.0;
+        let (_, count) = detect_spikes(&pts(&v), 0.1, 4.0).expect("resolvable");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn detect_spikes_count_is_zoom_independent() {
+        // Same physical 3-spike signal sampled into the same number of display
+        // points yields the same count whether the window is 0.1 s or 0.5 s, as
+        // long as both stay above the resolvability floor (DA37: count tracks
+        // firing rate, not zoom).
+        let mut v = vec![0.0; 1000];
+        for &i in &[100usize, 400, 700] {
+            v[i] = -20.0;
+        }
+        let a = detect_spikes(&pts(&v), 0.1, 4.0).unwrap().1;
+        let b = detect_spikes(&pts(&v), 0.5, 4.0).unwrap().1;
+        assert_eq!(a, b);
+    }
 }

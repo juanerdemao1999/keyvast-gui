@@ -2434,4 +2434,87 @@ fn export_kvraw(
     result.map_err(|e| e.to_string())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panels::FilterSettings;
+    use kv_types::SampleBlock;
+
+    fn block_interleaved(
+        channel_count: usize,
+        samples_per_channel: usize,
+        data: Vec<i16>,
+    ) -> SampleBlock {
+        assert_eq!(data.len(), channel_count * samples_per_channel);
+        SampleBlock {
+            device_id: "test".to_string(),
+            stream_id: 0,
+            packet_id: 0,
+            timestamp_start: 0,
+            sample_rate: 30_000.0,
+            channel_count,
+            samples_per_channel,
+            ttl_bits: 0,
+            data,
+            aux_data: None,
+            board_adc_data: None,
+            ttl_in_per_sample: None,
+            ttl_out_per_sample: None,
+        }
+    }
+
+    #[test]
+    fn build_filter_chains_sets_one_passthrough_chain_per_channel_when_disabled() {
+        let filters = FilterSettings::default();
+        let chains = KvApp::build_filter_chains(&filters, 30_000.0, 4);
+        assert_eq!(chains.len(), 4);
+        for chain in &chains {
+            assert!(!chain.hp_enabled);
+            assert!(!chain.lp_enabled);
+            assert!(!chain.notch_enabled);
+        }
+    }
+
+    #[test]
+    fn build_filter_chains_enables_requested_stages() {
+        let filters = FilterSettings {
+            hp_enabled: true,
+            hp_cutoff_hz: 300.0,
+            lp_enabled: true,
+            lp_cutoff_hz: 5_000.0,
+            notch_enabled: true,
+            ..FilterSettings::default()
+        };
+        let chains = KvApp::build_filter_chains(&filters, 30_000.0, 2);
+        assert_eq!(chains.len(), 2);
+        for chain in &chains {
+            assert!(chain.hp_enabled);
+            assert!(chain.lp_enabled);
+            assert!(chain.notch_enabled);
+        }
+    }
+
+    #[test]
+    fn filter_block_with_chains_is_identity_when_car_off_and_chains_passthrough() {
+        // 2 channels, 2 samples, interleaved by sample: [s0c0, s0c1, s1c0, s1c1].
+        let block = block_interleaved(2, 2, vec![100, -200, 300, -400]);
+        let mut chains = vec![FilterChain::passthrough(); 2];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, false);
+        assert_eq!(out.data, block.data);
+    }
+
+    #[test]
+    fn filter_block_with_chains_subtracts_common_average_when_car_on() {
+        // Per time step the mean across channels is removed.
+        // s0 = [10, 20] -> mean 15 -> [-5, 5]; s1 = [30, 50] -> mean 40 -> [-10, 10].
+        let block = block_interleaved(2, 2, vec![10, 20, 30, 50]);
+        let mut chains = vec![FilterChain::passthrough(); 2];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, true);
+        assert_eq!(out.data, vec![-5, 5, -10, 10]);
+        // Metadata is preserved; only the samples change.
+        assert_eq!(out.channel_count, block.channel_count);
+        assert_eq!(out.samples_per_channel, block.samples_per_channel);
+    }
+}
+
 // Overlay helpers are now handled inside multiview::KvTileBehavior::draw_main_waveform().

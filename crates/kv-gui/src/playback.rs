@@ -442,4 +442,57 @@ mod tests {
         pb.seek_to(9_999);
         assert_eq!(pb.cursor_frame, (2 * SPC) as u64);
     }
+
+    #[test]
+    fn tick_returns_none_without_a_loaded_file() {
+        // L45: with no reader/metadata the cursor cannot advance and no block
+        // can be read, so a tick is a no-op even if the state is forced.
+        let mut pb = PlaybackManager::default();
+        assert!(!pb.is_loaded());
+        assert_eq!(pb.state, PlaybackState::Idle);
+        assert!(pb.tick().is_none());
+
+        // play() only takes effect with a reader, so the state stays Idle and
+        // tick keeps returning None.
+        pb.play();
+        assert_eq!(pb.state, PlaybackState::Idle);
+        assert!(pb.tick().is_none());
+    }
+
+    #[test]
+    fn playing_tick_auto_pauses_at_end_of_file() {
+        // L45: once the cursor reaches the final frame a playing tick clamps to
+        // total_frames and flips the state back to Paused.
+        let path = write_recording("autopause");
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        let total = pb.total_frames();
+        assert_eq!(total, (2 * SPC) as u64);
+
+        pb.seek_to(total);
+        pb.play();
+        assert_eq!(pb.state, PlaybackState::Playing);
+
+        let _ = pb.tick();
+        assert_eq!(pb.cursor_frame, total);
+        assert_eq!(pb.state, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn toggle_play_pause_is_a_no_op_until_a_file_loads() {
+        // L51: the transport state machine ignores toggles while Idle, then
+        // alternates Playing/Paused once a recording is loaded.
+        let mut pb = PlaybackManager::default();
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Idle);
+
+        let path = write_recording("toggle");
+        pb.load_file(path);
+        assert_eq!(pb.state, PlaybackState::Paused);
+
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Playing);
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Paused);
+    }
 }

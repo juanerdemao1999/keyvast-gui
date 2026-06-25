@@ -436,4 +436,89 @@ mod tests {
             "unpaced run should not block on real-time cadence"
         );
     }
+
+    fn backend_with_ttl(ttl_enabled: bool, ttl_line_count: usize) -> SimulatorBackend {
+        let mut device = DeviceConfig::simulator_default();
+        device.ttl_enabled = ttl_enabled;
+        device.ttl_line_count = ttl_line_count;
+        SimulatorBackend::new(SimulatorConfig {
+            device,
+            ..SimulatorConfig::default()
+        })
+        .expect("ttl config is valid")
+    }
+
+    #[test]
+    fn ttl_line_mask_covers_boundary_line_counts() {
+        // L15/L16: a zero line count or disabled TTL collapses to no mask, a
+        // partial width fills the low bits, and a full 32-line bank saturates
+        // without shifting past the u32 width.
+        assert_eq!(backend_with_ttl(true, 0).ttl_line_mask(), 0);
+        assert_eq!(backend_with_ttl(false, 8).ttl_line_mask(), 0);
+        assert_eq!(backend_with_ttl(true, 1).ttl_line_mask(), 0b1);
+        assert_eq!(backend_with_ttl(true, 8).ttl_line_mask(), 0xff);
+        assert_eq!(
+            backend_with_ttl(true, 31).ttl_line_mask(),
+            (1_u32 << 31) - 1
+        );
+        assert_eq!(backend_with_ttl(true, 32).ttl_line_mask(), u32::MAX);
+    }
+
+    #[test]
+    fn ttl_in_per_sample_is_none_when_disabled_and_masked_when_enabled() {
+        // L15/L16: disabling TTL drops the per-sample words entirely, while an
+        // enabled bank yields one word per sample, each confined to the mask.
+        assert!(backend_with_ttl(false, 8).ttl_in_per_sample(0).is_none());
+        assert!(backend_with_ttl(true, 0).ttl_in_per_sample(0).is_none());
+
+        let backend = backend_with_ttl(true, 4);
+        let spp = backend.config.device.samples_per_packet;
+        let words = backend
+            .ttl_in_per_sample(123)
+            .expect("enabled TTL yields per-sample words");
+        assert_eq!(words.len(), spp);
+        for word in words {
+            assert_eq!(word & !0xf, 0, "word {word:#x} escaped the 4-line mask");
+        }
+    }
+
+    #[test]
+    fn samples_for_packet_saturates_large_timestamps_without_panicking() {
+        // L15/L16: a near-overflow packet must still produce a full block; the
+        // sample index uses saturating arithmetic instead of wrapping/panicking.
+        let backend = SimulatorBackend::default();
+        let expected =
+            backend.config.device.channel_count * backend.config.device.samples_per_packet;
+        let data = backend.samples_for_packet(u64::MAX, u64::MAX - 1);
+        assert_eq!(data.len(), expected);
+    }
+
+    #[test]
+    fn spike_component_emits_biphasic_template_within_value_set() {
+        // L15/L16: every spike sample is drawn from the fixed biphasic template,
+        // and each firing emits the -180/260/-80 sequence on consecutive samples.
+        let sample_rate = 8_000.0;
+        let mut fired = 0;
+        let mut index = 0u64;
+        while index < 200_000 {
+            let value = spike_component(DEFAULT_SIMULATOR_SEED, index, 0, sample_rate);
+            assert!(
+                matches!(value, 0 | -180 | 260 | -80),
+                "unexpected spike value {value} at index {index}"
+            );
+            if value == -180 {
+                fired += 1;
+                assert_eq!(
+                    spike_component(DEFAULT_SIMULATOR_SEED, index + 1, 0, sample_rate),
+                    260
+                );
+                assert_eq!(
+                    spike_component(DEFAULT_SIMULATOR_SEED, index + 2, 0, sample_rate),
+                    -80
+                );
+            }
+            index += 1;
+        }
+        assert!(fired > 0, "no spikes fired across the scanned window");
+    }
 }

@@ -475,4 +475,17 @@ mod tests {
         // A pre-epoch day stays in 1969.
         assert_eq!(civil_date_from_unix_days(-1), (1969, 12, 31));
     }
+
+    #[test]
+    fn civil_date_handles_leap_year_month_boundaries() {
+        // L31: the proleptic-Gregorian rule keeps Feb 29 in years divisible by
+        // 400 (2000) but drops it in century years that are not (2100).
+        assert_eq!(civil_date_from_unix_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_date_from_unix_days(11_017), (2000, 3, 1));
+        // 2100 is not a leap year, so Feb has 28 days and rolls straight to Mar.
+        assert_eq!(civil_date_from_unix_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_date_from_unix_days(47_541), (2100, 3, 1));
+        // A common year still ends on Dec 31.
+        assert_eq!(civil_date_from_unix_days(20_088), (2024, 12, 31));
+    }
 }

@@ -149,6 +149,20 @@ where
 
     for block in blocks {
         let block = block.borrow();
+        // Reject malformed/partial blocks before indexing so a short `data`
+        // vector surfaces as a recoverable error instead of panicking.
+        block
+            .validate()
+            .map_err(|source| RecorderError::InvalidBlock {
+                packet_id: block.packet_id,
+                source,
+            })?;
+        if block.channel_count != channel_count {
+            return Err(RecorderError::InconsistentBlockConfig {
+                packet_id: block.packet_id,
+                field: "channel_count",
+            });
+        }
         for s in 0..block.samples_per_channel {
             buf_timestamps.push(ts);
             for ch in 0..block.channel_count {
@@ -402,6 +416,18 @@ where
     let mut total_samples: u64 = 0;
     for block in blocks {
         let block = block.borrow();
+        block
+            .validate()
+            .map_err(|source| RecorderError::InvalidBlock {
+                packet_id: block.packet_id,
+                source,
+            })?;
+        if block.channel_count != channel_count {
+            return Err(RecorderError::InconsistentBlockConfig {
+                packet_id: block.packet_id,
+                field: "channel_count",
+            });
+        }
         for sample in &block.data {
             w.write_all(&sample.to_le_bytes())
                 .map_err(|source| RecorderError::Io {

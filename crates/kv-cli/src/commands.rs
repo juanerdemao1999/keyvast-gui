@@ -316,7 +316,7 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
             frontpanel_dll_path: options.frontpanel_dll_path.clone(),
             serial: options.serial.clone(),
             data: data_config.clone(),
-            cable_length_meters: DEFAULT_CABLE_LENGTH_METERS,
+            cable_length_meters: options.cable_length_meters,
         })?;
 
         run_fixed_blocks(&device_config, options.blocks, &mut || {

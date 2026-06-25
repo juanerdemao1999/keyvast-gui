@@ -152,8 +152,14 @@ impl RhythmDataConfig {
             channel_count,
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
-            // The Rhythm frame always carries one TTL word per sample, so the
-            // digital inputs are always present at the protocol level.
+            // TTL is fixed on (not config-driven) because the Rhythm frame
+            // always carries one TTL word per sample, so the digital inputs
+            // are physically present at the protocol level regardless of any
+            // user preference. A config-driven `ttl_enabled` only makes sense
+            // once a transport/headstage that can omit the TTL word is
+            // supported; until then surfacing such a toggle would be
+            // misleading. TBD: revisit alongside the non-USB transport
+            // decision (project rule 1) if that hardware materialises.
             ttl_enabled: true,
             ttl_line_count: RHYTHM_TTL_LINE_COUNT,
         })

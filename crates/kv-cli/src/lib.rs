@@ -156,7 +156,7 @@ pub struct SimulatorStreamResult {
     pub max_write_latency_us: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RhdSmokeOptions {
     pub output_dir: PathBuf,
     pub blocks: usize,
@@ -165,6 +165,8 @@ pub struct RhdSmokeOptions {
     pub bitfile_path: PathBuf,
     pub frontpanel_dll_path: Option<PathBuf>,
     pub serial: Option<String>,
+    /// RHD2000 cable length in meters; drives the MISO sampling delay.
+    pub cable_length_meters: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

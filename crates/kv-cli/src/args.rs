@@ -271,6 +271,7 @@ pub(crate) fn parse_rhd_smoke_args(
     let mut frontpanel_dll_path: Option<PathBuf> = None;
     let mut serial: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut cable_length_meters = DEFAULT_CABLE_LENGTH_METERS;
     let mut args = args.peekable();
 
     while let Some(argument) = args.next() {
@@ -282,6 +283,10 @@ pub(crate) fn parse_rhd_smoke_args(
             "--streams" | "--enabled-streams" => {
                 let value = next_value(&mut args, "--streams")?;
                 enabled_streams = parse_usize("--streams", &value)?;
+            }
+            "--cable-length" => {
+                let value = next_value(&mut args, "--cable-length")?;
+                cable_length_meters = parse_f64("--cable-length", &value)?;
             }
             "--raw-input" => {
                 let value = next_value(&mut args, "--raw-input")?;
@@ -319,6 +324,7 @@ pub(crate) fn parse_rhd_smoke_args(
         bitfile_path,
         frontpanel_dll_path,
         serial,
+        cable_length_meters,
     }))
 }
 

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig};
+use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig, DeviceConfigError};
 
 pub const RHYTHM_HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 
@@ -142,7 +142,7 @@ impl RhythmDataConfig {
         validate_sample_rate(self.sample_rate)?;
 
         let channel_count = self.channel_count();
-        Ok(DeviceConfig {
+        let config = DeviceConfig {
             device_id: self.device_id.clone(),
             // Transport kind is fixed to USB because the only Rhythm bring-up
             // path is the Opal Kelly XEM7310 USB3 board; revisit if a non-USB
@@ -156,7 +156,12 @@ impl RhythmDataConfig {
             // digital inputs are always present at the protocol level.
             ttl_enabled: true,
             ttl_line_count: RHYTHM_TTL_LINE_COUNT,
-        })
+        };
+        // Run the same backend-agnostic structural validation every other
+        // backend uses, so an RHD-built config cannot reach bring-up
+        // malformed (DA30).
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), RhythmConfigError> {
@@ -169,6 +174,7 @@ pub enum RhythmConfigError {
     InvalidStreamCount { enabled_streams: usize },
     InvalidSamplesPerBlock { samples_per_block: usize },
     InvalidSampleRate,
+    InvalidDeviceConfig(DeviceConfigError),
 }
 
 impl fmt::Display for RhythmConfigError {
@@ -186,7 +192,16 @@ impl fmt::Display for RhythmConfigError {
                 formatter,
                 "RHD sample rate must be finite and greater than zero"
             ),
+            Self::InvalidDeviceConfig(error) => {
+                write!(formatter, "RHD device config is invalid: {error}")
+            }
         }
+    }
+}
+
+impl From<DeviceConfigError> for RhythmConfigError {
+    fn from(error: DeviceConfigError) -> Self {
+        Self::InvalidDeviceConfig(error)
     }
 }
 

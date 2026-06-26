@@ -128,6 +128,28 @@ available history range `[0, paused_elapsed * 1000]`.
       paused timestamp.
 - [ ] Unpausing resumes live scrolling at the current acquisition time.
 
+### 3.3 Gap-Free Offline Playback Streaming (DA44)
+
+**Problem**: `PlaybackManager::tick()` advanced `cursor_frame` by
+`dt * sample_rate * speed` each frame, then read a single fixed block ending
+at the cursor. When the playhead jumped forward by more than one display
+window — high playback speed, or a long UI stall — every frame between the
+previous and new cursor position was silently skipped and never streamed out.
+
+**Solution**: Track a `read_cursor` high-water mark of frames already emitted.
+Each tick drains the `[read_cursor, cursor_frame)` range contiguously, reading
+at most `MAX_DISPLAY_FRAMES` (30,000) per tick and advancing `read_cursor` by
+the frames actually backed by file data, so successive ticks catch up without
+ever skipping inter-block samples. A seek/scrub collapses
+`read_cursor = cursor_frame` so a deliberate jump is treated as a fresh static
+window rather than a continuous stream to drain.
+
+**Acceptance criteria**:
+- [ ] High-speed play streams every frame in order with no gaps.
+- [ ] Streaming resumes from the previous cursor, not a trailing block ending
+      at the new cursor.
+- [ ] A seek does not replay the skipped-over range.
+
 ---
 
 ## Verification Commands

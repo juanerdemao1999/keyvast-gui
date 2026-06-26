@@ -1143,6 +1143,50 @@ These do not block the next core step:
 - Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
 - Hardware testing of all Phase 2 features on Windows with XEM7310
 
+### Session: Deep-audit (doc 20) remediation — DA30 / DA44
+
+**Date**: 2026-06-25
+**Branch**: `devin/1782447326-da30-da44-deviceconfig-playback` (base: `main`)
+**PR**: #61 (CI green: Clippy+fmt, workspace tests, kv-gui Windows tests)
+
+**Context**: This is the latest slice of an ongoing doc-20 deep-audit (DA1–DA44)
+remediation. Earlier slices landed as PRs #45–#60 (each one or a few DA items
+with code + tests + design-doc sync). Note that the audit/plan docs
+(`docs/20-deep-audit.md`, `docs/21-doc20-remediation-plan.md`) and several
+design-doc syncs live in those still-unmerged PR branches, so they are **not on
+`main` yet** — check open PRs #45–#61 for the authoritative DA tracking.
+
+**What changed (this PR)**:
+
+1. **DA30 — type-level `DeviceConfig` validation** (`kv-types`, `kv-core`,
+   `kv-simulator`, `kv-rhd`). Added `DeviceConfig::validate() -> Result<(),
+   DeviceConfigError>` as the single gate (rejects non-finite/≤0 sample rate,
+   zero channel count, zero samples/packet, `ttl_line_count > u32::BITS`,
+   out-of-range `enabled_channels`). Each backend keeps its own error enum and
+   converts via `From<DeviceConfigError>`; validation logic is no longer
+   duplicated.
+
+2. **DA44 — gap-free offline playback streaming** (`kv-gui/playback.rs`). Added
+   a `read_cursor` high-water mark; `tick()` now drains `[read_cursor,
+   cursor_frame)` contiguously in `MAX_DISPLAY_FRAMES` (30k) chunks across
+   ticks instead of reading one fixed block ending at the cursor, so high-speed
+   play / long stalls no longer skip inter-block frames. `seek_to()` collapses
+   `read_cursor = cursor_frame` (jump, not stream).
+
+**Docs synced**: `docs/04-data-model.md` (DeviceConfig validation),
+`docs/16-gui-optimization-plan.md` §3.3 (playback streaming).
+
+**Verification** (GNU toolchain `stable-x86_64-pc-windows-gnu`; MSVC link.exe is
+broken on this box, set repo override):
+- `cargo build` — pass
+- `cargo test -p kv-types -p kv-simulator -p kv-rhd -p kv-core -p kv-gui` — pass
+- `cargo clippy --all-targets` — 0 warnings
+- `cargo fmt --all -- --check` — clean (needed `rustup component add rustfmt
+  --toolchain stable-x86_64-pc-windows-gnu` first)
+
+**Remaining doc-20 work**: DA34 is the main code item still uncovered by any PR;
+confirm the final coverage against `docs/21-doc20-remediation-plan.md` in PR #45.
+
 ## Notes For Future Agents
 
 - Keep hardware independence strict.

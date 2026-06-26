@@ -11,7 +11,9 @@ use std::thread;
 use std::time::Instant;
 
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
-use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
+use kv_integrity::{
+    IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks_with_expected_start,
+};
 use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
 use kv_types::{DeviceConfig, SampleBlock};
 
@@ -242,7 +244,9 @@ where
     drop(state);
 
     let wall_clock = start.elapsed();
-    let integrity = check_blocks(&recorded_blocks)?;
+    // Acquisition numbers packets from 0; anchor there so loss before the first
+    // recorded block is counted (DA43).
+    let integrity = check_blocks_with_expected_start(Some(0), &recorded_blocks)?;
 
     let timing = PipelineTiming {
         wall_clock_seconds: wall_clock.as_secs_f64(),
@@ -348,7 +352,9 @@ where
     });
 
     let mut recorder = StreamingRecorder::new(&config.output_dir)?;
-    let mut integrity = IncrementalIntegrity::new();
+    // Acquisition numbers packets from 0, so anchor integrity at 0 to count any
+    // packets lost before the first block reaches the recorder (DA43).
+    let mut integrity = IncrementalIntegrity::with_expected_first_packet_id(0);
     let mut first_block_time: Option<Instant> = None;
 
     loop {

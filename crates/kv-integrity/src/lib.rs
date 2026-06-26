@@ -147,9 +147,10 @@ fn account_missing_before_first_block(
     }
 
     report.summary.missing_packets = report.summary.missing_packets.saturating_add(forward_gap);
-    report.summary.expected_samples = report.summary.expected_samples.saturating_add(
-        (first_block.expected_sample_values() as u64).saturating_mul(forward_gap),
-    );
+    report.summary.expected_samples = report
+        .summary
+        .expected_samples
+        .saturating_add((first_block.expected_sample_values() as u64).saturating_mul(forward_gap));
     report.packet_gaps.push(PacketGap {
         expected_packet_id: expected_first_packet_id,
         observed_packet_id: first_block.packet_id,
@@ -214,13 +215,14 @@ fn check_timestamp_continuity(
                 expected_timestamp_start,
                 observed_timestamp_start: current.timestamp_start,
             });
-        report.summary.expected_samples = report
-            .summary
-            .expected_samples
-            .saturating_add(hardware_missing_sample_values(
-                expected_timestamp_start,
-                current,
-            ));
+        report.summary.expected_samples =
+            report
+                .summary
+                .expected_samples
+                .saturating_add(hardware_missing_sample_values(
+                    expected_timestamp_start,
+                    current,
+                ));
     }
 }
 
@@ -231,7 +233,9 @@ fn check_timestamp_continuity(
 /// means `n * channel_count` sample values went missing. A backwards jump
 /// (timestamp reset/overlap) is not loss, so it contributes nothing.
 fn hardware_missing_sample_values(expected_timestamp_start: u64, current: &SampleBlock) -> u64 {
-    let forward = current.timestamp_start.wrapping_sub(expected_timestamp_start);
+    let forward = current
+        .timestamp_start
+        .wrapping_sub(expected_timestamp_start);
     if forward == 0 || forward > u64::MAX / 2 {
         return 0;
     }

@@ -366,8 +366,18 @@ fn pre_first_block_loss_is_counted_against_expected_start() {
     // began and must show up as missing rather than being silently skipped.
     let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
     let blocks = vec![
-        sample_block(3, 3 * spp, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
-        sample_block(4, 4 * spp, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            3,
+            3 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+        sample_block(
+            4,
+            4 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
     ];
 
     let report =
@@ -406,8 +416,18 @@ fn first_block_at_expected_start_has_no_pre_stream_loss() {
 fn pre_first_block_loss_matches_between_batch_and_incremental() {
     let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
     let blocks = vec![
-        sample_block(5, 5 * spp, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
-        sample_block(6, 6 * spp, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            5,
+            5 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+        sample_block(
+            6,
+            6 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
     ];
 
     let batch = check_blocks_with_expected_start(Some(0), &blocks).expect("batch ok");
@@ -463,7 +483,12 @@ fn backwards_timestamp_jump_is_not_counted_as_loss() {
     let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
     let blocks = vec![
         sample_block(0, 100, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
-        sample_block(1, 100 + spp - 5, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            1,
+            100 + spp - 5,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
     ];
 
     let report = check_blocks(&blocks).expect("backwards jump is not fatal");
@@ -481,7 +506,12 @@ fn hardware_loss_matches_between_batch_and_incremental() {
     let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
     let blocks = vec![
         sample_block(0, 0, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
-        sample_block(1, spp + 7, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            1,
+            spp + 7,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
     ];
 
     let batch = check_blocks(&blocks).expect("batch ok");

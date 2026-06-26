@@ -104,8 +104,12 @@ impl RhdHardwareBackend {
         let raw = self.board.read_raw_block(&self.config)?;
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
-        let block =
+        let mut block =
             parse_rhythm_data_block(packet_id, &raw, &self.config).map_err(RhdReadError::Parse)?;
+        // Stamp the host wall-clock at the moment the live block arrived so the
+        // FPGA sample counter (`timestamp_start`) can be aligned to wall-clock
+        // time and host↔FPGA drift estimated offline (DA16).
+        block.host_time_ns = Some(kv_types::host_time_ns_now());
 
         if !self.logged_first_block {
             self.logged_first_block = true;

@@ -30,6 +30,7 @@ fn sample_block_accepts_documented_interleaved_layout() {
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     };
 
     block.validate().expect("documented layout should validate");
@@ -54,6 +55,7 @@ fn sample_block_rejects_data_length_mismatch() {
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     };
 
     assert_eq!(
@@ -81,6 +83,7 @@ fn sample_block_rejects_ttl_bits_outside_enabled_lines() {
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     };
 
     assert_eq!(

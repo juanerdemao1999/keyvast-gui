@@ -93,6 +93,8 @@ impl SimulatorBackend {
             board_adc_data: None,
             ttl_in_per_sample,
             ttl_out_per_sample: None,
+            // Synthetic source: keep generated blocks deterministic (no wall-clock).
+            host_time_ns: None,
         };
 
         block

@@ -125,6 +125,8 @@ pub fn parse_rhythm_data_block(
         board_adc_data: Some(board_adc),
         ttl_in_per_sample: Some(ttl_in_vec),
         ttl_out_per_sample: Some(ttl_out_vec),
+        // Stamped by the backend at read time; the pure parser stays clock-free.
+        host_time_ns: None,
     };
 
     block

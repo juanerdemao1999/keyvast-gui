@@ -41,6 +41,10 @@ Register map: use Rhythm USB3 / FrontPanel endpoints unless the Keyvast bitfile 
 Packet format: Rhythm USB3 data frames unless the Keyvast bitfile changes them
 CRC algorithm: TBD
 Timestamp clock: Rhythm USB3 32-bit sample timestamp for first hardware bring-up
+Clock domains (DA16): the FPGA sample timestamp is a sample-relative hardware counter with
+  no absolute reference and drifts against the host clock. Each live SampleBlock is also stamped
+  with host wall-clock time (host_time_ns, ns since Unix epoch) at parse time; recordings persist
+  the first/last value of both domains so offline tools can align them and estimate drift.
 ADC gain conversion: follow Open Ephys / Intan RHD convention for display, while preserving raw data
 ```
 

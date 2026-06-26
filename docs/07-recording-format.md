@@ -66,6 +66,25 @@ Initial `kv-recorder` metadata also writes:
 - `last_packet_id`
 - `written_samples`
 
+### Clock-domain fields (DA16)
+
+Both the batch and streaming recorders also emit the first/last value of each
+clock domain so offline tools can align the FPGA sample counter to wall-clock
+time and estimate host↔FPGA drift:
+
+- `fpga_timestamp_first`, `fpga_timestamp_last` — `SampleBlock::timestamp_start`
+  (the FPGA hardware sample counter) of the first and last written block.
+- `host_clock_first_ns`, `host_clock_last_ns` — `SampleBlock::host_time_ns`
+  (host wall-clock, nanoseconds since the Unix epoch) of those same blocks, or
+  `null` when the source did not stamp a wall-clock (synthetic/replayed data).
+
+In the streaming (`KVRAW v2`) format the metadata is embedded in the file header
+rather than a sidecar `recording.json`. The reserved JSON block is **1024 bytes**
+(was 512 B): a fully-populated header with the DA16 clock-domain fields exceeds
+512 B, and `finish()` would otherwise truncate it into invalid JSON. Readers
+consume exactly `data_offset_bytes` (recorded in the header) before the sample
+payload, so files written with either reserved size parse via their own offset.
+
 The first implementation writes this fixed JSON shape with Rust standard library code only. If metadata grows more complex, introduce a proper structured JSON library instead of expanding ad hoc formatting.
 
 ## events.csv

@@ -43,6 +43,18 @@ impl DeviceConfig {
     }
 }
 
+/// Host wall-clock time in nanoseconds since the Unix epoch, for stamping
+/// [`SampleBlock::host_time_ns`] at the moment a block is received from a live
+/// device. Times before the epoch are returned as a negative value.
+#[must_use]
+pub fn host_time_ns_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(delta) => delta.as_nanos() as i64,
+        Err(err) => -(err.duration().as_nanos() as i64),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleBlock {
     pub device_id: String,
@@ -71,6 +83,14 @@ pub struct SampleBlock {
 
     /// Per-sample TTL output words.
     pub ttl_out_per_sample: Option<Vec<u32>>,
+
+    /// Host wall-clock time (nanoseconds since the Unix epoch) captured when the
+    /// host received this block. `timestamp_start` is the FPGA sample counter,
+    /// which has no absolute reference and drifts against the host clock; pairing
+    /// the two lets a recording be aligned to wall-clock time and lets offline
+    /// tools estimate host↔FPGA clock drift (DA16). `None` when the producer has
+    /// no host clock to attach (synthetic/test blocks, replayed recordings).
+    pub host_time_ns: Option<i64>,
 }
 
 impl SampleBlock {
@@ -262,6 +282,7 @@ mod tests {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 

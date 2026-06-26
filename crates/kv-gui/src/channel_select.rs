@@ -554,6 +554,7 @@ mod tests {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         };
         let filtered = filter_block_channels(&block, &[0, 2]);
         assert_eq!(filtered.channel_count, 2);

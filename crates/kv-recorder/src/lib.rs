@@ -12,16 +12,23 @@ use std::{
 // ── KVRAW v2 embedded-header format constants ────────────────────────────────
 //
 // File layout:
-//   [0..8]    magic b"KEYVAST\n"
-//   [8..12]   json_len: u32 LE   (bytes of valid JSON in the block below)
-//   [12..524] json_block: 512 B  (UTF-8 JSON, zero-padded to 512 bytes)
-//   [524..]   raw i16 samples    (channel-interleaved, little-endian)
+//   [0..8]     magic b"KEYVAST\n"
+//   [8..12]    json_len: u32 LE   (bytes of valid JSON in the block below)
+//   [12..1036] json_block: 1024 B (UTF-8 JSON, zero-padded to 1024 bytes)
+//   [1036..]   raw i16 samples    (channel-interleaved, little-endian)
 //
 // `new()` writes a zeroed placeholder header; `finish()` seeks back to
 // byte 8 and overwrites with the final metadata.
+//
+// The reserved block is 1024 B (was 512 B): the DA16 clock-domain fields
+// (`fpga_timestamp_first/last`, `host_clock_first/last_ns`) push a fully
+// populated header past 512 B, which `finish()` would otherwise truncate into
+// invalid JSON. Readers consume exactly `data_offset_bytes` (recorded in the
+// JSON) before the samples, so older 512-B files still parse via their own
+// stored offset.
 const KVRAW_MAGIC: &[u8; 8] = b"KEYVAST\n";
-const KVRAW_JSON_RESERVED: usize = 512;
-/// Byte offset where sample data begins (8 magic + 4 len + 512 json = 524).
+const KVRAW_JSON_RESERVED: usize = 1024;
+/// Byte offset where sample data begins (8 magic + 4 len + 1024 json = 1036).
 pub const KVRAW_DATA_OFFSET: u64 = 8 + 4 + KVRAW_JSON_RESERVED as u64;
 
 /// Maximum number of write-latency samples kept in memory (reservoir sampler).
@@ -382,6 +389,10 @@ fn recording_metadata_json(blocks: &[SampleBlock], backend: &str) -> String {
             "  \"layout\": \"interleaved_by_sample\",\n",
             "  \"first_packet_id\": {},\n",
             "  \"last_packet_id\": {},\n",
+            "  \"fpga_timestamp_first\": {},\n",
+            "  \"fpga_timestamp_last\": {},\n",
+            "  \"host_clock_first_ns\": {},\n",
+            "  \"host_clock_last_ns\": {},\n",
             "  \"written_samples\": {},\n",
             "  \"clean_stop\": true\n",
             "}}\n"
@@ -393,8 +404,22 @@ fn recording_metadata_json(blocks: &[SampleBlock], backend: &str) -> String {
         first.samples_per_channel,
         first.packet_id,
         last.packet_id,
+        first.timestamp_start,
+        last.timestamp_start,
+        json_opt_i64(first.host_time_ns),
+        json_opt_i64(last.host_time_ns),
         written_samples(blocks)
     )
+}
+
+/// Render an optional host wall-clock timestamp (DA16) as a JSON number or
+/// `null`. Pairing `host_clock_*_ns` with `fpga_timestamp_*` lets offline tools
+/// align the FPGA sample counter to wall-clock time and estimate clock drift.
+fn json_opt_i64(value: Option<i64>) -> String {
+    match value {
+        Some(ns) => ns.to_string(),
+        None => "null".to_string(),
+    }
 }
 
 fn empty_recording_metadata_json() -> String {
@@ -631,6 +656,10 @@ pub struct StreamingRecorder {
     byte_count: u64,
     first_packet_id: Option<u64>,
     last_packet_id: Option<u64>,
+    first_timestamp_start: Option<u64>,
+    last_timestamp_start: Option<u64>,
+    first_host_time_ns: Option<i64>,
+    last_host_time_ns: Option<i64>,
     device_id: Option<String>,
     sample_rate: Option<f64>,
     channel_count: Option<usize>,
@@ -663,7 +692,7 @@ impl StreamingRecorder {
                 path: raw_path.clone(),
                 source,
             })?;
-        // json_len placeholder (4 bytes) + json_block placeholder (512 bytes)
+        // json_len placeholder (4 bytes) + json_block placeholder (KVRAW_JSON_RESERVED bytes)
         let placeholder = [0u8; 4 + KVRAW_JSON_RESERVED];
         writer
             .write_all(&placeholder)
@@ -681,6 +710,10 @@ impl StreamingRecorder {
             byte_count: 0,
             first_packet_id: None,
             last_packet_id: None,
+            first_timestamp_start: None,
+            last_timestamp_start: None,
+            first_host_time_ns: None,
+            last_host_time_ns: None,
             device_id: None,
             sample_rate: None,
             channel_count: None,
@@ -741,8 +774,12 @@ impl StreamingRecorder {
 
         if self.first_packet_id.is_none() {
             self.first_packet_id = Some(block.packet_id);
+            self.first_timestamp_start = Some(block.timestamp_start);
+            self.first_host_time_ns = block.host_time_ns;
         }
         self.last_packet_id = Some(block.packet_id);
+        self.last_timestamp_start = Some(block.timestamp_start);
+        self.last_host_time_ns = block.host_time_ns;
 
         Ok(())
     }
@@ -902,6 +939,10 @@ impl StreamingRecorder {
                 "  \"block_count\": {},\n",
                 "  \"first_packet_id\": {},\n",
                 "  \"last_packet_id\": {},\n",
+                "  \"fpga_timestamp_first\": {},\n",
+                "  \"fpga_timestamp_last\": {},\n",
+                "  \"host_clock_first_ns\": {},\n",
+                "  \"host_clock_last_ns\": {},\n",
                 "  \"written_samples\": {},\n",
                 "  \"clean_stop\": true\n",
                 "}}\n"
@@ -919,6 +960,14 @@ impl StreamingRecorder {
             self.last_packet_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "null".to_string()),
+            self.first_timestamp_start
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            self.last_timestamp_start
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            json_opt_i64(self.first_host_time_ns),
+            json_opt_i64(self.last_host_time_ns),
             self.written_samples
         )
     }

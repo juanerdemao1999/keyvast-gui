@@ -90,3 +90,21 @@ crates/kv-gui
 This lets each part stay small, while still building as one project.
 
 The folder can stay named `51_keyvast_gui`. Rust crate names should use normal package names such as `kv-types`, `kv-core`, and `kv-cli`.
+
+## Acquisition FIFO Underrun Tolerance (P4: DA4)
+
+DA4  `read_raw_block()` blocks on the Rhythm FIFO until a full block is
+     available. The wait previously polled for ~1 s and then treated any
+     shortfall as a fatal `NotEnoughFifoWords`, with no retry and no way to
+     distinguish a transient stall (host scheduling jitter, USB back-pressure,
+     the FPGA briefly behind) from a genuine hardware failure. A single
+     scheduling hiccup therefore tore down an otherwise-healthy acquisition.
+
+     `wait_for_fifo_words()` now makes up to `FIFO_WAIT_MAX_ATTEMPTS` (5) wait
+     attempts of ~1 s each, logging a `[WARN]` FIFO-underrun line per missed
+     attempt, and only returns the fatal `NotEnoughFifoWords` after the whole
+     ~5 s budget is exhausted. A transient underrun is thus ridden out instead
+     of ending the session, while a truly stalled board still fails (just with
+     diagnostic warnings first). The poll/timeout logic lives in the pure
+     `poll_fifo_words()` helper so the retry behaviour is unit-tested without
+     hardware.

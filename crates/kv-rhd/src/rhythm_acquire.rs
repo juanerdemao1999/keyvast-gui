@@ -13,6 +13,46 @@ use crate::protocol::{RhythmDataConfig, USB3_BLOCK_SIZE_BYTES, bytes_per_block};
 use crate::rhythm_board::RhythmFrontPanelBoard;
 use crate::rhythm_board::*;
 
+/// Number of FIFO polls per wait attempt; with `FIFO_POLL_INTERVAL_MS` this is
+/// the per-attempt budget (200 × 5 ms = ~1 s).
+const FIFO_POLL_ROUNDS_PER_ATTEMPT: u32 = 200;
+
+/// Sleep between FIFO polls.
+const FIFO_POLL_INTERVAL_MS: u64 = 5;
+
+/// How many ~1 s wait attempts to make before treating a FIFO underrun as
+/// fatal. Earlier the first timeout was fatal with no retry (DA4); a transient
+/// stall now tolerates up to ~5 s of back-pressure, logging a warning per
+/// attempt, before tearing down acquisition.
+const FIFO_WAIT_MAX_ATTEMPTS: u32 = 5;
+
+/// Poll `available` up to `rounds` times for at least `needed_words` words,
+/// sleeping via `sleep` between rounds. Returns `Ok(())` as soon as the FIFO
+/// has enough words, otherwise `Err(last_observed_words)`.
+///
+/// Pure with respect to its closures so the retry/timeout logic is unit-testable
+/// without hardware.
+fn poll_fifo_words<A, S>(
+    needed_words: u32,
+    rounds: u32,
+    mut available: A,
+    mut sleep: S,
+) -> Result<(), u32>
+where
+    A: FnMut() -> u32,
+    S: FnMut(),
+{
+    let mut observed = 0;
+    for _ in 0..rounds {
+        observed = available();
+        if observed >= needed_words {
+            return Ok(());
+        }
+        sleep();
+    }
+    Err(observed)
+}
+
 impl RhythmFrontPanelBoard {
     pub(crate) fn run(&self) -> Result<(), RhdReadError> {
         self.device
@@ -259,18 +299,37 @@ impl RhythmFrontPanelBoard {
     }
 
     pub(crate) fn wait_for_fifo_words(&self, needed_words: u32) -> Result<(), RhdReadError> {
-        for _ in 0..200 {
-            let available = self.num_words_in_fifo();
-            if available >= needed_words {
-                return Ok(());
+        for attempt in 1..=FIFO_WAIT_MAX_ATTEMPTS {
+            match poll_fifo_words(
+                needed_words,
+                FIFO_POLL_ROUNDS_PER_ATTEMPT,
+                || self.num_words_in_fifo(),
+                || thread::sleep(Duration::from_millis(FIFO_POLL_INTERVAL_MS)),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(available) => {
+                    if attempt < FIFO_WAIT_MAX_ATTEMPTS {
+                        // A transient underrun (host scheduling jitter, USB
+                        // back-pressure, FPGA briefly behind) is not fatal: the
+                        // FIFO is simply filling more slowly. Warn and keep
+                        // polling rather than tearing down acquisition (DA4).
+                        log::warn!(
+                            "RHD FIFO underrun: needed {needed_words} words, {available} \
+                             available after {}ms (attempt {attempt}/{FIFO_WAIT_MAX_ATTEMPTS}); \
+                             retrying",
+                            FIFO_POLL_ROUNDS_PER_ATTEMPT * FIFO_POLL_INTERVAL_MS as u32
+                        );
+                    } else {
+                        return Err(RhdReadError::NotEnoughFifoWords {
+                            needed: needed_words,
+                            available,
+                        });
+                    }
+                }
             }
-            thread::sleep(Duration::from_millis(5));
         }
 
-        Err(RhdReadError::NotEnoughFifoWords {
-            needed: needed_words,
-            available: self.num_words_in_fifo(),
-        })
+        unreachable!("FIFO wait loop always returns within FIFO_WAIT_MAX_ATTEMPTS");
     }
 
     pub(crate) fn flush_fifo(&self) -> Result<(), RhdReadError> {
@@ -435,5 +494,57 @@ impl RhythmFrontPanelBoard {
         _channel: u8,
     ) -> Result<(), RhdReadError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn poll_fifo_words_returns_immediately_when_enough() {
+        let calls = Cell::new(0_u32);
+        let sleeps = Cell::new(0_u32);
+        let result = poll_fifo_words(
+            100,
+            200,
+            || {
+                calls.set(calls.get() + 1);
+                512
+            },
+            || sleeps.set(sleeps.get() + 1),
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls.get(), 1, "should not keep polling once satisfied");
+        assert_eq!(sleeps.get(), 0, "should not sleep when first poll succeeds");
+    }
+
+    #[test]
+    fn poll_fifo_words_waits_then_succeeds() {
+        let polls = Cell::new(0_u32);
+        let result = poll_fifo_words(
+            100,
+            200,
+            || {
+                let n = polls.get();
+                polls.set(n + 1);
+                // Underrun for the first three polls, then the FIFO fills.
+                if n < 3 { 10 } else { 200 }
+            },
+            || {},
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(polls.get(), 4);
+    }
+
+    #[test]
+    fn poll_fifo_words_times_out_reporting_last_observed() {
+        let result = poll_fifo_words(100, 4, || 7, || {});
+        assert_eq!(
+            result,
+            Err(7),
+            "timeout must report the last observed count"
+        );
     }
 }

@@ -9,7 +9,9 @@ use crate::frame_analysis::{
     amplifier_mean_raw_word, min_stream_railed_fraction, probe_chip_id, stream_range_label,
     verify_chip_id_in_probe,
 };
-use crate::protocol::{RhythmDataConfig, USB3_BLOCK_SIZE_BYTES, bytes_per_block};
+use crate::protocol::{
+    RhythmDataConfig, USB3_BLOCK_SIZE_BYTES, block_aligned_len, bytes_per_block,
+};
 use crate::rhythm_board::RhythmFrontPanelBoard;
 use crate::rhythm_board::*;
 
@@ -68,17 +70,35 @@ impl RhythmFrontPanelBoard {
         let byte_count =
             bytes_per_block(enabled_streams, samples).map_err(RhdReadError::InvalidConfig)?;
         self.wait_for_fifo_words((byte_count / 2) as u32)?;
-        let mut buffer = vec![0_u8; byte_count];
-        let read = self
+
+        // FrontPanel block-pipe transfers must be an integer number of USB3
+        // blocks (1024 B). A finite zcheck/bring-up capture leaves exactly
+        // `byte_count` bytes in the FIFO, which for typical impedance configs is
+        // not 1024-aligned; passing that raw length is undefined behaviour for
+        // the DLL (DA6). Pad the request up to a block boundary and enable the
+        // block-throttle override (as `flush_fifo` does) so the FPGA serves the
+        // trailing partial block, then keep only the meaningful prefix.
+        let aligned = block_aligned_len(byte_count);
+        let mut buffer = vec![0_u8; aligned];
+
+        let _ = self
             .device
-            .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer)
-            .map_err(RhdReadError::FrontPanel)?;
-        if read != byte_count {
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 1 << 16, 1 << 16);
+        self.device.update_wire_ins();
+        let read_result =
+            self.device
+                .read_from_block_pipe_out(PIPE_OUT_DATA, USB3_BLOCK_SIZE_BYTES, &mut buffer);
+        let _ = self.device.set_wire_in_value(WIRE_IN_RESET_RUN, 0, 1 << 16);
+        self.device.update_wire_ins();
+
+        let read = read_result.map_err(RhdReadError::FrontPanel)?;
+        if read < byte_count {
             return Err(RhdReadError::ShortPipeRead {
                 expected: byte_count,
                 observed: read,
             });
         }
+        buffer.truncate(byte_count);
         Ok(buffer)
     }
 
@@ -303,8 +323,8 @@ impl RhythmFrontPanelBoard {
                 break;
             }
             let byte_count = (available_words as usize).saturating_mul(2);
-            // Round up to USB3_BLOCK_SIZE_BYTES boundary.
-            let aligned = byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES).max(1) * USB3_BLOCK_SIZE_BYTES;
+            // Round up to a USB3 block boundary (at least one block).
+            let aligned = block_aligned_len(byte_count).max(USB3_BLOCK_SIZE_BYTES);
             let mut buffer = vec![0_u8; aligned];
             let _ = self.device.read_from_block_pipe_out(
                 PIPE_OUT_DATA,

@@ -44,6 +44,25 @@ Timestamp clock: Rhythm USB3 32-bit sample timestamp for first hardware bring-up
 ADC gain conversion: follow Open Ephys / Intan RHD convention for display, while preserving raw data
 ```
 
+## Impedance Measurement & Finite Captures (P10: DA6/DA7/DA27)
+
+```text
+DA6  FrontPanel block-pipe reads must transfer an integer number of USB3 blocks
+     (USB3_BLOCK_SIZE_BYTES = 1024). A finite zcheck/bring-up capture leaves
+     exactly byte_count bytes in the FIFO, which for typical impedance configs
+     is not 1024-aligned. read_pipe_block() now pads the request to the next
+     block boundary (protocol::block_aligned_len), enables the block-throttle
+     override while reading the trailing partial block, then keeps only the
+     meaningful prefix. The continuous acquisition block is already aligned.
+DA7  Impedance magnitude is gated on the Intan saturation-voltage model: a
+     channel whose measured amplitude rails is reported as saturated rather
+     than as a falsely-low impedance, and the empirical frequency correction
+     is applied to the converted magnitude.
+DA27 The zcheck DAC waveform rejects impedance test frequencies too low to fit
+     one full period inside the command bank (MAX_COMMAND_LENGTH = 1024)
+     instead of silently clamping the period and measuring the wrong tone.
+```
+
 ## Verification Ladder
 
 Use this order:

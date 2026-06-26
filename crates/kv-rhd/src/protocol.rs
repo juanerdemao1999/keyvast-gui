@@ -313,10 +313,69 @@ pub fn bytes_per_block(
         .saturating_mul(2))
 }
 
+/// Round a raw byte count up to the next multiple of `USB3_BLOCK_SIZE_BYTES`.
+///
+/// FrontPanel `ReadFromBlockPipeOut` transfers must be an integer number of
+/// USB3 blocks. A finite zcheck/bring-up capture leaves exactly `byte_count`
+/// bytes in the FIFO, which for typical impedance configs is not 1024-aligned;
+/// the transfer length must be padded up to a block boundary and the meaningful
+/// prefix kept afterwards (DA6).
+#[must_use]
+pub fn block_aligned_len(byte_count: usize) -> usize {
+    byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES) * USB3_BLOCK_SIZE_BYTES
+}
+
 pub fn raw_word_to_signed_count(word: u16) -> i16 {
     (word as i32 - 32_768) as i16
 }
 
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_aligned_len_rounds_up_to_block_boundary() {
+        assert_eq!(block_aligned_len(0), 0);
+        assert_eq!(block_aligned_len(1), USB3_BLOCK_SIZE_BYTES);
+        assert_eq!(
+            block_aligned_len(USB3_BLOCK_SIZE_BYTES),
+            USB3_BLOCK_SIZE_BYTES
+        );
+        assert_eq!(
+            block_aligned_len(USB3_BLOCK_SIZE_BYTES + 1),
+            2 * USB3_BLOCK_SIZE_BYTES
+        );
+        // Every result is an integer number of USB3 blocks.
+        for byte_count in [1, 513, 62_400, 64_800, 100_001] {
+            assert_eq!(block_aligned_len(byte_count) % USB3_BLOCK_SIZE_BYTES, 0);
+            assert!(block_aligned_len(byte_count) >= byte_count);
+        }
+    }
+
+    #[test]
+    fn default_continuous_block_is_already_block_aligned() {
+        // The continuous acquisition path must never need padding: a non-aligned
+        // block_bytes would force per-block over-reads into the next frame.
+        for streams in 1..=MAX_SUPPORTED_STREAMS {
+            let bytes = bytes_per_block(streams, SAMPLES_PER_USB_BLOCK).unwrap();
+            assert_eq!(
+                bytes % USB3_BLOCK_SIZE_BYTES,
+                0,
+                "continuous block for {streams} stream(s) is not 1024-aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn default_impedance_capture_needs_padding() {
+        // Regression guard for DA6: the default single-stream zcheck capture is
+        // deliberately NOT block-aligned, so the read path must pad it.
+        let bytes = bytes_per_block(1, 600).unwrap();
+        assert_ne!(bytes % USB3_BLOCK_SIZE_BYTES, 0);
+        assert!(block_aligned_len(bytes) > bytes);
+    }
 }

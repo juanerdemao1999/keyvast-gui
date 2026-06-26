@@ -24,6 +24,49 @@ use crate::{RecorderError, escape_json_string};
 pub struct ExportHeader {
     pub sample_rate: f64,
     pub channel_count: usize,
+    /// Analog front-end filter configuration written into the Intan .rhd header.
+    /// Defaults to the hardware configuration this application programs into
+    /// every RHD2000 headstage; see [`RhdFilterConfig`].
+    pub filter: RhdFilterConfig,
+}
+
+/// RHD2000 amplifier analog-filter configuration recorded in the Intan .rhd
+/// header.
+///
+/// Intan readers interpret these fields as the **analog front-end** filter
+/// corners, not the digitiser's Nyquist limit. The original exporter wrote the
+/// Nyquist frequency (`sample_rate / 2`) as the "upper bandwidth", which
+/// misreports a 15 kHz analog corner for a 30 kS/s recording when the hardware
+/// was actually configured for 7.5 kHz — corrupting any downstream
+/// re-filtering or noise estimate (DA28). These values mirror
+/// `kv_rhd::Rhd2000Registers::open_ephys_default`, the configuration this
+/// application programs into every headstage.
+#[derive(Debug, Clone, Copy)]
+pub struct RhdFilterConfig {
+    pub dsp_enabled: bool,
+    pub dsp_cutoff_hz: f32,
+    pub lower_bandwidth_hz: f32,
+    pub upper_bandwidth_hz: f32,
+    pub impedance_test_frequency_hz: f32,
+}
+
+impl RhdFilterConfig {
+    /// The actual RHD2000 front-end configuration programmed into every
+    /// headstage (`Rhd2000Registers::open_ephys_default`): DSP high-pass at
+    /// 1 Hz, analog passband 1 Hz – 7.5 kHz, 1 kHz impedance test tone.
+    pub const HARDWARE_DEFAULT: Self = Self {
+        dsp_enabled: true,
+        dsp_cutoff_hz: 1.0,
+        lower_bandwidth_hz: 1.0,
+        upper_bandwidth_hz: 7_500.0,
+        impedance_test_frequency_hz: 1_000.0,
+    };
+}
+
+impl Default for RhdFilterConfig {
+    fn default() -> Self {
+        Self::HARDWARE_DEFAULT
+    }
 }
 
 // ── Export format enum ──────────────────────────────────────────────
@@ -108,6 +151,7 @@ pub fn export_intan_rhd(
     let header = ExportHeader {
         sample_rate: blocks[0].sample_rate,
         channel_count: blocks[0].channel_count,
+        filter: RhdFilterConfig::default(),
     };
     export_intan_rhd_streaming(output_path, header, blocks.iter(), notes)
 }
@@ -138,7 +182,14 @@ where
     let mut w = BufWriter::new(file);
 
     // Write header
-    write_rhd_header(&mut w, sample_rate, channel_count, notes, output_path)?;
+    write_rhd_header(
+        &mut w,
+        sample_rate,
+        channel_count,
+        header.filter,
+        notes,
+        output_path,
+    )?;
 
     // Stream blocks through a fixed-size accumulator (128 samples × channels).
     // Memory usage is O(RHD_SAMPLES_PER_BLOCK * channel_count), not O(total).
@@ -236,6 +287,7 @@ fn write_rhd_header(
     w: &mut BufWriter<File>,
     sample_rate: f64,
     channel_count: usize,
+    filter: RhdFilterConfig,
     notes: &str,
     path: &Path,
 ) -> Result<(), RecorderError> {
@@ -245,6 +297,12 @@ fn write_rhd_header(
         source,
     };
 
+    // The amplifier's analog upper corner cannot exceed the digitiser's Nyquist
+    // frequency in a way any reader can use; cap the reported value so a
+    // low-rate export never claims an impossibly wide passband (DA28).
+    let nyquist = (sample_rate / 2.0) as f32;
+    let upper_bandwidth = filter.upper_bandwidth_hz.min(nyquist);
+
     // Magic number
     w.write_all(&INTAN_MAGIC.to_le_bytes()).map_err(e)?;
     // Version
@@ -253,26 +311,31 @@ fn write_rhd_header(
     // Sample rate (f32)
     w.write_all(&(sample_rate as f32).to_le_bytes())
         .map_err(e)?;
-    // DSP enabled (i16: 1 = yes)
-    w.write_all(&1_i16.to_le_bytes()).map_err(e)?;
-    // DSP cutoff frequency (f32)
-    w.write_all(&1.0_f32.to_le_bytes()).map_err(e)?;
-    // Lower bandwidth (f32)
-    w.write_all(&0.1_f32.to_le_bytes()).map_err(e)?;
-    // Upper bandwidth (f32)
-    w.write_all(&(sample_rate as f32 / 2.0).to_le_bytes())
+    // DSP enabled (i16)
+    w.write_all(&i16::from(filter.dsp_enabled).to_le_bytes())
         .map_err(e)?;
+    // DSP cutoff frequency (f32)
+    w.write_all(&filter.dsp_cutoff_hz.to_le_bytes())
+        .map_err(e)?;
+    // Lower bandwidth (f32)
+    w.write_all(&filter.lower_bandwidth_hz.to_le_bytes())
+        .map_err(e)?;
+    // Upper bandwidth (f32)
+    w.write_all(&upper_bandwidth.to_le_bytes()).map_err(e)?;
     // Desired lower bandwidth (f32)
-    w.write_all(&0.1_f32.to_le_bytes()).map_err(e)?;
+    w.write_all(&filter.lower_bandwidth_hz.to_le_bytes())
+        .map_err(e)?;
     // Desired upper bandwidth (f32)
-    w.write_all(&((sample_rate / 2.0) as f32).to_le_bytes())
+    w.write_all(&filter.upper_bandwidth_hz.to_le_bytes())
         .map_err(e)?;
     // Notch filter mode (i16: 0 = none)
     w.write_all(&0_i16.to_le_bytes()).map_err(e)?;
     // Desired impedance test frequency (f32)
-    w.write_all(&1000.0_f32.to_le_bytes()).map_err(e)?;
+    w.write_all(&filter.impedance_test_frequency_hz.to_le_bytes())
+        .map_err(e)?;
     // Actual impedance test frequency (f32)
-    w.write_all(&1000.0_f32.to_le_bytes()).map_err(e)?;
+    w.write_all(&filter.impedance_test_frequency_hz.to_le_bytes())
+        .map_err(e)?;
 
     // Notes (3 × QString: note1, note2, note3)
     write_qstring(w, notes, path)?;
@@ -364,6 +427,7 @@ pub fn export_flat_binary(
     let header = ExportHeader {
         sample_rate: blocks[0].sample_rate,
         channel_count: blocks[0].channel_count,
+        filter: RhdFilterConfig::default(),
     };
     export_flat_binary_streaming(output_dir, header, blocks.iter(), notes)
 }
@@ -555,6 +619,55 @@ mod tests {
             f32::from_le_bytes([data[8], data[9], data[10], data[11]]),
             30_000.0
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intan_rhd_header_reports_actual_amplifier_bandwidth_not_nyquist() {
+        // DA28: the header must describe the analog front-end (1 Hz – 7.5 kHz,
+        // DSP high-pass on), not the digitiser Nyquist frequency. A 30 kS/s
+        // export previously claimed a 15 kHz upper bandwidth.
+        let dir = std::env::temp_dir().join("kv_intan_bandwidth_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let blocks = make_test_blocks(2, 128, 1);
+        let rhd_path = dir.join("bw.rhd");
+        export_intan_rhd(&rhd_path, &blocks, "test").unwrap();
+        let data = fs::read(&rhd_path).unwrap();
+
+        // Header layout after the f32 sample rate at bytes 8..12:
+        //   [12..14)  DSP enabled (i16)
+        //   [14..18)  DSP cutoff (f32)
+        //   [18..22)  lower bandwidth (f32)
+        //   [22..26)  upper bandwidth (f32)
+        let read_f32 = |off: usize| {
+            f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
+        assert_eq!(i16::from_le_bytes([data[12], data[13]]), 1, "DSP enabled");
+        assert_eq!(read_f32(14), 1.0, "DSP cutoff Hz");
+        assert_eq!(read_f32(18), 1.0, "lower bandwidth Hz");
+        let upper = read_f32(22);
+        assert_eq!(upper, 7_500.0, "upper bandwidth must be the analog corner");
+        assert_ne!(upper, 15_000.0, "must not report Nyquist as bandwidth");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn intan_rhd_header_caps_upper_bandwidth_at_nyquist() {
+        // A low sample rate cannot represent a 7.5 kHz analog corner; the
+        // reported upper bandwidth must be clamped to Nyquist (DA28).
+        let dir = std::env::temp_dir().join("kv_intan_bw_clamp_test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut blocks = make_test_blocks(1, 128, 1);
+        blocks[0].sample_rate = 10_000.0; // Nyquist = 5 kHz < 7.5 kHz corner.
+        let rhd_path = dir.join("clamp.rhd");
+        export_intan_rhd(&rhd_path, &blocks, "test").unwrap();
+        let data = fs::read(&rhd_path).unwrap();
+        let upper = f32::from_le_bytes([data[22], data[23], data[24], data[25]]);
+        assert_eq!(upper, 5_000.0, "upper bandwidth clamped to Nyquist");
 
         let _ = fs::remove_dir_all(&dir);
     }

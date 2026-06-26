@@ -635,6 +635,13 @@ pub enum RhdCommandError {
     InvalidArgumentShape {
         command_type: Rhd2000CommandType,
     },
+    /// The requested impedance test frequency is so low that one period of the
+    /// excitation sine would need more than `MAX_COMMAND_LENGTH` command-RAM
+    /// slots, so a full period cannot be uploaded.
+    FrequencyTooLow {
+        period_samples: usize,
+        max_command_length: usize,
+    },
 }
 
 impl fmt::Display for RhdCommandError {
@@ -659,6 +666,15 @@ impl fmt::Display for RhdCommandError {
                     "{command_type:?} was called with invalid arguments"
                 )
             }
+            Self::FrequencyTooLow {
+                period_samples,
+                max_command_length,
+            } => write!(
+                formatter,
+                "impedance test frequency is too low: one period spans {period_samples} samples \
+                 but the command bank holds at most {max_command_length}; raise the frequency or \
+                 lower the sample rate"
+            ),
         }
     }
 }
@@ -727,10 +743,20 @@ impl Rhd2000Registers {
             return Ok(commands);
         }
 
-        // Compute how many samples make up one complete period of the
-        // test waveform.  Clamp to at most MAX_COMMAND_LENGTH.
+        // Compute how many samples make up one complete period of the test
+        // waveform. A period longer than the command bank cannot be uploaded;
+        // silently clamping it to MAX_COMMAND_LENGTH would emit a truncated
+        // sub-period sine, distorting the excitation and yielding a systematically
+        // wrong single-frequency impedance fit with no warning (DA27). Match the
+        // Intan reference and reject the frequency instead.
         let period_samples = (self.sample_rate / frequency).round() as usize;
-        let period_samples = period_samples.clamp(1, MAX_COMMAND_LENGTH);
+        if period_samples > MAX_COMMAND_LENGTH {
+            return Err(RhdCommandError::FrequencyTooLow {
+                period_samples,
+                max_command_length: MAX_COMMAND_LENGTH,
+            });
+        }
+        let period_samples = period_samples.max(1);
 
         let two_pi = 2.0 * std::f64::consts::PI;
         for i in 0..period_samples {

@@ -1143,6 +1143,41 @@ These do not block the next core step:
 - Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
 - Hardware testing of all Phase 2 features on Windows with XEM7310
 
+### Session: DA34 — per-frame panic isolation in the GUI event loop
+
+**Date**: 2026-06-25
+**Branch**: `devin/<ts>-da34-panic-isolation` (base: `main`)
+**Audit item**: doc 20 DA34 (last uncovered item; DA1–DA44 otherwise covered by
+open PRs #40–#61, authoritative tracker in #45 `docs/21-doc20-remediation-plan.md`).
+
+**Problem**: `eframe` drives `KvApp::update()` per frame and that frame drives the
+live recording pipeline. A panic in the render path unwound out of the event loop
+and killed the recorder thread mid-write, leaving the in-progress `.kvraw` without
+its flushed footer (data loss). The release panic strategy was also implicit.
+
+**What changed**:
+1. `Cargo.toml` — `[profile.release]` now declares `panic = "unwind"` explicitly
+   (with a comment: the GUI guard depends on it; `abort` would defeat `catch_unwind`).
+2. `crates/kv-gui/src/panic_guard.rs` (new) — `guard_frame()` runs a frame body in
+   `std::panic::catch_unwind`, returning `Ok(())` or `Err(message)`; `payload_message()`
+   extracts a readable message from `&str`/`String`/other payloads.
+3. `crates/kv-gui/src/lib.rs` — `mod panic_guard;`.
+4. `crates/kv-gui/src/app.rs` — `KvApp` gains `fatal_panic: Option<String>`; the
+   original `update()` body became inherent `render_frame()`; the `eframe::App::update()`
+   wrapper runs `render_frame()` through `guard_frame()`. On panic it latches the
+   message, sends `RecorderCmd::Terminate` to finalize the recording, drops the live
+   pipeline, and renders a static recovery screen; once latched, later frames render
+   only that screen.
+
+**Verification**:
+- `cargo build -p kv-gui` — pass
+- `cargo test -p kv-gui` — 57 pass (4 new `panic_guard` tests)
+- `cargo clippy --all-targets` — clean
+- `cargo fmt --all -- --check` — clean
+
+**Next steps**:
+- All doc-20 DA items now have a PR; remaining work is reviewing/merging #40–#61.
+
 ## Notes For Future Agents
 
 - Keep hardware independence strict.

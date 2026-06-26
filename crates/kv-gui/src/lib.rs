@@ -19,6 +19,7 @@ mod impedance_panel;
 mod live_pipeline;
 mod multiview;
 mod panels;
+mod panic_guard;
 mod playback;
 mod preview;
 mod remote_api;

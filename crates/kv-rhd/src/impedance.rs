@@ -110,6 +110,9 @@ impl ImpedanceResult {
 /// `sample_rate` — in Hz.
 /// `frequency` — test frequency in Hz.
 /// `cap_scale` — the ZcheckScale used.
+/// `dac_amplitude` — DAC peak amplitude (0..128) that drove the test waveform;
+///   must match the value used to generate the injected sine ([`DEFAULT_DAC_AMPLITUDE`]
+///   for the Intan full-scale default).
 ///
 /// Returns `(magnitude_ohms, phase_degrees)`.
 ///
@@ -120,6 +123,7 @@ pub fn compute_impedance(
     sample_rate: f64,
     frequency: f64,
     cap_scale: ZcheckScale,
+    dac_amplitude: f64,
 ) -> (f64, f64) {
     if amplifier_data.is_empty() || frequency <= 0.0 || sample_rate <= 0.0 {
         return (f64::INFINITY, 0.0);
@@ -154,8 +158,9 @@ pub fn compute_impedance(
 
     // Convert voltage amplitude to impedance.
     // V_measured = I * Z, where I = Cs * (2π*f) * V_dac.
-    // V_dac peak ≈ 128 * 1.225V / 256 ≈ 0.6125V (half-scale DAC output).
-    let v_dac_peak = 128.0 * crate::protocol::RHD_DAC_VREF_VOLTS / 256.0; // ~0.6125 V
+    // V_dac peak ≈ dac_amplitude * 1.225V / 256 (≈0.6125V at the full-scale
+    // default of 128).
+    let v_dac_peak = dac_amplitude * crate::protocol::RHD_DAC_VREF_VOLTS / 256.0;
     let cap_farads = cap_scale.capacitance_farads();
     let omega = two_pi * frequency;
     let i_current = cap_farads * omega * v_dac_peak; // Amps
@@ -320,6 +325,7 @@ impl RhythmFrontPanelBoard {
                 config.sample_rate,
                 config.frequency_hz,
                 ZcheckScale::Cs1pF,
+                config.dac_amplitude,
             );
 
             // Auto-select the best scale and re-measure if needed.
@@ -354,6 +360,7 @@ impl RhythmFrontPanelBoard {
                     config.sample_rate,
                     config.frequency_hz,
                     best_scale,
+                    config.dac_amplitude,
                 );
                 (mag, ph, best_scale)
             } else {
@@ -410,7 +417,13 @@ mod tests {
     fn test_dc_impedance() {
         // All-zero data → infinite impedance
         let data = vec![0i16; 1000];
-        let (mag, _phase) = compute_impedance(&data, 30_000.0, 1000.0, ZcheckScale::Cs1pF);
+        let (mag, _phase) = compute_impedance(
+            &data,
+            30_000.0,
+            1000.0,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        );
         assert!(
             mag > 1.0e12 || mag.is_infinite(),
             "expected very high impedance for zero signal, got {mag}"
@@ -434,10 +447,55 @@ mod tests {
             })
             .collect();
 
-        let (mag, _phase) = compute_impedance(&data, sample_rate, freq, ZcheckScale::Cs1pF);
+        let (mag, _phase) = compute_impedance(
+            &data,
+            sample_rate,
+            freq,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        );
         assert!(
             mag.is_finite() && mag > 0.0,
             "expected finite impedance, got {mag}"
+        );
+    }
+
+    #[test]
+    fn dac_amplitude_scales_impedance_inversely() {
+        // The injected current is proportional to the DAC amplitude, so for a
+        // fixed measured voltage halving the amplitude must double the reported
+        // impedance.
+        let sample_rate = 30_000.0;
+        let freq = 1000.0;
+        let n = 600;
+        let amplitude_uv = 50.0;
+        let amplitude_counts =
+            amplitude_uv / crate::protocol::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
+        let data: Vec<i16> = (0..n)
+            .map(|i| {
+                let phase = 2.0 * std::f64::consts::PI * freq * (i as f64) / sample_rate;
+                (amplitude_counts * phase.sin()).round() as i16
+            })
+            .collect();
+
+        let (mag_full, _) = compute_impedance(
+            &data,
+            sample_rate,
+            freq,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        );
+        let (mag_half, _) = compute_impedance(
+            &data,
+            sample_rate,
+            freq,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE / 2.0,
+        );
+
+        assert!(
+            (mag_half / mag_full - 2.0).abs() < 1e-6,
+            "got {mag_half} vs {mag_full}"
         );
     }
 

@@ -564,6 +564,26 @@ fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
             .bitfile_path
             .ends_with("keyvast_260607_with_UART.bit")
     );
+    // Cable length defaults to the 3 ft (~0.9144 m) SPI cable.
+    assert!((options.cable_length_meters - 0.9144).abs() < 1e-9);
+}
+
+#[test]
+fn rhd_smoke_parse_accepts_cable_length() {
+    let command = parse_args(["rhd-smoke", "--cable-length", "2.5", "--output", "rhd-out"])
+        .expect("args should parse");
+
+    let CliCommand::RhdSmoke(options) = command else {
+        panic!("expected RhdSmoke command");
+    };
+
+    assert!((options.cable_length_meters - 2.5).abs() < 1e-9);
+}
+
+#[test]
+fn rhd_smoke_parse_rejects_invalid_cable_length() {
+    let result = parse_args(["rhd-smoke", "--cable-length", "not-a-number"]);
+    assert!(matches!(result, Err(CliError::InvalidNumber { .. })));
 }
 
 #[test]
@@ -581,6 +601,7 @@ fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
         bitfile_path: PathBuf::from("unused.bit"),
         frontpanel_dll_path: None,
         serial: None,
+        cable_length_meters: 0.9144,
     })
     .expect("raw RHD smoke should parse");
 

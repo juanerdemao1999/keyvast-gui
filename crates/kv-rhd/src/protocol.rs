@@ -152,8 +152,14 @@ impl RhythmDataConfig {
             channel_count,
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
-            // The Rhythm frame always carries one TTL word per sample, so the
-            // digital inputs are always present at the protocol level.
+            // TTL is fixed on (not config-driven) because the Rhythm frame
+            // always carries one TTL word per sample, so the digital inputs
+            // are physically present at the protocol level regardless of any
+            // user preference. A config-driven `ttl_enabled` only makes sense
+            // once a transport/headstage that can omit the TTL word is
+            // supported; until then surfacing such a toggle would be
+            // misleading. TBD: revisit alongside the non-USB transport
+            // decision (project rule 1) if that hardware materialises.
             ttl_enabled: true,
             ttl_line_count: RHYTHM_TTL_LINE_COUNT,
         })
@@ -227,6 +233,20 @@ pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
     } else {
         (1_u32 << enabled_streams) - 1
     }
+}
+
+/// Shift a base stream-enable `mask` up to the data-stream slots owned by
+/// `port`. Each SPI port owns 4 consecutive data streams, so port `p` starts at
+/// stream `4 * p`.
+///
+/// Returns `None` when the shift amount is `>= u32::BITS`. With
+/// `MAX_SUPPORTED_STREAMS` this is unreachable, but the `checked_shl` guard
+/// keeps a future stream-layout change from turning into a shift-overflow panic
+/// (debug builds) or a silently masked, wrong mask (release builds).
+#[must_use]
+pub fn port_stream_mask(mask: u32, port: usize) -> Option<u32> {
+    let shift = u32::try_from(port).ok()?.checked_mul(4)?;
+    mask.checked_shl(shift)
 }
 
 /// Word/byte layout of a single Rhythm USB data frame for a given number of
@@ -319,4 +339,40 @@ pub fn raw_word_to_signed_count(word: u16) -> i16 {
 
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_enable_mask_sets_low_bits_and_saturates() {
+        assert_eq!(stream_enable_mask(0), 0);
+        assert_eq!(stream_enable_mask(1), 0b1);
+        assert_eq!(stream_enable_mask(2), 0b11);
+        assert_eq!(stream_enable_mask(31), 0x7fff_ffff);
+        // At or beyond the bit width we must not shift-overflow; the mask saturates.
+        assert_eq!(stream_enable_mask(32), u32::MAX);
+        assert_eq!(stream_enable_mask(1_000), u32::MAX);
+    }
+
+    #[test]
+    fn port_stream_mask_shifts_to_each_supported_port() {
+        // Two enabled streams (the supported maximum) shifted onto each SPI port.
+        let bits = stream_enable_mask(MAX_SUPPORTED_STREAMS);
+        assert_eq!(port_stream_mask(bits, 0), Some(0b11));
+        assert_eq!(port_stream_mask(bits, 1), Some(0b11 << 4));
+        assert_eq!(port_stream_mask(bits, 7), Some(0b11 << 28));
+    }
+
+    #[test]
+    fn port_stream_mask_guards_overflowing_shift() {
+        // A shift amount of >= u32::BITS returns None instead of panicking
+        // (debug) or silently masking the shift amount mod 32 (release).
+        assert_eq!(port_stream_mask(0b11, 8), None); // shift 32
+        assert_eq!(port_stream_mask(1, usize::MAX), None); // port doesn't fit in u32
+        // In-range shifts stay defined even when high bits are shifted out the top.
+        assert_eq!(port_stream_mask(u32::MAX, 1), Some(0xFFFF_FFF0));
+        assert_eq!(port_stream_mask(0, 7), Some(0));
+    }
 }

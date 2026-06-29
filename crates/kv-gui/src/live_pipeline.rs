@@ -80,10 +80,11 @@ pub enum RecorderEvent {
     /// Periodic buffer health report (sent ~5/s while running).
     /// `occupancy` is 0.0..=1.0 (buffered / capacity).
     BufferStatus { occupancy: f64 },
-    /// The fanout buffer dropped one or more blocks because a consumer queue
-    /// was full. Carries the cumulative dropped-block count and the buffer
-    /// occupancy at the time of the drop. Rate-limited by the producer so a
-    /// sustained overflow does not flood the event channel.
+    /// A consumer queue overflowed and the oldest block(s) were dropped.
+    /// `dropped_blocks` is the cumulative count across all consumers and
+    /// `occupancy` is the worst-case fill level at the time of the drop.
+    /// Producer-side reporting is rate-limited so sustained overflow does not
+    /// flood the GUI event channel.
     BufferOverflow { dropped_blocks: u64, occupancy: f64 },
     /// The acquisition source (simulator or hardware) failed to open or to
     /// produce a block. Carries a human-readable message for the GUI banner.

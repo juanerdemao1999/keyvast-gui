@@ -271,6 +271,7 @@ pub(crate) fn parse_rhd_smoke_args(
     let mut frontpanel_dll_path: Option<PathBuf> = None;
     let mut serial: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut cable_length_meters = DEFAULT_CABLE_LENGTH_METERS;
     let mut args = args.peekable();
 
     while let Some(argument) = args.next() {
@@ -282,6 +283,10 @@ pub(crate) fn parse_rhd_smoke_args(
             "--streams" | "--enabled-streams" => {
                 let value = next_value(&mut args, "--streams")?;
                 enabled_streams = parse_usize("--streams", &value)?;
+            }
+            "--cable-length" => {
+                let value = next_value(&mut args, "--cable-length")?;
+                cable_length_meters = parse_f64("--cable-length", &value)?;
             }
             "--raw-input" => {
                 let value = next_value(&mut args, "--raw-input")?;
@@ -319,6 +324,7 @@ pub(crate) fn parse_rhd_smoke_args(
         bitfile_path,
         frontpanel_dll_path,
         serial,
+        cable_length_meters,
     }))
 }
 
@@ -468,5 +474,18 @@ mod tests {
         assert_eq!(civil_date_from_unix_days(10_957), (2000, 1, 1));
         // A pre-epoch day stays in 1969.
         assert_eq!(civil_date_from_unix_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn civil_date_handles_leap_year_month_boundaries() {
+        // L31: the proleptic-Gregorian rule keeps Feb 29 in years divisible by
+        // 400 (2000) but drops it in century years that are not (2100).
+        assert_eq!(civil_date_from_unix_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_date_from_unix_days(11_017), (2000, 3, 1));
+        // 2100 is not a leap year, so Feb has 28 days and rolls straight to Mar.
+        assert_eq!(civil_date_from_unix_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_date_from_unix_days(47_541), (2100, 3, 1));
+        // A common year still ends on Dec 31.
+        assert_eq!(civil_date_from_unix_days(20_088), (2024, 12, 31));
     }
 }

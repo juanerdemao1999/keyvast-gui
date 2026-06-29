@@ -6,6 +6,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -13,7 +14,7 @@ use std::time::Instant;
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
 use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
 use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
-use kv_types::{DeviceConfig, SampleBlock};
+use kv_types::{AcquisitionEvent, DeviceConfig, SampleBlock};
 
 use crate::AcquisitionSource;
 
@@ -156,6 +157,23 @@ where
     S: AcquisitionSource + Send + 'static,
     S::Error: Send + 'static,
 {
+    run_threaded_pipeline_with_events(config, source, None)
+}
+
+/// Like [`run_threaded_pipeline`], but also forwards [`AcquisitionEvent`]s to
+/// an optional observer channel. When a consumer queue overflows, a
+/// [`AcquisitionEvent::BufferOverflow`] carrying the cumulative dropped-block
+/// count and worst-case occupancy is sent so callers can surface backpressure
+/// instead of only logging it.
+pub fn run_threaded_pipeline_with_events<S>(
+    config: &PipelineConfig,
+    source: S,
+    events: Option<Sender<AcquisitionEvent>>,
+) -> Result<PipelineResult, PipelineError>
+where
+    S: AcquisitionSource + Send + 'static,
+    S::Error: Send + 'static,
+{
     let start = Instant::now();
 
     let mut fanout = FanoutBlockBuffer::new();
@@ -176,7 +194,7 @@ where
     let shared_producer = Arc::clone(&shared);
 
     let producer_handle = thread::spawn(move || {
-        producer_loop(source, requested, &shared_producer);
+        producer_loop(source, requested, &shared_producer, events);
     });
 
     let mut recorded_blocks = Vec::with_capacity(requested);
@@ -270,8 +288,12 @@ where
     })
 }
 
-fn producer_loop<S>(mut source: S, requested: usize, shared: &Arc<(Mutex<SharedState>, Condvar)>)
-where
+fn producer_loop<S>(
+    mut source: S,
+    requested: usize,
+    shared: &Arc<(Mutex<SharedState>, Condvar)>,
+    events: Option<Sender<AcquisitionEvent>>,
+) where
     S: AcquisitionSource,
 {
     let (lock, cvar) = &**shared;
@@ -280,15 +302,25 @@ where
         match source.read_block() {
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
-                if let Some(overflow) = state.buffer.push(block) {
+                let overflow = state.buffer.push(block);
+                if let Some(overflow) = &overflow {
                     state.dropped_blocks_total = overflow.dropped_blocks;
+                }
+                cvar.notify_all();
+                drop(state);
+                if let Some(overflow) = overflow {
                     log::warn!(
                         "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
                         overflow.dropped_blocks,
                         overflow.buffer_occupancy * 100.0
                     );
+                    if let Some(tx) = &events {
+                        let _ = tx.send(AcquisitionEvent::BufferOverflow {
+                            dropped_blocks: overflow.dropped_blocks,
+                            buffer_occupancy: overflow.buffer_occupancy,
+                        });
+                    }
                 }
-                cvar.notify_all();
             }
             Err(error) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
@@ -337,6 +369,20 @@ where
     S: AcquisitionSource + Send + 'static,
     S::Error: Send + 'static,
 {
+    run_streaming_pipeline_with_events(config, source, None)
+}
+
+/// Like [`run_streaming_pipeline`], but also forwards [`AcquisitionEvent`]s to
+/// an optional observer channel (see [`run_threaded_pipeline_with_events`]).
+pub fn run_streaming_pipeline_with_events<S>(
+    config: &StreamingPipelineConfig,
+    source: S,
+    events: Option<Sender<AcquisitionEvent>>,
+) -> Result<StreamingPipelineResult, PipelineError>
+where
+    S: AcquisitionSource + Send + 'static,
+    S::Error: Send + 'static,
+{
     let start = Instant::now();
 
     let mut fanout = FanoutBlockBuffer::new();
@@ -357,7 +403,7 @@ where
     let shared_producer = Arc::clone(&shared);
 
     let producer_handle = thread::spawn(move || {
-        producer_loop(source, requested, &shared_producer);
+        producer_loop(source, requested, &shared_producer, events);
     });
 
     let mut recorder = StreamingRecorder::new(&config.output_dir)?;
@@ -458,4 +504,96 @@ where
         latency_distribution: streaming_summary.latency_distribution,
         dropped_blocks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    use kv_simulator::{SimulatorBackend, SimulatorError};
+
+    /// Let the pipeline pull blocks straight off the simulator backend instead
+    /// of through a hand-written closure wrapper. The trait lives in `kv-core`,
+    /// so the impl stays test-only here to avoid a `kv-core` <-> `kv-simulator`
+    /// dependency cycle.
+    impl AcquisitionSource for SimulatorBackend {
+        type Error = SimulatorError;
+
+        fn read_block(&mut self) -> Result<SampleBlock, Self::Error> {
+            self.next_block()
+        }
+    }
+
+    /// `producer_loop` should emit a `BufferOverflow` event for every push that
+    /// drops a block, carrying the cumulative dropped-block count and the
+    /// worst-case occupancy.
+    #[test]
+    fn producer_loop_emits_buffer_overflow_events() {
+        // A single consumer with capacity 1 overflows on every push after the
+        // first, so the event count is fully deterministic.
+        let mut fanout = FanoutBlockBuffer::new();
+        fanout
+            .add_consumer("recorder", 1)
+            .expect("consumer capacity is non-zero");
+
+        let shared = Arc::new((
+            Mutex::new(SharedState {
+                buffer: fanout,
+                producer_done: false,
+                producer_error: None,
+            }),
+            Condvar::new(),
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let simulator = SimulatorBackend::default();
+
+        producer_loop(simulator, 3, &shared, Some(tx));
+
+        let events: Vec<AcquisitionEvent> = rx.iter().collect();
+        assert_eq!(events.len(), 2, "two of three pushes overflow capacity 1");
+
+        match events[0] {
+            AcquisitionEvent::BufferOverflow {
+                dropped_blocks,
+                buffer_occupancy,
+            } => {
+                assert_eq!(dropped_blocks, 1);
+                assert_eq!(buffer_occupancy, 1.0);
+            }
+            ref other => panic!("expected BufferOverflow, got {other:?}"),
+        }
+        match events[1] {
+            AcquisitionEvent::BufferOverflow { dropped_blocks, .. } => {
+                assert_eq!(dropped_blocks, 2, "dropped count is cumulative");
+            }
+            ref other => panic!("expected BufferOverflow, got {other:?}"),
+        }
+    }
+
+    /// With enough capacity to hold every block, no overflow event is emitted.
+    #[test]
+    fn producer_loop_emits_no_events_without_overflow() {
+        let mut fanout = FanoutBlockBuffer::new();
+        fanout
+            .add_consumer("recorder", 16)
+            .expect("consumer capacity is non-zero");
+
+        let shared = Arc::new((
+            Mutex::new(SharedState {
+                buffer: fanout,
+                producer_done: false,
+                producer_error: None,
+            }),
+            Condvar::new(),
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let simulator = SimulatorBackend::default();
+
+        producer_loop(simulator, 4, &shared, Some(tx));
+
+        assert_eq!(rx.iter().count(), 0);
+    }
 }

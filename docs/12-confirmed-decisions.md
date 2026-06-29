@@ -122,3 +122,31 @@ front of the dependency search order. Deployments should still bundle the
 required FrontPanel/VC++ runtime alongside `okFrontPanel.dll` (see
 "Host program should bundle the required FrontPanel runtime DLL" above) so the
 dependencies are present in that directory.
+
+## Sample-rate handling
+
+### The programmed rate is the recorded rate (DA9)
+
+The configured `sample_rate` is threaded all the way to the hardware: board
+bring-up calls `set_sample_rate(config.sample_rate)` (the PLL M/D step table,
+1000–30000 Hz) instead of a hardcoded 30 kHz, and the per-chip register set is
+built with `Rhd2000Registers::new(sample_rate)` so MUX/ADC bias and the DSP
+high-pass cutoff match the rate actually running. A rate outside the PLL step
+table is rejected at configure time with `RhdReadError::UnsupportedSampleRate`
+rather than silently falling back to 30 kHz.
+
+Because the hardware now runs exactly the configured rate, the `sample_rate`
+stamped into each `SampleBlock` and the `.kvraw` metadata is the true
+acquisition rate — there is no longer a path where the file claims a rate the
+ADC never ran at. The `rhd-smoke` command exposes `--sample-rate <hz>`
+(default 30000) as the user path to select it; non-finite or non-positive
+values are rejected during argument parsing.
+
+### Cable-delay timing tracks the configured rate (DA40)
+
+`set_cable_length_meters` computes the MISO sampling delay from
+`t_step = 1 / (2800 * sample_rate)`. The per-channel SPI clock scales with the
+sample rate, so this now uses the configured rate passed in from `configure`
+rather than the `DEFAULT_RHD_SAMPLE_RATE` constant; otherwise the headstage
+cable delay would be mis-compensated at any rate other than 30 kHz, degrading
+the MISO sampling phase.

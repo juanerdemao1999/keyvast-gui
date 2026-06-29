@@ -302,7 +302,7 @@ pub fn run_rhd_smoke(options: RhdSmokeOptions) -> Result<RhdSmokeResult, CliErro
         device_id: DEFAULT_RHD_DEVICE_ID.to_string(),
         stream_id: 0,
         enabled_streams: options.enabled_streams,
-        sample_rate: DEFAULT_RHD_SAMPLE_RATE,
+        sample_rate: options.sample_rate,
         samples_per_block: SAMPLES_PER_USB_BLOCK,
     };
     let device_config = data_config

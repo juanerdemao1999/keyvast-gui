@@ -576,6 +576,7 @@ fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
     assert_eq!(options.enabled_streams, 1);
     assert_eq!(options.raw_input, Some(PathBuf::from("capture.bin")));
     assert_eq!(options.output_dir, PathBuf::from("rhd-out"));
+    assert_eq!(options.sample_rate, 30000.0);
     assert!(
         options
             .bitfile_path
@@ -604,6 +605,30 @@ fn rhd_smoke_parse_rejects_invalid_cable_length() {
 }
 
 #[test]
+fn rhd_smoke_parse_accepts_explicit_sample_rate() {
+    let command = parse_args(["rhd-smoke", "--sample-rate", "2500", "--output", "rhd-out"])
+        .expect("args should parse");
+
+    let CliCommand::RhdSmoke(options) = command else {
+        panic!("expected RhdSmoke command");
+    };
+    assert_eq!(options.sample_rate, 2500.0);
+}
+
+#[test]
+fn rhd_smoke_parse_rejects_non_positive_sample_rate() {
+    let error = parse_args(["rhd-smoke", "--sample-rate", "0", "--output", "rhd-out"])
+        .expect_err("non-positive sample rate should be rejected");
+
+    assert!(matches!(
+        error,
+        CliError::NonPositiveValue {
+            flag: "--sample-rate"
+        }
+    ));
+}
+
+#[test]
 fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
     let output_dir = unique_output_dir("rhd-raw-smoke");
     fs::create_dir_all(&output_dir).expect("test output dir should be creatable");
@@ -614,6 +639,7 @@ fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
         output_dir: output_dir.clone(),
         blocks: 1,
         enabled_streams: 1,
+        sample_rate: 30000.0,
         raw_input: Some(raw_path),
         bitfile_path: PathBuf::from("unused.bit"),
         frontpanel_dll_path: None,

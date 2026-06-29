@@ -272,6 +272,7 @@ pub(crate) fn parse_rhd_smoke_args(
 ) -> Result<CliCommand, CliError> {
     let mut blocks = DEFAULT_BLOCKS;
     let mut enabled_streams = 2_usize;
+    let mut sample_rate: Option<f64> = None;
     let mut raw_input: Option<PathBuf> = None;
     let mut bitfile_path = default_rhd_bitfile_path();
     let mut frontpanel_dll_path: Option<PathBuf> = None;
@@ -293,6 +294,10 @@ pub(crate) fn parse_rhd_smoke_args(
             "--cable-length" => {
                 let value = next_value(&mut args, "--cable-length")?;
                 cable_length_meters = parse_f64("--cable-length", &value)?;
+            }
+            "--sample-rate" => {
+                let value = next_value(&mut args, "--sample-rate")?;
+                sample_rate = Some(parse_f64("--sample-rate", &value)?);
             }
             "--raw-input" => {
                 let value = next_value(&mut args, "--raw-input")?;
@@ -317,6 +322,12 @@ pub(crate) fn parse_rhd_smoke_args(
         }
     }
 
+    if sample_rate.is_some_and(|rate| !(rate.is_finite() && rate > 0.0)) {
+        return Err(CliError::NonPositiveValue {
+            flag: "--sample-rate",
+        });
+    }
+
     let output_dir = match output_dir {
         Some(output_dir) => output_dir,
         None => default_recording_output_dir()?,
@@ -326,6 +337,7 @@ pub(crate) fn parse_rhd_smoke_args(
         output_dir,
         blocks,
         enabled_streams,
+        sample_rate: sample_rate.unwrap_or(DEFAULT_RHD_SAMPLE_RATE),
         raw_input,
         bitfile_path,
         frontpanel_dll_path,

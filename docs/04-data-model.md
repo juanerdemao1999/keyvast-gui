@@ -106,6 +106,24 @@ pub struct DeviceConfig {
 }
 ```
 
+### Validation (DA30)
+
+`DeviceConfig::validate(&self) -> Result<(), DeviceConfigError>` is the single,
+type-level gate every backend runs before bring-up, so a malformed config is
+rejected the same way regardless of where it originates (simulator, core
+orchestration, RHD/USB, Ethernet, PCIe). It rejects:
+
+- a non-finite or non-positive `sample_rate` (`InvalidSampleRate`),
+- a zero `channel_count` (`EmptyChannelSet`),
+- a zero `samples_per_packet` (`EmptyPacket`),
+- a `ttl_line_count` wider than the `u32` TTL storage word
+  (`TtlLineCountOutOfRange`),
+- any `enabled_channels` entry `>= channel_count`
+  (`EnabledChannelOutOfRange`).
+
+Backends keep their own error enums but convert from `DeviceConfigError` via
+`From`, so the validation logic itself lives in exactly one place.
+
 ## DeviceBackendKind
 
 ```rust

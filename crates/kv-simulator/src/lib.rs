@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use kv_types::{DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError};
+use kv_types::{DeviceBackendKind, DeviceConfig, DeviceConfigError, SampleBlock, SampleBlockError};
 
 pub const DEFAULT_SIMULATOR_SEED: u64 = 0x4b56_5354_0000_0001;
 
@@ -264,6 +264,26 @@ impl fmt::Display for SimulatorConfigError {
 
 impl std::error::Error for SimulatorConfigError {}
 
+impl From<DeviceConfigError> for SimulatorConfigError {
+    fn from(error: DeviceConfigError) -> Self {
+        match error {
+            DeviceConfigError::InvalidSampleRate => Self::InvalidSampleRate,
+            DeviceConfigError::EmptyChannelSet => Self::EmptyChannelSet,
+            DeviceConfigError::EmptyPacket => Self::EmptyPacket,
+            DeviceConfigError::TtlLineCountOutOfRange { ttl_line_count } => {
+                Self::TtlLineCountOutOfRange { ttl_line_count }
+            }
+            DeviceConfigError::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            } => Self::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulatorError {
     InvalidGeneratedBlock(SampleBlockError),
@@ -282,40 +302,16 @@ impl fmt::Display for SimulatorError {
 impl std::error::Error for SimulatorError {}
 
 fn validate_device_config(config: &DeviceConfig) -> Result<(), SimulatorConfigError> {
+    // The simulator backend constraint is specific to this backend; the rest of
+    // the structural checks are shared with every other backend through the
+    // type-level `DeviceConfig::validate` (DA30).
     if config.backend != DeviceBackendKind::Simulator {
         return Err(SimulatorConfigError::NonSimulatorBackend {
             backend: config.backend,
         });
     }
 
-    if !config.sample_rate.is_finite() || config.sample_rate <= 0.0 {
-        return Err(SimulatorConfigError::InvalidSampleRate);
-    }
-
-    if config.channel_count == 0 {
-        return Err(SimulatorConfigError::EmptyChannelSet);
-    }
-
-    if config.samples_per_packet == 0 {
-        return Err(SimulatorConfigError::EmptyPacket);
-    }
-
-    if config.ttl_line_count > u32::BITS as usize {
-        return Err(SimulatorConfigError::TtlLineCountOutOfRange {
-            ttl_line_count: config.ttl_line_count,
-        });
-    }
-
-    for &channel in &config.enabled_channels {
-        if channel >= config.channel_count {
-            return Err(SimulatorConfigError::EnabledChannelOutOfRange {
-                channel,
-                channel_count: config.channel_count,
-            });
-        }
-    }
-
-    Ok(())
+    config.validate().map_err(SimulatorConfigError::from)
 }
 
 fn mix_u64(mut value: u64) -> u64 {

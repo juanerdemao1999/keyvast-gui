@@ -41,6 +41,44 @@ impl DeviceConfig {
             ttl_line_count: DEFAULT_TTL_LINE_COUNT,
         }
     }
+
+    /// Backend-agnostic structural validation of a device configuration.
+    ///
+    /// This is the single source of truth every backend should call after it
+    /// constructs a `DeviceConfig`, so a malformed configuration cannot reach
+    /// bring-up regardless of which backend produced it (DA30). Backend-specific
+    /// constraints (e.g. the simulator requiring the `Simulator` backend) are
+    /// layered on top by the caller.
+    pub fn validate(&self) -> Result<(), DeviceConfigError> {
+        if !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
+            return Err(DeviceConfigError::InvalidSampleRate);
+        }
+
+        if self.channel_count == 0 {
+            return Err(DeviceConfigError::EmptyChannelSet);
+        }
+
+        if self.samples_per_packet == 0 {
+            return Err(DeviceConfigError::EmptyPacket);
+        }
+
+        if self.ttl_line_count > u32::BITS as usize {
+            return Err(DeviceConfigError::TtlLineCountOutOfRange {
+                ttl_line_count: self.ttl_line_count,
+            });
+        }
+
+        for &channel in &self.enabled_channels {
+            if channel >= self.channel_count {
+                return Err(DeviceConfigError::EnabledChannelOutOfRange {
+                    channel,
+                    channel_count: self.channel_count,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Host wall-clock time in nanoseconds since the Unix epoch, for stamping
@@ -54,6 +92,45 @@ pub fn host_time_ns_now() -> i64 {
         Err(err) => -(err.duration().as_nanos() as i64),
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceConfigError {
+    InvalidSampleRate,
+    EmptyChannelSet,
+    EmptyPacket,
+    TtlLineCountOutOfRange {
+        ttl_line_count: usize,
+    },
+    EnabledChannelOutOfRange {
+        channel: usize,
+        channel_count: usize,
+    },
+}
+
+impl fmt::Display for DeviceConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSampleRate => {
+                write!(formatter, "sample rate must be finite and positive")
+            }
+            Self::EmptyChannelSet => write!(formatter, "channel count must be greater than zero"),
+            Self::EmptyPacket => write!(formatter, "samples per packet must be greater than zero"),
+            Self::TtlLineCountOutOfRange { ttl_line_count } => write!(
+                formatter,
+                "ttl line count {ttl_line_count} exceeds u32 ttl storage width"
+            ),
+            Self::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            } => write!(
+                formatter,
+                "enabled channel {channel} is outside configured channel count {channel_count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeviceConfigError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleBlock {
@@ -533,5 +610,64 @@ mod tests {
         block.ttl_in_per_sample = Some(vec![0b0001, 0b0010, 0b0100]);
         block.ttl_out_per_sample = Some(vec![0b1000, 0b0000, 0b0011]);
         assert_eq!(block.validate_against_ttl_lines(4), Ok(()));
+    }
+
+    #[test]
+    fn device_config_validate_accepts_the_simulator_default() {
+        assert_eq!(DeviceConfig::simulator_default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn device_config_validate_rejects_bad_sample_rate() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut cfg = DeviceConfig::simulator_default();
+            cfg.sample_rate = bad;
+            assert_eq!(
+                cfg.validate(),
+                Err(DeviceConfigError::InvalidSampleRate),
+                "sample_rate {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn device_config_validate_rejects_empty_channels_and_packets() {
+        let mut no_channels = DeviceConfig::simulator_default();
+        no_channels.channel_count = 0;
+        no_channels.enabled_channels.clear();
+        assert_eq!(
+            no_channels.validate(),
+            Err(DeviceConfigError::EmptyChannelSet)
+        );
+
+        let mut no_packet = DeviceConfig::simulator_default();
+        no_packet.samples_per_packet = 0;
+        assert_eq!(no_packet.validate(), Err(DeviceConfigError::EmptyPacket));
+    }
+
+    #[test]
+    fn device_config_validate_rejects_oversized_ttl_line_count() {
+        let mut cfg = DeviceConfig::simulator_default();
+        cfg.ttl_line_count = (u32::BITS as usize) + 1;
+        assert_eq!(
+            cfg.validate(),
+            Err(DeviceConfigError::TtlLineCountOutOfRange {
+                ttl_line_count: (u32::BITS as usize) + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn device_config_validate_rejects_enabled_channel_out_of_range() {
+        let mut cfg = DeviceConfig::simulator_default();
+        cfg.channel_count = 4;
+        cfg.enabled_channels = vec![0, 4];
+        assert_eq!(
+            cfg.validate(),
+            Err(DeviceConfigError::EnabledChannelOutOfRange {
+                channel: 4,
+                channel_count: 4,
+            })
+        );
     }
 }

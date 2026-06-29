@@ -302,3 +302,30 @@ fn default_bitfile_path() -> Option<PathBuf> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_to_physical_identity_when_order_empty() {
+        let settings = DisplaySettings::default();
+        assert!(settings.channel_order.is_empty());
+        for index in 0..8 {
+            assert_eq!(settings.display_to_physical(index), index);
+        }
+    }
+
+    #[test]
+    fn display_to_physical_applies_non_identity_map() {
+        let settings = DisplaySettings {
+            channel_order: vec![3, 1, 0, 2],
+            ..Default::default()
+        };
+
+        assert_eq!(settings.display_to_physical(0), 3);
+        assert_eq!(settings.display_to_physical(1), 1);
+        assert_eq!(settings.display_to_physical(2), 0);
+        assert_eq!(settings.display_to_physical(9), 9);
+    }
+}

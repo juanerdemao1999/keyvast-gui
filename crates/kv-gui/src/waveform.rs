@@ -288,11 +288,14 @@ pub fn draw_waveform_area(
         ));
 
         // Determine which channel the cursor is hovering over.
-        // Returns the PHYSICAL channel index for consistent comparison with trace.channel.
+        // Returns the PHYSICAL channel index for consistent comparison with
+        // trace.channel. The lane's display index (start_ch + lane) is mapped
+        // through the active channel order so hover follows a non-identity map
+        // (DA19).
         let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
             let disp_pos = (-pos.y / ch_spacing).round() as i64;
             if disp_pos >= 0 && (disp_pos as usize) < visible {
-                Some(start_ch + disp_pos as usize)
+                Some(settings.display_to_physical(start_ch + disp_pos as usize))
             } else {
                 None
             }
@@ -317,7 +320,7 @@ pub fn draw_waveform_area(
         // Use display_pos for Y-offset; check physical channel for enable/disable.
         if settings.show_grid {
             for disp_pos in 0..visible {
-                if !settings.is_channel_enabled(start_ch + disp_pos) {
+                if !settings.is_channel_enabled(settings.display_to_physical(start_ch + disp_pos)) {
                     continue;
                 }
                 let y_off = -(disp_pos as f64) * ch_spacing;
@@ -468,7 +471,7 @@ pub fn draw_waveform_area(
         let painter = ui.painter();
         let frame = *response.transform.frame();
         for disp_pos in (0..visible).step_by(label_stride) {
-            let phys_ch = start_ch + disp_pos;
+            let phys_ch = settings.display_to_physical(start_ch + disp_pos);
             if !settings.is_channel_enabled(phys_ch) {
                 continue;
             }
@@ -503,8 +506,10 @@ pub fn draw_waveform_area(
         // where y_offset = -(ch * ch_spacing).
         // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
         // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
-        // hovered_ch is the physical channel; display_pos = physical_ch - start_ch.
-        let disp_pos = hovered_ch.saturating_sub(start_ch);
+        // Recover the lane from the cursor's plot-Y directly: under a non-identity
+        // channel map the physical channel is not start_ch + lane, so we can't
+        // derive the lane by subtracting start_ch from hovered_ch (DA19).
+        let disp_pos = (-plot_val.y / ch_spacing).round().max(0.0) as usize;
         let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
         let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
@@ -719,7 +724,10 @@ fn collect_from_ring(
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
 
     for disp_pos in 0..visible {
-        let phys_ch = start_ch + disp_pos;
+        // Map the lane's display index through the active channel order so the
+        // Channel Map panel actually reorders which physical channel each lane
+        // reads/draws/spike-detects (DA19). Identity map => start_ch + disp_pos.
+        let phys_ch = settings.display_to_physical(start_ch + disp_pos);
 
         // Per-channel enable/disable is indexed by physical channel.
         if !settings.is_channel_enabled(phys_ch) {

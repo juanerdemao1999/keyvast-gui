@@ -18,8 +18,8 @@ pub use commands::{
 };
 pub use frontpanel::{FrontPanelError, default_frontpanel_dll_path};
 pub use impedance::{
-    ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceTestConfig, auto_select_scale,
-    compute_impedance,
+    ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceSample, ImpedanceTestConfig,
+    approximate_saturation_voltage, auto_select_scale, compute_impedance,
 };
 pub use parser::{
     BlockParseReport, ParsedRhythmBlock, RhythmParseError, parse_rhythm_data_block,

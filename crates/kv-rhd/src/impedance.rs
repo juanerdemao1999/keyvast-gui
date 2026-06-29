@@ -21,6 +21,11 @@ pub const DEFAULT_NUM_PERIODS: usize = 20;
 /// DAC amplitude (0..128).  Intan default = 128 (full scale).
 pub const DEFAULT_DAC_AMPLITUDE: f64 = 128.0;
 
+/// Amplifier upper bandwidth (Hz) configured for the impedance run. Must match
+/// `Rhd2000Registers::open_ephys_default` (`set_upper_bandwidth(7_500.0)`); used
+/// by `approximate_saturation_voltage` to decide when a channel is railed.
+pub const DEFAULT_UPPER_BANDWIDTH_HZ: f64 = 7_500.0;
+
 /// Impedance measurement result for a single channel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChannelImpedance {
@@ -39,6 +44,8 @@ pub struct ImpedanceTestConfig {
     pub dac_amplitude: f64,
     pub sample_rate: f64,
     pub channel_count: usize,
+    /// Configured amplifier upper bandwidth (Hz); feeds the saturation model.
+    pub upper_bandwidth_hz: f64,
 }
 
 impl Default for ImpedanceTestConfig {
@@ -49,6 +56,7 @@ impl Default for ImpedanceTestConfig {
             dac_amplitude: DEFAULT_DAC_AMPLITUDE,
             sample_rate: 30_000.0,
             channel_count: 64,
+            upper_bandwidth_hz: DEFAULT_UPPER_BANDWIDTH_HZ,
         }
     }
 }
@@ -114,9 +122,16 @@ impl ImpedanceResult {
 ///   must match the value used to generate the injected sine ([`DEFAULT_DAC_AMPLITUDE`]
 ///   for the Intan full-scale default).
 ///
-/// Returns `(magnitude_ohms, phase_degrees)`.
+/// Returns the measured impedance plus the raw signal amplitude that produced
+/// it (`amplitude_uv`), which the caller compares against
+/// `approximate_saturation_voltage` to reject railed channels.
 ///
-/// Port of Intan `measureComplexAmplitude` + `approximateSaturationVoltage`.
+/// Port of Intan `measureComplexAmplitude`. NOTE: the Intan empirical
+/// per-frequency amplitude-correction curve (`bestAmplitude` calibration table)
+/// is NOT applied here — magnitudes use the ideal series-capacitor model and so
+/// carry a (usually frequency-dependent) systematic offset versus an Intan rig.
+/// Porting that curve requires Intan's calibration coefficients plus bench
+/// validation against R+C standards; tracked separately (DA7).
 #[must_use]
 pub fn compute_impedance(
     amplifier_data: &[i16],
@@ -124,20 +139,20 @@ pub fn compute_impedance(
     frequency: f64,
     cap_scale: ZcheckScale,
     dac_amplitude: f64,
-) -> (f64, f64) {
+) -> ImpedanceSample {
     if amplifier_data.is_empty() || frequency <= 0.0 || sample_rate <= 0.0 {
-        return (f64::INFINITY, 0.0);
+        return ImpedanceSample::OPEN;
     }
 
     let period = (sample_rate / frequency).round() as usize;
     if period == 0 {
-        return (f64::INFINITY, 0.0);
+        return ImpedanceSample::OPEN;
     }
 
     // Use integer number of complete periods (discard partial tail).
     let num_complete = amplifier_data.len() / period;
     if num_complete == 0 {
-        return (f64::INFINITY, 0.0);
+        return ImpedanceSample::OPEN;
     }
     let n = num_complete * period;
     let data = &amplifier_data[..n];
@@ -180,7 +195,45 @@ pub fn compute_impedance(
     let phase_rad = imag.atan2(real);
     let phase_deg = phase_rad.to_degrees();
 
-    (magnitude, phase_deg)
+    ImpedanceSample {
+        magnitude_ohms: magnitude,
+        phase_degrees: phase_deg,
+        amplitude_uv: v_amplitude_uv,
+    }
+}
+
+/// A single impedance DFT result: the derived impedance plus the measured
+/// signal amplitude (µV) used to detect railing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ImpedanceSample {
+    pub magnitude_ohms: f64,
+    pub phase_degrees: f64,
+    pub amplitude_uv: f64,
+}
+
+impl ImpedanceSample {
+    /// No measurable signal (open circuit / no data).
+    const OPEN: Self = Self {
+        magnitude_ohms: f64::INFINITY,
+        phase_degrees: 0.0,
+        amplitude_uv: 0.0,
+    };
+}
+
+/// Approximate the amplifier output amplitude (µV) at which the front end
+/// saturates for a given excitation frequency, given the configured upper
+/// bandwidth. A measured amplitude at or above this is treated as railed and
+/// the channel's impedance is rejected as invalid (DA7).
+///
+/// Port of Intan `approximateSaturationVoltage`.
+#[must_use]
+pub fn approximate_saturation_voltage(frequency_hz: f64, upper_bandwidth_hz: f64) -> f64 {
+    if upper_bandwidth_hz <= 0.0 || frequency_hz < 0.2 * upper_bandwidth_hz {
+        5000.0
+    } else {
+        let ratio = 3.3333 * frequency_hz / upper_bandwidth_hz;
+        5000.0 * (1.0 / (1.0 + ratio.powi(4))).sqrt()
+    }
 }
 
 /// Select the best capacitor scale for a given impedance magnitude.
@@ -320,7 +373,7 @@ impl RhythmFrontPanelBoard {
             let raw = self.read_pipe_block(enabled_streams, samples_needed)?;
             let amp_data = extract_channel_from_raw(&raw, enabled_streams, samples_needed, ch);
 
-            let (mag_1pf, phase_1pf) = crate::impedance::compute_impedance(
+            let sample_1pf = crate::impedance::compute_impedance(
                 &amp_data,
                 config.sample_rate,
                 config.frequency_hz,
@@ -329,9 +382,9 @@ impl RhythmFrontPanelBoard {
             );
 
             // Auto-select the best scale and re-measure if needed.
-            let best_scale = crate::impedance::auto_select_scale(mag_1pf);
+            let best_scale = crate::impedance::auto_select_scale(sample_1pf.magnitude_ohms);
 
-            let (magnitude, phase, scale) = if best_scale != ZcheckScale::Cs1pF {
+            let (sample, scale) = if best_scale != ZcheckScale::Cs1pF {
                 registers.set_zcheck_scale(best_scale);
                 let re_cfg = registers
                     .create_command_list_register_config(false)
@@ -355,24 +408,43 @@ impl RhythmFrontPanelBoard {
                 let raw2 = self.read_pipe_block(enabled_streams, samples_needed)?;
                 let amp2 = extract_channel_from_raw(&raw2, enabled_streams, samples_needed, ch);
 
-                let (mag, ph) = crate::impedance::compute_impedance(
+                let sample = crate::impedance::compute_impedance(
                     &amp2,
                     config.sample_rate,
                     config.frequency_hz,
                     best_scale,
                     config.dac_amplitude,
                 );
-                (mag, ph, best_scale)
+                (sample, best_scale)
             } else {
-                (mag_1pf, phase_1pf, ZcheckScale::Cs1pF)
+                (sample_1pf, ZcheckScale::Cs1pF)
             };
+
+            // Reject railed channels: if the amplifier output reached the
+            // saturation envelope for this frequency/bandwidth, the DFT
+            // amplitude is clipped and the derived impedance is meaningless
+            // (an open/broken electrode would otherwise be reported as a
+            // finite, plausible value) (DA7).
+            let saturation_uv = crate::impedance::approximate_saturation_voltage(
+                config.frequency_hz,
+                config.upper_bandwidth_hz,
+            );
+            let railed = sample.amplitude_uv >= saturation_uv;
+            if railed {
+                log::warn!(
+                    "impedance channel {ch} railed (amplitude {:.0} µV ≥ saturation {:.0} µV); \
+                     marking invalid",
+                    sample.amplitude_uv,
+                    saturation_uv
+                );
+            }
 
             results.push(crate::impedance::ChannelImpedance {
                 channel: ch,
-                magnitude_ohms: magnitude,
-                phase_degrees: phase,
+                magnitude_ohms: sample.magnitude_ohms,
+                phase_degrees: sample.phase_degrees,
                 scale_used: scale,
-                valid: magnitude.is_finite() && magnitude > 0.0,
+                valid: !railed && sample.magnitude_ohms.is_finite() && sample.magnitude_ohms > 0.0,
             });
         }
 
@@ -417,13 +489,14 @@ mod tests {
     fn test_dc_impedance() {
         // All-zero data → infinite impedance
         let data = vec![0i16; 1000];
-        let (mag, _phase) = compute_impedance(
+        let mag = compute_impedance(
             &data,
             30_000.0,
             1000.0,
             ZcheckScale::Cs1pF,
             DEFAULT_DAC_AMPLITUDE,
-        );
+        )
+        .magnitude_ohms;
         assert!(
             mag > 1.0e12 || mag.is_infinite(),
             "expected very high impedance for zero signal, got {mag}"
@@ -447,13 +520,14 @@ mod tests {
             })
             .collect();
 
-        let (mag, _phase) = compute_impedance(
+        let mag = compute_impedance(
             &data,
             sample_rate,
             freq,
             ZcheckScale::Cs1pF,
             DEFAULT_DAC_AMPLITUDE,
-        );
+        )
+        .magnitude_ohms;
         assert!(
             mag.is_finite() && mag > 0.0,
             "expected finite impedance, got {mag}"
@@ -478,25 +552,65 @@ mod tests {
             })
             .collect();
 
-        let (mag_full, _) = compute_impedance(
+        let mag_full = compute_impedance(
             &data,
             sample_rate,
             freq,
             ZcheckScale::Cs1pF,
             DEFAULT_DAC_AMPLITUDE,
-        );
-        let (mag_half, _) = compute_impedance(
+        )
+        .magnitude_ohms;
+        let mag_half = compute_impedance(
             &data,
             sample_rate,
             freq,
             ZcheckScale::Cs1pF,
             DEFAULT_DAC_AMPLITUDE / 2.0,
-        );
+        )
+        .magnitude_ohms;
 
         assert!(
             (mag_half / mag_full - 2.0).abs() < 1e-6,
             "got {mag_half} vs {mag_full}"
         );
+    }
+
+    #[test]
+    fn saturation_voltage_flat_below_corner_then_rolls_off() {
+        // Below 0.2*BW the saturation envelope is the flat 5000 µV ceiling.
+        let bw = 7_500.0;
+        assert!((approximate_saturation_voltage(1_000.0, bw) - 5000.0).abs() < 1e-9);
+        // Well above the corner it rolls off monotonically below the ceiling.
+        let high = approximate_saturation_voltage(6_000.0, bw);
+        assert!(high < 5000.0, "expected roll-off, got {high}");
+        assert!(
+            approximate_saturation_voltage(9_000.0, bw) < high,
+            "saturation envelope must be monotonically decreasing past the corner"
+        );
+    }
+
+    #[test]
+    fn railed_channel_is_rejected_open_channel_is_not() {
+        // A near-full-scale sine (railed) exceeds the 5000 µV envelope at 1 kHz.
+        let sample_rate = 30_000.0;
+        let freq = 1000.0;
+        let n = 600;
+        let big = 6000.0 / crate::protocol::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64;
+        let railed: Vec<i16> = (0..n)
+            .map(|i| {
+                let phase = 2.0 * std::f64::consts::PI * freq * (i as f64) / sample_rate;
+                (big * phase.sin()).round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect();
+        let amp = compute_impedance(
+            &railed,
+            sample_rate,
+            freq,
+            ZcheckScale::Cs1pF,
+            DEFAULT_DAC_AMPLITUDE,
+        )
+        .amplitude_uv;
+        assert!(amp >= approximate_saturation_voltage(freq, 7_500.0));
     }
 
     #[test]

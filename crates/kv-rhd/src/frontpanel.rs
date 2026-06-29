@@ -235,6 +235,18 @@ mod imp {
             block_size: usize,
             buffer: &mut [u8],
         ) -> Result<usize, FrontPanelError> {
+            // okFrontPanel_ReadFromBlockPipeOut requires the transfer length to be
+            // an integer multiple of `block_size` (1024 B on USB3). Passing an
+            // unaligned length is undefined: the DLL may reject the whole read,
+            // round down, or hang. Reject it here so callers must allocate an
+            // aligned buffer rather than silently corrupting an impedance run or
+            // stalling bring-up (DA6).
+            if block_size == 0 || !buffer.len().is_multiple_of(block_size) {
+                return Err(FrontPanelError::UnalignedTransfer {
+                    length: buffer.len(),
+                    block_size,
+                });
+            }
             // SAFETY: handle is non-null and exclusively owned. buffer is a
             // valid mutable slice; buffer.len() fits in c_long for all practical
             // block sizes (max ~100 KB). The API writes at most `len` bytes into
@@ -492,6 +504,7 @@ pub enum FrontPanelError {
     FrontPanelNotEnabled,
     Api { function: &'static str, code: i32 },
     TransferFailed { function: &'static str, code: i32 },
+    UnalignedTransfer { length: usize, block_size: usize },
 }
 
 impl fmt::Display for FrontPanelError {
@@ -534,6 +547,11 @@ impl fmt::Display for FrontPanelError {
             Self::TransferFailed { function, code } => {
                 write!(formatter, "{function} returned transfer status {code}")
             }
+            Self::UnalignedTransfer { length, block_size } => write!(
+                formatter,
+                "block-pipe transfer length {length} B is not a multiple of the {block_size} B \
+                 block size; allocate a block-aligned buffer"
+            ),
         }
     }
 }

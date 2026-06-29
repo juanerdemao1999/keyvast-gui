@@ -280,3 +280,30 @@ Initial behavior:
 - Return filesystem errors to the caller.
 
 Real wall-clock write latency, buffer high-water marks, CPU, and memory metrics remain later additions.
+
+## Intan `.rhd` Export Header (DA28)
+
+The `.rhd` exporter (`kv-recorder::export_formats`) writes an Intan v2.0 header
+ahead of the amplifier data. The filter fields in that header describe the
+**analog front end**, not the digitiser, and downstream Intan tools (RHX,
+NeuroScope) re-filter or estimate noise from them. Writing the digitiser Nyquist
+frequency (`sample_rate / 2`) as the "upper bandwidth" therefore misreports the
+hardware: a 30 kS/s capture claimed a 15 kHz analog corner when the headstage is
+actually configured for 7.5 kHz.
+
+The header now carries the **actual** amplifier configuration the application
+programs into every RHD2000 headstage (`Rhd2000Registers::open_ephys_default`):
+
+| Field | Value | Source |
+|-------|-------|--------|
+| DSP enabled | `1` (on) | `enable_dsp(true)` |
+| DSP cutoff | `1.0 Hz` | `set_dsp_cutoff_freq(1.0)` |
+| Lower bandwidth | `1.0 Hz` | `set_lower_bandwidth(1.0)` |
+| Upper bandwidth | `7_500.0 Hz`, capped at Nyquist | `set_upper_bandwidth(7_500.0)` |
+| Impedance test frequency | `1_000.0 Hz` | impedance run default |
+
+These defaults live in `RhdFilterConfig::HARDWARE_DEFAULT` and are carried on
+`ExportHeader::filter`, so a future caller that records the real per-recording
+configuration can override them without touching the writer. The reported upper
+bandwidth is clamped to Nyquist so a low-rate export never advertises a passband
+wider than it can represent.

@@ -52,7 +52,7 @@ fn export_kvraw(
     use std::rc::Rc;
 
     use kv_recorder::KvrawReader;
-    use kv_recorder::export_formats::{self, ExportFormat, ExportHeader};
+    use kv_recorder::export_formats::{self, ExportFormat, ExportHeader, RhdFilterConfig};
 
     // Native format needs no conversion — just copy the .kvraw alongside.
     if format.is_native() {
@@ -74,6 +74,7 @@ fn export_kvraw(
     let header = ExportHeader {
         sample_rate: meta.sample_rate,
         channel_count: meta.channel_count,
+        filter: RhdFilterConfig::default(),
     };
     let notes = format!("exported from {}", source.display());
 

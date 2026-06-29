@@ -590,6 +590,12 @@ fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
     let orig_ch = blocks[1].channel_count;
     blocks[1].samples_per_channel *= 2;
     blocks[1].data = vec![0; orig_ch * blocks[1].samples_per_channel];
+    // Drop per-sample side channels so the block is internally valid and the
+    // only inconsistency under test is samples_per_channel across blocks.
+    blocks[1].ttl_in_per_sample = None;
+    blocks[1].ttl_out_per_sample = None;
+    blocks[1].board_adc_data = None;
+    blocks[1].aux_data = None;
 
     let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
     recorder.write_block(&blocks[0]).expect("first block");

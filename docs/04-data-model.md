@@ -38,6 +38,20 @@ when TTL is enabled); the RHD parser populates them when the corresponding
 endpoints are decoded. `ttl_bits` is the legacy scalar mirror of the most
 recent `ttl_in_per_sample` entry and is always present.
 
+### Validation
+
+`SampleBlock::validate()` is the gate every consumer must pass a block through
+before indexing it. Besides the core invariants (`data.len() == channel_count *
+samples_per_channel`) it also checks that **every populated side-channel vector**
+has the expected length — per-sample TTL words equal `samples_per_channel`, each
+board-ADC and aux channel equals `samples_per_channel` — rejecting a malformed
+block with `SampleBlockError::SideChannelLengthMismatch { channel, expected,
+observed }` instead of letting a later unchecked index panic (DA29). Exporters
+call `validate()` and use checked indexing, surfacing a bad block as
+`RecorderError::InvalidBlock` rather than panicking mid-write (DA11). GUI render
+paths (e.g. `spike_overlay`) bounds-check `block.data` and skip a malformed block
+rather than indexing out of bounds (DA36).
+
 ## Data Layout
 
 The initial internal layout is interleaved by sample:

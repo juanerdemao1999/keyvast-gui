@@ -102,6 +102,65 @@ impl SampleBlock {
             return Err(SampleBlockError::DataLengthMismatch { expected, observed });
         }
 
+        self.validate_side_channels()?;
+
+        Ok(())
+    }
+
+    /// Verify that every populated side-channel vector (per-sample TTL,
+    /// board ADC, auxiliary) carries exactly `samples_per_channel` samples,
+    /// so malformed/partial blocks cannot pass the integrity gate and later
+    /// panic in unchecked export/render paths.
+    fn validate_side_channels(&self) -> Result<(), SampleBlockError> {
+        let spc = self.samples_per_channel;
+
+        for (channel, len) in [
+            (
+                "ttl_in_per_sample",
+                self.ttl_in_per_sample.as_ref().map(Vec::len),
+            ),
+            (
+                "ttl_out_per_sample",
+                self.ttl_out_per_sample.as_ref().map(Vec::len),
+            ),
+        ] {
+            if let Some(observed) = len
+                && observed != spc
+            {
+                return Err(SampleBlockError::SideChannelLengthMismatch {
+                    channel,
+                    expected: spc,
+                    observed,
+                });
+            }
+        }
+
+        if let Some(board_adc) = &self.board_adc_data {
+            for chan in board_adc {
+                if chan.len() != spc {
+                    return Err(SampleBlockError::SideChannelLengthMismatch {
+                        channel: "board_adc_data",
+                        expected: spc,
+                        observed: chan.len(),
+                    });
+                }
+            }
+        }
+
+        if let Some(aux) = &self.aux_data {
+            for stream in aux {
+                for chan in stream {
+                    if chan.len() != spc {
+                        return Err(SampleBlockError::SideChannelLengthMismatch {
+                            channel: "aux_data",
+                            expected: spc,
+                            observed: chan.len(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -150,6 +209,11 @@ pub enum SampleBlockError {
     TtlLineCountOutOfRange {
         ttl_line_count: usize,
     },
+    SideChannelLengthMismatch {
+        channel: &'static str,
+        expected: usize,
+        observed: usize,
+    },
 }
 
 impl fmt::Display for SampleBlockError {
@@ -172,6 +236,14 @@ impl fmt::Display for SampleBlockError {
             Self::TtlLineCountOutOfRange { ttl_line_count } => write!(
                 formatter,
                 "ttl line count {ttl_line_count} exceeds u32 ttl storage width"
+            ),
+            Self::SideChannelLengthMismatch {
+                channel,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "side-channel {channel} length mismatch: expected {expected}, observed {observed}"
             ),
         }
     }
@@ -308,6 +380,55 @@ mod tests {
             Err(SampleBlockError::DataLengthMismatch {
                 expected: 6,
                 observed: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_accepts_correctly_sized_side_channels() {
+        let mut block = valid_block();
+        block.ttl_in_per_sample = Some(vec![0; 3]);
+        block.ttl_out_per_sample = Some(vec![0; 3]);
+        block.board_adc_data = Some(vec![vec![0; 3], vec![0; 3]]);
+        block.aux_data = Some(vec![vec![vec![0; 3]]]);
+        assert_eq!(block.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_short_per_sample_ttl() {
+        let mut block = valid_block();
+        block.ttl_in_per_sample = Some(vec![0; 2]);
+        assert_eq!(
+            block.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "ttl_in_per_sample",
+                expected: 3,
+                observed: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_short_board_adc_and_aux() {
+        let mut adc = valid_block();
+        adc.board_adc_data = Some(vec![vec![0; 3], vec![0; 1]]);
+        assert_eq!(
+            adc.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "board_adc_data",
+                expected: 3,
+                observed: 1,
+            })
+        );
+
+        let mut aux = valid_block();
+        aux.aux_data = Some(vec![vec![vec![0; 3], vec![0; 0]]]);
+        assert_eq!(
+            aux.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "aux_data",
+                expected: 3,
+                observed: 0,
             })
         );
     }

@@ -27,7 +27,7 @@ where
 pub(crate) fn parse_simulator_record_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut args = args.peekable();
@@ -62,13 +62,19 @@ pub(crate) fn parse_simulator_record_args(
     }))
 }
 
+/// Default number of acquisition blocks when `--blocks` is omitted.
+///
+/// A value of 1 captures only a single block (~milliseconds of signal), which
+/// silently produces a near-empty recording when callers forget the flag. This
+/// default acquires a meaningful, non-trivial amount of data instead.
+const DEFAULT_BLOCKS: usize = 1000;
 const DEFAULT_RECORDER_CAPACITY: usize = 2048;
 const DEFAULT_PREVIEW_CAPACITY: usize = 32;
 
 pub(crate) fn parse_simulator_pipeline_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut recorder_capacity = DEFAULT_RECORDER_CAPACITY;
@@ -118,7 +124,7 @@ pub(crate) fn parse_simulator_pipeline_args(
 pub(crate) fn parse_simulator_stream_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut recorder_capacity = DEFAULT_RECORDER_CAPACITY;
@@ -264,7 +270,7 @@ pub(crate) fn parse_benchmark_args(
 pub(crate) fn parse_rhd_smoke_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut enabled_streams = 2_usize;
     let mut raw_input: Option<PathBuf> = None;
     let mut bitfile_path = default_rhd_bitfile_path();

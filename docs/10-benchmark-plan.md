@@ -28,6 +28,10 @@ Use shorter runs during development:
 | stress-256 | 256 channels x 30 kHz | 10 minutes |
 | endurance | 64 channels x 30 kHz | 2 hours |
 
+When neither `--blocks` nor `--duration` is given, the CLI now acquires
+`DEFAULT_BLOCKS = 1000` blocks instead of a single block, so an unparameterized
+run produces a meaningful, non-trivial recording (DA31).
+
 ## Metrics
 
 Each benchmark should report:
@@ -54,6 +58,11 @@ Initial `benchmark.json` fields:
 
 - `measurement_kind: "simulator_estimate"`
 - `duration_seconds` based on written samples, channel count, and sample rate
+  (the *recorded* signal duration, derived from `written_samples`, not the
+  requested run length — DA32)
+- `requested_duration_seconds` — the duration the operator asked for (`null`
+  when the run was bounded by `--blocks` rather than `--duration`), so a short
+  or truncated run is distinguishable from its target (DA32)
 - `channel_count`
 - `sample_rate`
 - `expected_samples`

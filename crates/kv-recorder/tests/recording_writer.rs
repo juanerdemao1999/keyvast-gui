@@ -166,6 +166,8 @@ fn writes_benchmark_summary_json() {
     let summary = BenchmarkSummary {
         measurement_kind: "simulator_estimate".to_string(),
         duration_seconds: 0.0064,
+        wall_clock_seconds: Some(0.5),
+        requested_duration_seconds: None,
         channel_count: 64,
         sample_rate: 30_000.0,
         expected_samples: 16_384,
@@ -191,6 +193,8 @@ fn writes_benchmark_summary_json() {
     let benchmark = fs::read_to_string(benchmark_path).expect("benchmark json");
     assert!(benchmark.contains("\"measurement_kind\": \"simulator_estimate\""));
     assert!(benchmark.contains("\"duration_seconds\": 0.006400"));
+    assert!(benchmark.contains("\"wall_clock_seconds\": 0.500000"));
+    assert!(benchmark.contains("\"requested_duration_seconds\": null"));
     assert!(benchmark.contains("\"channel_count\": 64"));
     assert!(benchmark.contains("\"sample_rate\": 30000.0"));
     assert!(benchmark.contains("\"expected_samples\": 16384"));

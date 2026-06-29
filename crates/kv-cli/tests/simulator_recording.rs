@@ -173,6 +173,23 @@ fn simulator_record_parse_uses_default_run_directory_when_output_is_omitted() {
 }
 
 #[test]
+fn simulator_record_uses_nontrivial_block_default_when_blocks_omitted() {
+    let command = parse_args(["simulator-record"]).expect("args should parse");
+
+    let CliCommand::SimulatorRecord(options) = command else {
+        panic!("expected SimulatorRecord command");
+    };
+
+    // A default of 1 silently produced a ~millisecond recording; the default
+    // must capture a meaningful amount of data instead.
+    assert!(
+        options.blocks > 1,
+        "default block count should be greater than 1, got {}",
+        options.blocks
+    );
+}
+
+#[test]
 fn kv_acq_binary_runs_simulator_record_command() {
     let output_dir = unique_output_dir("binary-recording");
     let binary = env!("CARGO_BIN_EXE_kv-acq");

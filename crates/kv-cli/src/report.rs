@@ -9,10 +9,17 @@ pub(crate) fn streaming_benchmark_summary(
     result: &StreamingPipelineResult,
     device: &kv_types::DeviceConfig,
     process_metrics: Option<&ProcessMetrics>,
+    requested_duration_seconds: Option<f64>,
 ) -> BenchmarkSummary {
     BenchmarkSummary {
         measurement_kind: "measured_streaming".to_string(),
-        duration_seconds: result.timing.wall_clock_seconds,
+        duration_seconds: recorded_duration_seconds(
+            result.integrity.summary.written_samples,
+            device.channel_count,
+            device.sample_rate,
+        ),
+        wall_clock_seconds: Some(result.timing.wall_clock_seconds),
+        requested_duration_seconds,
         channel_count: device.channel_count,
         sample_rate: device.sample_rate,
         expected_samples: result.integrity.summary.expected_samples,
@@ -68,6 +75,8 @@ pub(crate) fn rhd_smoke_benchmark_summary(
             "rhd_raw_input".to_string()
         },
         duration_seconds,
+        wall_clock_seconds: None,
+        requested_duration_seconds: None,
         channel_count: acquisition.status.channel_count,
         sample_rate: acquisition.status.sample_rate,
         expected_samples: integrity.summary.expected_samples,
@@ -97,7 +106,13 @@ pub(crate) fn pipeline_benchmark_summary(
 
     BenchmarkSummary {
         measurement_kind: "measured".to_string(),
-        duration_seconds: pipeline.timing.wall_clock_seconds,
+        duration_seconds: recorded_duration_seconds(
+            pipeline.integrity.summary.written_samples,
+            channel_count,
+            sample_rate,
+        ),
+        wall_clock_seconds: Some(pipeline.timing.wall_clock_seconds),
+        requested_duration_seconds: None,
         channel_count,
         sample_rate,
         expected_samples: pipeline.integrity.summary.expected_samples,
@@ -279,6 +294,8 @@ pub(crate) fn simulator_benchmark_summary(
     BenchmarkSummary {
         measurement_kind: "simulator_estimate".to_string(),
         duration_seconds,
+        wall_clock_seconds: None,
+        requested_duration_seconds: None,
         channel_count: acquisition.status.channel_count,
         sample_rate: acquisition.status.sample_rate,
         expected_samples: integrity.summary.expected_samples,

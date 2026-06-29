@@ -60,6 +60,19 @@ impl fmt::Display for IntegrityError {
 impl std::error::Error for IntegrityError {}
 
 pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, IntegrityError> {
+    check_blocks_with_expected_start(None, blocks)
+}
+
+/// Like [`check_blocks`], but `expected_first_packet_id` declares the packet id
+/// the session was expected to begin at. Packets lost *before* the first
+/// observed block (DA43) are then counted as missing instead of being silently
+/// skipped because accounting anchored on whichever block happened to arrive
+/// first. Acquisition numbers packets from 0, so the pipeline passes `Some(0)`;
+/// pass `None` to anchor on the first observed block as before.
+pub fn check_blocks_with_expected_start(
+    expected_first_packet_id: Option<u64>,
+    blocks: &[SampleBlock],
+) -> Result<IntegrityReport, IntegrityError> {
     let mut report = IntegrityReport {
         summary: IntegritySummary::default(),
         packet_gaps: Vec::new(),
@@ -82,13 +95,20 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
             .written_samples
             .saturating_add(block.data.len() as u64);
 
-        if let Some(previous) = previous_block {
-            let had_gap = check_packet_continuity(previous, block, &mut report)?;
-            // Only check timestamp continuity when there is no packet gap;
-            // a gap naturally causes a timestamp jump that is not a clock
-            // discontinuity.
-            if !had_gap {
-                check_timestamp_continuity(previous, block, &mut report);
+        match previous_block {
+            Some(previous) => {
+                let had_gap = check_packet_continuity(previous, block, &mut report)?;
+                // Only check timestamp continuity when there is no packet gap;
+                // a gap naturally causes a timestamp jump that is not a clock
+                // discontinuity.
+                if !had_gap {
+                    check_timestamp_continuity(previous, block, &mut report);
+                }
+            }
+            None => {
+                if let Some(base) = expected_first_packet_id {
+                    account_missing_before_first_block(base, block, &mut report);
+                }
             }
         }
 
@@ -107,6 +127,35 @@ pub fn check_blocks(blocks: &[SampleBlock]) -> Result<IntegrityReport, Integrity
         .saturating_add(report.summary.written_samples);
 
     Ok(report)
+}
+
+/// Account for packets lost before the first observed block (DA43). Counting
+/// starts at `expected_first_packet_id`; if the first block we actually saw is
+/// forward of it, the difference was lost ahead of the recording and is folded
+/// into the missing tallies (sample estimate uses the first block's geometry).
+fn account_missing_before_first_block(
+    expected_first_packet_id: u64,
+    first_block: &SampleBlock,
+    report: &mut IntegrityReport,
+) {
+    let forward_gap = first_block.packet_id.wrapping_sub(expected_first_packet_id);
+    // `0` means the stream started exactly where expected; a huge wrapping
+    // distance means the first id is *behind* the baseline, which is not
+    // pre-stream loss, so leave both cases alone.
+    if forward_gap == 0 || forward_gap > u64::MAX / 2 {
+        return;
+    }
+
+    report.summary.missing_packets = report.summary.missing_packets.saturating_add(forward_gap);
+    report.summary.expected_samples = report
+        .summary
+        .expected_samples
+        .saturating_add((first_block.expected_sample_values() as u64).saturating_mul(forward_gap));
+    report.packet_gaps.push(PacketGap {
+        expected_packet_id: expected_first_packet_id,
+        observed_packet_id: first_block.packet_id,
+        missing_count: forward_gap,
+    });
 }
 
 /// Returns `Ok(true)` if a packet gap was detected, `Ok(false)` if
@@ -175,7 +224,31 @@ fn check_timestamp_continuity(
                 expected_timestamp_start,
                 observed_timestamp_start: current.timestamp_start,
             });
+        report.summary.expected_samples =
+            report
+                .summary
+                .expected_samples
+                .saturating_add(hardware_missing_sample_values(
+                    expected_timestamp_start,
+                    current,
+                ));
     }
+}
+
+/// Estimate the sample values the FPGA dropped across a hardware-timestamp jump
+/// (DA35). The host packet id increments on every read, so FPGA FIFO loss never
+/// shows up as a packet gap; the only evidence is the timestamp advancing
+/// further than the previous block covered. A forward jump of `n` sample ticks
+/// means `n * channel_count` sample values went missing. A backwards jump
+/// (timestamp reset/overlap) is not loss, so it contributes nothing.
+fn hardware_missing_sample_values(expected_timestamp_start: u64, current: &SampleBlock) -> u64 {
+    let forward = current
+        .timestamp_start
+        .wrapping_sub(expected_timestamp_start);
+    if forward == 0 || forward > u64::MAX / 2 {
+        return 0;
+    }
+    forward.saturating_mul(current.channel_count as u64)
 }
 
 /// Incremental integrity checker that processes blocks one at a time.
@@ -185,6 +258,7 @@ fn check_timestamp_continuity(
 #[derive(Debug, Clone)]
 pub struct IncrementalIntegrity {
     report: IntegrityReport,
+    expected_first_packet_id: Option<u64>,
     previous_packet_id: Option<u64>,
     previous_timestamp_after_block: Option<u64>,
     previous_samples_per_block: Option<u64>,
@@ -198,9 +272,21 @@ impl IncrementalIntegrity {
                 packet_gaps: Vec::new(),
                 timestamp_discontinuities: Vec::new(),
             },
+            expected_first_packet_id: None,
             previous_packet_id: None,
             previous_timestamp_after_block: None,
             previous_samples_per_block: None,
+        }
+    }
+
+    /// Like [`IncrementalIntegrity::new`], but declares the packet id the
+    /// session was expected to begin at so packets lost before the first
+    /// observed block (DA43) are counted as missing. Acquisition numbers
+    /// packets from 0, so the streaming pipeline passes `0`.
+    pub fn with_expected_first_packet_id(expected_first_packet_id: u64) -> Self {
+        Self {
+            expected_first_packet_id: Some(expected_first_packet_id),
+            ..Self::new()
         }
     }
 
@@ -221,6 +307,12 @@ impl IncrementalIntegrity {
             .summary
             .written_samples
             .saturating_add(block.data.len() as u64);
+
+        if self.previous_packet_id.is_none()
+            && let Some(base) = self.expected_first_packet_id
+        {
+            account_missing_before_first_block(base, block, &mut self.report);
+        }
 
         let mut had_gap = false;
         if let Some(previous_id) = self.previous_packet_id {
@@ -277,6 +369,11 @@ impl IncrementalIntegrity {
                     expected_timestamp_start: expected_timestamp,
                     observed_timestamp_start: block.timestamp_start,
                 });
+            self.report.summary.expected_samples = self
+                .report
+                .summary
+                .expected_samples
+                .saturating_add(hardware_missing_sample_values(expected_timestamp, block));
         }
 
         self.previous_packet_id = Some(block.packet_id);

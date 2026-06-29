@@ -5,7 +5,7 @@ pub mod process_metrics;
 
 use std::fmt;
 
-use kv_integrity::{IntegrityError, IntegrityReport, check_blocks};
+use kv_integrity::{IntegrityError, IntegrityReport, check_blocks_with_expected_start};
 use kv_types::{AcquisitionState, DeviceConfig, DeviceStatus, SampleBlock};
 
 pub trait AcquisitionSource {
@@ -206,7 +206,9 @@ where
 
     state_history.push(AcquisitionState::Stopping);
 
-    let integrity = match check_blocks(&blocks) {
+    // Acquisition numbers packets from 0; anchor there so loss before the first
+    // observed block is counted (DA43).
+    let integrity = match check_blocks_with_expected_start(Some(0), &blocks) {
         Ok(report) => report,
         Err(source) => {
             let message = source.to_string();

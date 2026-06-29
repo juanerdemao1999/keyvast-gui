@@ -152,6 +152,42 @@ window rather than a continuous stream to drain.
 
 ---
 
+## Round 4 — Crash Resilience
+
+### 4.1 Per-Frame Panic Isolation (DA34)
+
+**Problem**: `eframe` drives `KvApp::update()` once per frame, and that frame
+drives the live acquisition/recording pipeline directly.  A panic anywhere in
+the render path — an out-of-range notch index, a non-power-of-two FFT length, a
+stray `unwrap` — unwinds straight out of the event loop and the main thread
+exits.  When that happens mid-experiment, the recorder thread is killed before
+it can flush the `.kvraw` footer, so the in-progress recording is left
+truncated and the experiment's data is lost.  The release profile also left the
+panic strategy implicit, so a future `panic = "abort"` could silently defeat any
+guard.
+
+**Solution**:
+- Declare `panic = "unwind"` explicitly in `[profile.release]` with a comment
+  noting that the GUI guard depends on it (`abort` would bypass `catch_unwind`).
+- Add a `panic_guard::guard_frame()` helper that runs one frame body inside
+  `std::panic::catch_unwind`, returning `Ok(())` or `Err(message)` with a
+  best-effort human-readable description of the payload.
+- In the `eframe::App::update()` wrapper, run the real `render_frame()` through
+  the guard.  On panic, latch `fatal_panic`, send `RecorderCmd::Terminate` so
+  the recorder finalizes the active `.kvraw`, drop the live pipeline, and render
+  a static recovery screen instead of re-entering the broken render path.
+
+**Acceptance criteria**:
+- [ ] Release profile declares `panic = "unwind"` explicitly.
+- [ ] A panic in any panel during `update()` is caught; the process stays alive
+      and shows a recovery screen rather than vanishing.
+- [ ] On a caught panic while recording, `RecorderCmd::Terminate` is sent so the
+      `.kvraw` footer is flushed and the file is a valid recording.
+- [ ] Once latched, subsequent frames render the recovery screen without
+      re-running the panicking path.
+
+---
+
 ## Verification Commands
 
 ```bash
@@ -178,3 +214,4 @@ cargo clippy --workspace
 | 2.2 Dynamic channel spacing | Pending | — |
 | 3.1 Extended palette | Pending | — |
 | 3.2 Drag-to-browse | Pending | — |
+| 4.1 Per-frame panic isolation (DA34) | Done | — |

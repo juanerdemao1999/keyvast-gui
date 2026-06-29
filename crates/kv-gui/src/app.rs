@@ -42,6 +42,7 @@ use crate::panels::{
     self, DeviceKind, DeviceSettings, DisplaySettings, FilterSettings, RecordingSettings,
     RecordingState,
 };
+use crate::panic_guard;
 use crate::playback::{self, PlaybackManager};
 use crate::preview::{BlockStats, compute_block_stats};
 use crate::remote_api::{
@@ -239,6 +240,9 @@ pub struct KvApp {
     /// Window size persisted at startup, reused on the first frame so the
     /// config file is read once (in `new`) rather than again in `update`.
     restore_window_size: (f32, f32),
+    /// Latched fatal frame panic. Once set, the GUI stops driving the live
+    /// render path and shows a static recovery screen (DA34).
+    fatal_panic: Option<String>,
 }
 
 impl KvApp {
@@ -326,6 +330,7 @@ impl KvApp {
             ui_scale,
             window_restored: false,
             restore_window_size: (saved.window_width, saved.window_height),
+            fatal_panic: None,
         };
 
         // Apply the persisted display/filter/recording settings to live state.
@@ -367,8 +372,11 @@ impl KvApp {
     }
 }
 
-impl eframe::App for KvApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl KvApp {
+    /// Render and drive one frame. Invoked by `<KvApp as eframe::App>::update`
+    /// inside a `catch_unwind` guard (DA34) so a panic anywhere in the render
+    /// path finalizes the active recording instead of aborting the process.
+    fn render_frame(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let frame_start = Instant::now();
         let frame_delta_ms = frame_start.duration_since(self.last_frame).as_secs_f64() * 1000.0;
         self.last_frame = frame_start;
@@ -538,6 +546,70 @@ impl eframe::App for KvApp {
             || self.export_rx.is_some()
             || self.filter_change_pending_since.is_some()
         {
+            ctx.request_repaint();
+        }
+    }
+
+    /// DA34: latch a frame panic and finalize any active recording.
+    ///
+    /// Dropping the pipeline runs [`LivePipelineHandle`]'s `Drop`/`stop`, which
+    /// sends [`RecorderCmd::Terminate`] and joins both threads so the active
+    /// `.kvraw` gets its footer flushed before the process can exit.
+    fn handle_frame_panic(&mut self, msg: String) {
+        log::error!("GUI frame panicked; finalizing recording before recovery: {msg}");
+        if let Some(pipeline) = self.live_pipeline.as_ref() {
+            let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Terminate);
+        }
+        self.live_pipeline = None;
+        self.fatal_panic = Some(msg);
+    }
+
+    /// DA34: static recovery screen shown after a frame has panicked.
+    fn render_panic_screen(&self, ctx: &egui::Context) {
+        let msg = self.fatal_panic.clone().unwrap_or_default();
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading(
+                    egui::RichText::new("A panel crashed")
+                        .size(22.0)
+                        .color(theme::ACCENT_RED),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    "The interface hit an unexpected error and was paused to protect your data. \
+                     Any recording in progress has been finalized to disk.",
+                );
+                ui.add_space(12.0);
+                ui.label(
+                    egui::RichText::new(msg)
+                        .monospace()
+                        .color(theme::TEXT_SECONDARY),
+                );
+                ui.add_space(16.0);
+                ui.label(
+                    egui::RichText::new("Please restart the application to continue.")
+                        .color(theme::TEXT_DIM),
+                );
+            });
+        });
+    }
+}
+
+impl eframe::App for KvApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // DA34: once a frame has panicked, stop driving the broken render path;
+        // re-entering it would only risk panicking again and spinning the event loop.
+        if self.fatal_panic.is_some() {
+            self.render_panic_screen(ctx);
+            return;
+        }
+
+        // Isolate the frame so any panel panic still lets us finalize recording
+        // and keep the process alive long enough to surface an error screen.
+        if let Err(msg) = panic_guard::guard_frame(|| self.render_frame(ctx, frame)) {
+            self.handle_frame_panic(msg);
+            self.render_panic_screen(ctx);
             ctx.request_repaint();
         }
     }

@@ -83,10 +83,18 @@ fn backend_errors_move_run_into_explicit_error_path() {
     let error =
         run_fixed_blocks(&device_config, 2, &mut backend).expect_err("second read should fail");
 
-    let AcquisitionRunError::BackendRead { summary, message } = error else {
+    let AcquisitionRunError::BackendRead {
+        summary,
+        message,
+        blocks,
+    } = error
+    else {
         panic!("expected backend read error");
     };
 
+    // The block acquired before the failure must be preserved so callers can
+    // finalize a partial recording (DA14).
+    assert_eq!(blocks.len(), 1);
     assert_eq!(message, "synthetic read failure");
     assert_eq!(summary.state, AcquisitionState::Error);
     assert_eq!(

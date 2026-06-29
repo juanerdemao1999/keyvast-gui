@@ -13,7 +13,7 @@ pub(crate) use kv_core::pipeline::{
 };
 pub(crate) use kv_core::process_metrics::{ProcessMetrics, ProcessMetricsCollector};
 pub(crate) use kv_core::{AcquisitionRunError, AcquisitionRunSummary, run_fixed_blocks};
-pub(crate) use kv_integrity::IntegrityReport;
+pub(crate) use kv_integrity::{IntegrityReport, check_blocks};
 pub(crate) use kv_recorder::{
     BenchmarkSummary, RecorderError, RecordingSummary, ttl_change_events, write_benchmark_summary,
     write_events_csv, write_integrity_summary, write_log_file, write_recording,
@@ -27,7 +27,7 @@ pub(crate) use kv_rhd::{
 pub(crate) use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError};
 pub(crate) use kv_types::{
     AcquisitionEvent, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET,
-    DeviceConfig,
+    DeviceConfig, SampleBlock,
 };
 
 mod args;

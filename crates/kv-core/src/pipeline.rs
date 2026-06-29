@@ -142,6 +142,26 @@ struct SharedState {
     /// Cumulative dropped-block count reported by the fanout buffer, surfaced
     /// so overflow is observable instead of only logged.
     dropped_blocks_total: u64,
+    /// Set by the consumer to ask the producer to stop early (e.g. a recorder
+    /// write failure). The producer checks it before each `read_block` so a
+    /// consumer-side error cannot orphan an acquisition thread (DA12).
+    stop_requested: bool,
+}
+
+/// Result of draining the recorder consumer to completion.
+enum ConsumeOutcome {
+    /// The producer finished normally and every block was written.
+    Completed,
+    /// The producer reported an acquisition error after some blocks.
+    ProducerFailed { message: String },
+}
+
+/// Ask the producer thread to stop at its next iteration.
+fn request_stop(shared: &Arc<(Mutex<SharedState>, Condvar)>) {
+    let (lock, cvar) = &**shared;
+    let mut state = lock.lock().expect("shared state lock poisoned");
+    state.stop_requested = true;
+    cvar.notify_all();
 }
 
 /// Run a threaded fan-out acquisition pipeline.
@@ -188,6 +208,7 @@ where
             producer_done: false,
             producer_error: None,
             dropped_blocks_total: 0,
+            stop_requested: false,
         }),
         Condvar::new(),
     ));
@@ -301,6 +322,13 @@ fn producer_loop<S>(
     let (lock, cvar) = &**shared;
 
     for _ in 0..requested {
+        // Honor a consumer stop request before reading more from hardware.
+        {
+            let state = lock.lock().expect("shared state lock poisoned");
+            if state.stop_requested {
+                break;
+            }
+        }
         match source.read_block() {
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
@@ -337,6 +365,77 @@ fn producer_loop<S>(
     let mut state = lock.lock().expect("shared state lock poisoned");
     state.producer_done = true;
     cvar.notify_all();
+}
+
+/// Drive the recorder consumer of a streaming pipeline to completion.
+///
+/// Returns `Ok(Completed)` when the producer finished cleanly, `Ok(
+/// ProducerFailed)` when the producer reported an acquisition error, or `Err`
+/// when a recorder/integrity write failed.  In every case the caller is
+/// responsible for stopping and joining the producer and finalizing the
+/// recorder (DA12).
+fn consume_streaming(
+    shared: &Arc<(Mutex<SharedState>, Condvar)>,
+    recorder_id: kv_buffer::BufferConsumerId,
+    preview_id: kv_buffer::BufferConsumerId,
+    recorder: &mut StreamingRecorder,
+    integrity: &mut IncrementalIntegrity,
+    first_block_time: &mut Option<Instant>,
+) -> Result<ConsumeOutcome, PipelineError> {
+    loop {
+        let (lock, cvar) = &**shared;
+        let mut state = lock.lock().expect("shared state lock poisoned");
+
+        while !state.producer_done {
+            if let Ok(status) = state.buffer.consumer_status(recorder_id)
+                && status.buffered_blocks > 0
+            {
+                break;
+            }
+            state = cvar.wait(state).expect("condvar wait failed");
+        }
+
+        // Collect Arc pointers inside the lock, then release before I/O.
+        let drained = collect_consumer(&mut state.buffer, recorder_id);
+        let done = state.producer_done;
+        let error = if done {
+            state.producer_error.clone()
+        } else {
+            None
+        };
+        collect_preview(&mut state.buffer, preview_id);
+
+        let drained_final = if done {
+            let d = collect_consumer(&mut state.buffer, recorder_id);
+            collect_preview(&mut state.buffer, preview_id);
+            d
+        } else {
+            Vec::new()
+        };
+
+        // Release the lock before performing disk I/O.
+        drop(state);
+
+        // Write blocks to disk and check integrity outside the critical section.
+        for block in &drained {
+            integrity.push(block)?;
+            recorder.write_block(block)?;
+        }
+        if first_block_time.is_none() && recorder.block_count() > 0 {
+            *first_block_time = Some(Instant::now());
+        }
+        for block in &drained_final {
+            integrity.push(block)?;
+            recorder.write_block(block)?;
+        }
+
+        if done {
+            return match error {
+                Some(message) => Ok(ConsumeOutcome::ProducerFailed { message }),
+                None => Ok(ConsumeOutcome::Completed),
+            };
+        }
+    }
 }
 
 /// Collect Arc pointers from a consumer queue without cloning the data.
@@ -397,17 +496,13 @@ where
             producer_done: false,
             producer_error: None,
             dropped_blocks_total: 0,
+            stop_requested: false,
         }),
         Condvar::new(),
     ));
 
-    let requested = config.requested_blocks;
-    let shared_producer = Arc::clone(&shared);
-
-    let producer_handle = thread::spawn(move || {
-        producer_loop(source, requested, &shared_producer, events);
-    });
-
+    // Create the recorder before spawning the producer so a recorder setup
+    // failure cannot orphan an acquisition thread (DA12).
     let recording_config = RecordingConfig {
         enabled_channels: config.device.enabled_channels.clone(),
         ttl_line_count: if config.device.ttl_enabled {
@@ -420,71 +515,49 @@ where
     let mut integrity = IncrementalIntegrity::new();
     let mut first_block_time: Option<Instant> = None;
 
-    loop {
-        let (lock, cvar) = &*shared;
-        let mut state = lock.lock().expect("shared state lock poisoned");
+    let requested = config.requested_blocks;
+    let shared_producer = Arc::clone(&shared);
 
-        while !state.producer_done {
-            if let Ok(status) = state.buffer.consumer_status(recorder_id)
-                && status.buffered_blocks > 0
-            {
-                break;
-            }
-            state = cvar.wait(state).expect("condvar wait failed");
+    let producer_handle = thread::spawn(move || {
+        producer_loop(source, requested, &shared_producer, events);
+    });
+
+    // Drain the recorder consumer.  On ANY error (recorder write, integrity)
+    // the loop reports its outcome instead of returning early, so we always
+    // stop and join the producer and finalize the recorder afterwards (DA12).
+    let outcome = consume_streaming(
+        &shared,
+        recorder_id,
+        preview_id,
+        &mut recorder,
+        &mut integrity,
+        &mut first_block_time,
+    );
+
+    // Whatever happened, signal the producer to stop and join it so no
+    // acquisition thread is left streaming from hardware into a buffer no one
+    // drains.
+    request_stop(&shared);
+    let join_result = producer_handle.join();
+
+    match outcome {
+        Err(error) => {
+            // Finalize so a partial .kvraw is not left silently truncated.
+            let _ = recorder.finish();
+            return Err(error);
         }
-
-        // Collect Arc pointers inside the lock, then release before I/O.
-        let drained = collect_consumer(&mut state.buffer, recorder_id);
-        let done = state.producer_done;
-        let error = if done {
-            state.producer_error.clone()
-        } else {
-            None
-        };
-        collect_preview(&mut state.buffer, preview_id);
-
-        let drained_final = if done {
-            let d = collect_consumer(&mut state.buffer, recorder_id);
-            collect_preview(&mut state.buffer, preview_id);
-            d
-        } else {
-            Vec::new()
-        };
-
-        // Release the lock before performing disk I/O.
-        drop(state);
-
-        // Write blocks to disk and check integrity outside the critical section.
-        for block in &drained {
-            integrity.push(block)?;
-            recorder.write_block(block)?;
+        Ok(ConsumeOutcome::ProducerFailed { message }) => {
+            let blocks_acquired = recorder.block_count();
+            let _ = recorder.finish();
+            return Err(PipelineError::ProducerFailed {
+                message,
+                blocks_acquired,
+            });
         }
-        if first_block_time.is_none() && recorder.block_count() > 0 {
-            first_block_time = Some(Instant::now());
-        }
-        for block in &drained_final {
-            integrity.push(block)?;
-            recorder.write_block(block)?;
-        }
-
-        if done {
-            if let Some(error) = error {
-                let blocks_acquired = recorder.block_count();
-                // Finalize the file (flush + rewrite the header) even on the
-                // error path so a partial .kvraw is not left silently truncated.
-                let _ = recorder.finish();
-                return Err(PipelineError::ProducerFailed {
-                    message: error,
-                    blocks_acquired,
-                });
-            }
-            break;
-        }
+        Ok(ConsumeOutcome::Completed) => {}
     }
 
-    producer_handle
-        .join()
-        .map_err(|_| PipelineError::ProducerPanicked)?;
+    join_result.map_err(|_| PipelineError::ProducerPanicked)?;
 
     let (lock, _) = &*shared;
     let state = lock.lock().expect("shared state lock poisoned");
@@ -552,6 +625,8 @@ mod tests {
                 buffer: fanout,
                 producer_done: false,
                 producer_error: None,
+                dropped_blocks_total: 0,
+                stop_requested: false,
             }),
             Condvar::new(),
         ));
@@ -595,6 +670,8 @@ mod tests {
                 buffer: fanout,
                 producer_done: false,
                 producer_error: None,
+                dropped_blocks_total: 0,
+                stop_requested: false,
             }),
             Condvar::new(),
         ));

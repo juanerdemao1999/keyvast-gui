@@ -94,6 +94,10 @@ pub enum AcquisitionRunError {
     BackendRead {
         summary: Box<AcquisitionRunSummary>,
         message: String,
+        /// Blocks acquired before the read failed.  Carried so the caller can
+        /// finalize a partial recording instead of discarding hours of
+        /// unreproducible in-vivo data on a recoverable mid-run error (DA14).
+        blocks: Vec<SampleBlock>,
     },
     Integrity {
         summary: Box<AcquisitionRunSummary>,
@@ -194,6 +198,7 @@ where
                 return Err(AcquisitionRunError::BackendRead {
                     summary: Box::new(summary),
                     message,
+                    blocks,
                 });
             }
         }

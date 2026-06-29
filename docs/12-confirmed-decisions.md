@@ -387,3 +387,21 @@ railed fraction at the chosen delay); scan position is never the tiebreaker.
 The decision logic is factored into pure functions (`choose_port_delay`,
 `port_is_better`) over a `DelayProbe` summary so it is unit-tested without
 hardware; the hardware I/O loop only feeds them per-delay probe results.
+
+## Acquisition FIFO Underrun Tolerance (P4: DA4)
+
+DA4  `read_raw_block()` blocks on the Rhythm FIFO until a full block is
+     available. The wait previously polled for ~1 s and then treated any
+     shortfall as a fatal `NotEnoughFifoWords`, with no retry and no way to
+     distinguish a transient stall (host scheduling jitter, USB back-pressure,
+     the FPGA briefly behind) from a genuine hardware failure. A single
+     scheduling hiccup therefore tore down an otherwise-healthy acquisition.
+
+     `wait_for_fifo_words()` now makes up to `FIFO_WAIT_MAX_ATTEMPTS` (5) wait
+     attempts of ~1 s each, logging a `[WARN]` FIFO-underrun line per missed
+     attempt, and only returns the fatal `NotEnoughFifoWords` after the whole
+     ~5 s budget is exhausted. A transient underrun is thus ridden out instead
+     of ending the session, while a truly stalled board still fails (just with
+     diagnostic warnings first). The poll/timeout logic lives in the pure
+     `poll_fifo_words()` helper so the retry behaviour is unit-tested without
+     hardware.

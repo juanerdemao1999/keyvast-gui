@@ -24,10 +24,158 @@ const KVRAW_JSON_RESERVED: usize = 512;
 /// Byte offset where sample data begins (8 magic + 4 len + 512 json = 524).
 pub const KVRAW_DATA_OFFSET: u64 = 8 + 4 + KVRAW_JSON_RESERVED as u64;
 
+// ── KVAUX side-channel sidecar format constants ──────────────────────────────
+//
+// The `.kvraw` file holds only interleaved amplifier samples.  Per-sample TTL
+// in/out words, board-ADC channels and auxiliary-command channels — all parsed
+// off the wire but previously discarded — are persisted alongside it in a
+// companion `recording.kvaux` file, together with the channel→electrode mapping
+// metadata that the bare `.kvraw` header lacks.
+//
+// File layout (mirrors the `.kvraw` embedded-header convention):
+//   [0..8]      magic b"KVAUX1\0\0"
+//   [8..12]     json_len: u32 LE
+//   [12..8204]  json_block: 8192 B  (UTF-8 JSON, zero-padded)
+//   [8204..]    per-block side-channel payload (see `SideChannelLayout`)
+//
+// The sidecar is always written so the channel mapping is recoverable even when
+// a recording carries no side-channel streams.
+const KVAUX_MAGIC: &[u8; 8] = b"KVAUX1\0\0";
+const KVAUX_JSON_RESERVED: usize = 8192;
+/// Byte offset where side-channel payload begins (8 magic + 4 len + 8192 json).
+pub const KVAUX_DATA_OFFSET: u64 = 8 + 4 + KVAUX_JSON_RESERVED as u64;
+
 /// Maximum number of write-latency samples kept in memory (reservoir sampler).
 const LATENCY_RESERVOIR_CAP: usize = 65_536;
 
 use kv_types::{AcquisitionEvent, IntegritySummary, SampleBlock, SampleBlockError};
+
+/// Channel-mapping and acquisition metadata captured when a recording starts.
+///
+/// The bare `.kvraw` header records only a `channel_count`; this carries the
+/// selective-save column→electrode mapping and TTL line width so a recording is
+/// self-describing.  When `enabled_channels` is empty the recording captured
+/// every channel in natural order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordingConfig {
+    /// Original device channel indices, in the order they appear in `.kvraw`
+    /// columns.  Empty means "all channels, natural order".
+    pub enabled_channels: Vec<usize>,
+    /// Number of TTL lines the device exposes (0 when TTL is disabled).
+    pub ttl_line_count: usize,
+}
+
+/// Per-block layout of the side-channel streams written to the `.kvaux` sidecar.
+///
+/// Established from the first block and enforced for every subsequent block so
+/// the payload is a fixed-stride sequence the reader can index without a table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SideChannelLayout {
+    /// Samples per block for the TTL-input word stream, or `None` when absent.
+    pub ttl_in_samples: Option<usize>,
+    /// Samples per block for the TTL-output word stream, or `None` when absent.
+    pub ttl_out_samples: Option<usize>,
+    /// Number of board-ADC channels (0 when absent).
+    pub board_adc_channels: usize,
+    /// Samples per block, per board-ADC channel.
+    pub board_adc_samples: usize,
+    /// Number of auxiliary streams (0 when absent).
+    pub aux_streams: usize,
+    /// Auxiliary channels per stream (typically 3).
+    pub aux_channels_per_stream: usize,
+    /// Samples per block, per auxiliary channel.
+    pub aux_samples: usize,
+}
+
+impl SideChannelLayout {
+    /// Derives the layout from a block's optional side-channel vectors.
+    fn from_block(block: &SampleBlock) -> Self {
+        let board_adc_channels = block
+            .board_adc_data
+            .as_ref()
+            .map(|adc| adc.len())
+            .unwrap_or(0);
+        let board_adc_samples = block
+            .board_adc_data
+            .as_ref()
+            .and_then(|adc| adc.first())
+            .map(|ch| ch.len())
+            .unwrap_or(0);
+        let aux_streams = block.aux_data.as_ref().map(|aux| aux.len()).unwrap_or(0);
+        let aux_channels_per_stream = block
+            .aux_data
+            .as_ref()
+            .and_then(|aux| aux.first())
+            .map(|stream| stream.len())
+            .unwrap_or(0);
+        let aux_samples = block
+            .aux_data
+            .as_ref()
+            .and_then(|aux| aux.first())
+            .and_then(|stream| stream.first())
+            .map(|ch| ch.len())
+            .unwrap_or(0);
+        Self {
+            ttl_in_samples: block.ttl_in_per_sample.as_ref().map(|v| v.len()),
+            ttl_out_samples: block.ttl_out_per_sample.as_ref().map(|v| v.len()),
+            board_adc_channels,
+            board_adc_samples,
+            aux_streams,
+            aux_channels_per_stream,
+            aux_samples,
+        }
+    }
+
+    /// True when no side-channel stream is present.
+    fn is_empty(&self) -> bool {
+        self.ttl_in_samples.is_none()
+            && self.ttl_out_samples.is_none()
+            && self.board_adc_channels == 0
+            && self.aux_streams == 0
+    }
+}
+
+/// Derives `AcquisitionEvent::TtlChanged` events from the per-sample TTL-input
+/// words across a sequence of recorded blocks.
+///
+/// A block without `ttl_in_per_sample` contributes nothing.  An event is
+/// emitted for the first observed TTL word and for every subsequent sample
+/// whose word differs from its predecessor; `timestamp_start` carries the
+/// absolute sample index of the transition.
+pub fn ttl_change_events(blocks: &[SampleBlock]) -> Vec<AcquisitionEvent> {
+    let mut tracker = TtlChangeTracker::default();
+    let mut events = Vec::new();
+    for block in blocks {
+        tracker.observe(block, &mut events);
+    }
+    events
+}
+
+/// Tracks the most recently observed TTL-input word so transitions can be
+/// turned into `AcquisitionEvent::TtlChanged` records as blocks arrive.
+#[derive(Debug, Default)]
+struct TtlChangeTracker {
+    last_ttl: Option<u32>,
+}
+
+impl TtlChangeTracker {
+    /// Appends a `TtlChanged` event for every per-sample TTL transition in
+    /// `block`, using the sample's absolute index as `timestamp_start`.
+    fn observe(&mut self, block: &SampleBlock, events: &mut Vec<AcquisitionEvent>) {
+        let Some(words) = block.ttl_in_per_sample.as_ref() else {
+            return;
+        };
+        for (offset, &word) in words.iter().enumerate() {
+            if self.last_ttl != Some(word) {
+                events.push(AcquisitionEvent::TtlChanged {
+                    timestamp_start: block.timestamp_start.saturating_add(offset as u64),
+                    ttl_bits: word,
+                });
+                self.last_ttl = Some(word);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSummary {
@@ -354,6 +502,75 @@ fn write_samples_le(
         })
 }
 
+fn append_u32_le(buf: &mut Vec<u8>, words: &[u32]) {
+    buf.reserve(words.len() * 4);
+    for &word in words {
+        buf.extend_from_slice(&word.to_le_bytes());
+    }
+}
+
+fn append_u16_le(buf: &mut Vec<u8>, values: &[u16]) {
+    buf.reserve(values.len() * 2);
+    for &value in values {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Create the `.kvaux` sidecar and write its zeroed placeholder header.
+fn create_kvaux_placeholder(path: &Path) -> Result<BufWriter<File>, RecorderError> {
+    let file = File::create(path).map_err(|source| RecorderError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut writer = BufWriter::new(file);
+    writer
+        .write_all(KVAUX_MAGIC)
+        .map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let placeholder = [0u8; 4 + KVAUX_JSON_RESERVED];
+    writer
+        .write_all(&placeholder)
+        .map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(writer)
+}
+
+/// Infer the backend label from a device id: `demo-*` → demo, `rhd-*` →
+/// rhd-hardware, `simulator-*` → simulator; otherwise the id's first segment.
+fn infer_backend(device_id: &str) -> String {
+    if device_id.starts_with("demo") {
+        "demo".to_string()
+    } else if device_id.starts_with("rhd") {
+        "rhd-hardware".to_string()
+    } else if device_id.starts_with("simulator") {
+        "simulator".to_string()
+    } else {
+        device_id.split('-').next().unwrap_or("unknown").to_string()
+    }
+}
+
+fn format_usize_array(values: &[usize]) -> String {
+    let mut out = String::from("[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&value.to_string());
+    }
+    out.push(']');
+    out
+}
+
+fn format_optional_usize(value: Option<usize>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string())
+}
+
 fn write_metadata_file(
     path: &Path,
     blocks: &[SampleBlock],
@@ -651,10 +868,24 @@ pub struct StreamingRecorder {
     write_latencies_us: Vec<u64>,
     latency_sample_count: u64,
     sample_scratch: Vec<u8>,
+    config: RecordingConfig,
+    aux_path: PathBuf,
+    aux_writer: Option<BufWriter<File>>,
+    side_layout: Option<SideChannelLayout>,
+    aux_scratch: Vec<u8>,
 }
 
 impl StreamingRecorder {
     pub fn new(output_dir: impl AsRef<Path>) -> Result<Self, RecorderError> {
+        Self::with_config(output_dir, RecordingConfig::default())
+    }
+
+    /// Create a recorder that records the given channel-mapping/TTL metadata
+    /// into the `.kvaux` sidecar alongside the raw amplifier stream.
+    pub fn with_config(
+        output_dir: impl AsRef<Path>,
+        config: RecordingConfig,
+    ) -> Result<Self, RecorderError> {
         let output_dir = output_dir.as_ref().to_path_buf();
         fs::create_dir_all(&output_dir).map_err(|source| RecorderError::Io {
             path: output_dir.clone(),
@@ -662,6 +893,7 @@ impl StreamingRecorder {
         })?;
 
         let raw_path = output_dir.join("recording.kvraw");
+        let aux_path = output_dir.join("recording.kvaux");
         let file = File::create(&raw_path).map_err(|source| RecorderError::Io {
             path: raw_path.clone(),
             source,
@@ -685,6 +917,11 @@ impl StreamingRecorder {
                 source,
             })?;
 
+        // Always create the `.kvaux` sidecar so the channel mapping is recorded
+        // even for recordings without side-channel streams.  Side-channel
+        // payload is appended later by `write_side_channels`.
+        let aux_writer = create_kvaux_placeholder(&aux_path)?;
+
         Ok(Self {
             output_dir,
             raw_path,
@@ -701,6 +938,11 @@ impl StreamingRecorder {
             write_latencies_us: Vec::with_capacity(LATENCY_RESERVOIR_CAP),
             latency_sample_count: 0,
             sample_scratch: Vec::new(),
+            config,
+            aux_path,
+            aux_writer: Some(aux_writer),
+            side_layout: None,
+            aux_scratch: Vec::new(),
         })
     }
 
@@ -731,6 +973,8 @@ impl StreamingRecorder {
             &mut self.sample_scratch,
             &self.raw_path,
         )?;
+
+        self.write_side_channels(block)?;
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         self.latency_sample_count += 1;
@@ -766,6 +1010,9 @@ impl StreamingRecorder {
     /// header with the final metadata.  No separate `.json` file is created —
     /// all information is self-contained in `recording.kvraw`.
     pub fn finish(mut self) -> Result<StreamingRecordingSummary, RecorderError> {
+        // 0. Finalize the side-channel sidecar (header + flush).
+        self.finish_aux()?;
+
         // 1. Flush all pending sample data to disk
         self.writer.flush().map_err(|source| RecorderError::Io {
             path: self.raw_path.clone(),
@@ -881,22 +1128,159 @@ impl StreamingRecorder {
         Ok(())
     }
 
+    /// Append this block's side-channel streams (TTL in/out, board ADC, aux) to
+    /// the `.kvaux` sidecar.  The layout is fixed by the first block; a later
+    /// block whose side-channel shape differs is rejected so the payload stays a
+    /// constant-stride sequence.
+    fn write_side_channels(&mut self, block: &SampleBlock) -> Result<(), RecorderError> {
+        let layout = SideChannelLayout::from_block(block);
+
+        match self.side_layout {
+            Some(existing) => {
+                if existing != layout {
+                    return Err(RecorderError::InconsistentBlockConfig {
+                        packet_id: block.packet_id,
+                        field: "side_channel_layout",
+                    });
+                }
+            }
+            None => {
+                self.side_layout = Some(layout);
+            }
+        }
+
+        if layout.is_empty() {
+            return Ok(());
+        }
+
+        self.aux_scratch.clear();
+        if let Some(ref words) = block.ttl_in_per_sample {
+            append_u32_le(&mut self.aux_scratch, words);
+        }
+        if let Some(ref words) = block.ttl_out_per_sample {
+            append_u32_le(&mut self.aux_scratch, words);
+        }
+        if let Some(ref adc) = block.board_adc_data {
+            for channel in adc {
+                append_u16_le(&mut self.aux_scratch, channel);
+            }
+        }
+        if let Some(ref aux) = block.aux_data {
+            for stream in aux {
+                for channel in stream {
+                    append_u16_le(&mut self.aux_scratch, channel);
+                }
+            }
+        }
+
+        let Some(writer) = self.aux_writer.as_mut() else {
+            return Ok(());
+        };
+        writer
+            .write_all(&self.aux_scratch)
+            .map_err(|source| RecorderError::Io {
+                path: self.aux_path.clone(),
+                source,
+            })
+    }
+
+    /// Flush the `.kvaux` sidecar and overwrite its placeholder header with the
+    /// final channel-mapping/layout metadata.
+    fn finish_aux(&mut self) -> Result<(), RecorderError> {
+        let Some(mut writer) = self.aux_writer.take() else {
+            return Ok(());
+        };
+        writer.flush().map_err(|source| RecorderError::Io {
+            path: self.aux_path.clone(),
+            source,
+        })?;
+        let json = self.kvaux_metadata_json();
+        let mut file = writer.into_inner().map_err(|e| RecorderError::Io {
+            path: self.aux_path.clone(),
+            source: e.into_error(),
+        })?;
+        file.seek(SeekFrom::Start(8))
+            .map_err(|source| RecorderError::Io {
+                path: self.aux_path.clone(),
+                source,
+            })?;
+        let json_bytes = json.as_bytes();
+        let json_len = json_bytes.len().min(KVAUX_JSON_RESERVED);
+        file.write_all(&(json_len as u32).to_le_bytes())
+            .map_err(|source| RecorderError::Io {
+                path: self.aux_path.clone(),
+                source,
+            })?;
+        let mut json_block = vec![0u8; KVAUX_JSON_RESERVED];
+        json_block[..json_len].copy_from_slice(&json_bytes[..json_len]);
+        file.write_all(&json_block)
+            .map_err(|source| RecorderError::Io {
+                path: self.aux_path.clone(),
+                source,
+            })?;
+        file.flush().map_err(|source| RecorderError::Io {
+            path: self.aux_path.clone(),
+            source,
+        })
+    }
+
+    /// Build the `.kvaux` JSON header (channel mapping + side-channel layout).
+    fn kvaux_metadata_json(&self) -> String {
+        let device_id = self.device_id.as_deref().unwrap_or("");
+        let backend = infer_backend(device_id);
+        let layout = self.side_layout.unwrap_or_default();
+        format!(
+            concat!(
+                "{{\n",
+                "  \"format\": \"kvaux\",\n",
+                "  \"format_version\": 1,\n",
+                "  \"data_offset_bytes\": {},\n",
+                "  \"device_id\": \"{}\",\n",
+                "  \"backend\": \"{}\",\n",
+                "  \"sample_rate\": {},\n",
+                "  \"channel_count\": {},\n",
+                "  \"samples_per_block\": {},\n",
+                "  \"block_count\": {},\n",
+                "  \"ttl_line_count\": {},\n",
+                "  \"enabled_channels\": {},\n",
+                "  \"endianness\": \"little\",\n",
+                "  \"layout\": \"per_block_streams\",\n",
+                "  \"side_channels\": {{\n",
+                "    \"ttl_in_samples\": {},\n",
+                "    \"ttl_out_samples\": {},\n",
+                "    \"board_adc_channels\": {},\n",
+                "    \"board_adc_samples\": {},\n",
+                "    \"aux_streams\": {},\n",
+                "    \"aux_channels_per_stream\": {},\n",
+                "    \"aux_samples\": {}\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            KVAUX_DATA_OFFSET,
+            escape_json_string(device_id),
+            escape_json_string(&backend),
+            format_sample_rate(self.sample_rate.unwrap_or(0.0)),
+            self.channel_count.unwrap_or(0),
+            self.samples_per_packet.unwrap_or(0),
+            self.block_count,
+            self.config.ttl_line_count,
+            format_usize_array(&self.config.enabled_channels),
+            format_optional_usize(layout.ttl_in_samples),
+            format_optional_usize(layout.ttl_out_samples),
+            layout.board_adc_channels,
+            layout.board_adc_samples,
+            layout.aux_streams,
+            layout.aux_channels_per_stream,
+            layout.aux_samples,
+        )
+    }
+
     fn streaming_metadata_json(&self) -> String {
         let Some(ref device_id) = self.device_id else {
             return empty_recording_metadata_json();
         };
 
-        // Infer backend from device_id: "demo-*" → demo, "rhd-*" → rhd-hardware,
-        // "simulator-*" → simulator.  Falls back to the raw device_id prefix.
-        let backend = if device_id.starts_with("demo") {
-            "demo"
-        } else if device_id.starts_with("rhd") {
-            "rhd-hardware"
-        } else if device_id.starts_with("simulator") {
-            "simulator"
-        } else {
-            device_id.split('-').next().unwrap_or("unknown")
-        };
+        let backend = infer_backend(device_id);
 
         format!(
             concat!(
@@ -921,7 +1305,7 @@ impl StreamingRecorder {
             ),
             KVRAW_DATA_OFFSET,
             escape_json_string(device_id),
-            escape_json_string(backend),
+            escape_json_string(&backend),
             format_sample_rate(self.sample_rate.unwrap_or(0.0)),
             self.channel_count.unwrap_or(0),
             self.samples_per_packet.unwrap_or(0),
@@ -1256,6 +1640,189 @@ impl fmt::Debug for KvrawReader {
             .field("data_start", &self.data_start)
             .field("file_size", &self.file_size)
             .finish()
+    }
+}
+
+/// Parsed header of a `.kvaux` side-channel sidecar: the channel mapping
+/// (DA17) plus the per-block side-channel layout (DA1).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KvauxMetadata {
+    pub format_version: u32,
+    pub data_offset_bytes: u64,
+    pub device_id: String,
+    pub backend: String,
+    pub sample_rate: f64,
+    pub channel_count: usize,
+    pub samples_per_block: usize,
+    pub block_count: u64,
+    pub ttl_line_count: usize,
+    pub enabled_channels: Vec<usize>,
+    pub layout: SideChannelLayout,
+}
+
+impl KvauxMetadata {
+    /// Number of side-channel payload bytes one block occupies, given the
+    /// fixed per-block layout.  Zero when no side channels were recorded.
+    pub fn block_payload_bytes(&self) -> usize {
+        let l = &self.layout;
+        let ttl_in = l.ttl_in_samples.unwrap_or(0) * 4;
+        let ttl_out = l.ttl_out_samples.unwrap_or(0) * 4;
+        let board_adc = l.board_adc_channels * l.board_adc_samples * 2;
+        let aux = l.aux_streams * l.aux_channels_per_stream * l.aux_samples * 2;
+        ttl_in + ttl_out + board_adc + aux
+    }
+}
+
+/// Reader for `.kvaux` side-channel sidecars (embedded JSON header + raw
+/// little-endian per-block payload).
+pub struct KvauxReader {
+    metadata: KvauxMetadata,
+    payload: Vec<u8>,
+}
+
+impl KvauxReader {
+    /// Open a `.kvaux` file and parse its embedded header and payload.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, RecorderError> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|source| RecorderError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if bytes.len() < KVAUX_DATA_OFFSET as usize || &bytes[..8] != KVAUX_MAGIC {
+            return Err(RecorderError::MissingMetadata {
+                path: path.to_path_buf(),
+            });
+        }
+        let json_len = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+        let json_len = json_len.min(KVAUX_JSON_RESERVED);
+        let json_start = 12;
+        let json_str =
+            std::str::from_utf8(&bytes[json_start..json_start + json_len]).unwrap_or("{}");
+        let metadata = parse_kvaux_json(json_str);
+        let payload = bytes[KVAUX_DATA_OFFSET as usize..].to_vec();
+        Ok(Self { metadata, payload })
+    }
+
+    pub fn metadata(&self) -> &KvauxMetadata {
+        &self.metadata
+    }
+
+    /// Raw little-endian side-channel payload (concatenated per-block records).
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+impl fmt::Debug for KvauxReader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KvauxReader")
+            .field("metadata", &self.metadata)
+            .field("payload_bytes", &self.payload.len())
+            .finish()
+    }
+}
+
+/// Minimal JSON parser for `.kvaux` headers — mirrors `parse_kvraw_json` and
+/// additionally decodes the `enabled_channels` array and nested layout block.
+fn parse_kvaux_json(json: &str) -> KvauxMetadata {
+    let value_after = |key: &str| -> Option<usize> {
+        let needle = format!("\"{key}\"");
+        let mut search_from = 0;
+        while let Some(rel) = json[search_from..].find(&needle) {
+            let pos = search_from + rel;
+            let after = &json[pos + needle.len()..];
+            if let Some(rest) = after.trim_start().strip_prefix(':') {
+                return Some(json.len() - rest.trim_start().len());
+            }
+            search_from = pos + needle.len();
+        }
+        None
+    };
+
+    let get_str = |key: &str| -> String {
+        value_after(key)
+            .and_then(|start| {
+                let rest = &json[start..];
+                let value = rest.strip_prefix('"')?;
+                let end = value.find('"')?;
+                Some(value[..end].to_string())
+            })
+            .unwrap_or_default()
+    };
+
+    let get_u64 = |key: &str| -> u64 {
+        value_after(key)
+            .and_then(|start| {
+                let num: String = json[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                num.parse().ok()
+            })
+            .unwrap_or(0)
+    };
+
+    let get_f64 = |key: &str| -> f64 {
+        value_after(key)
+            .and_then(|start| {
+                let num: String = json[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit() || matches!(*c, '.' | '-' | 'e' | 'E' | '+'))
+                    .collect();
+                num.parse().ok()
+            })
+            .unwrap_or(0.0)
+    };
+
+    let get_optional_usize = |key: &str| -> Option<usize> {
+        let start = value_after(key)?;
+        let rest = &json[start..];
+        if rest.starts_with("null") {
+            return None;
+        }
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        num.parse().ok()
+    };
+
+    let get_usize_array = |key: &str| -> Vec<usize> {
+        value_after(key)
+            .and_then(|start| {
+                let rest = json[start..].trim_start();
+                let inner = rest.strip_prefix('[')?;
+                let end = inner.find(']')?;
+                Some(
+                    inner[..end]
+                        .split(',')
+                        .filter_map(|tok| tok.trim().parse().ok())
+                        .collect(),
+                )
+            })
+            .unwrap_or_default()
+    };
+
+    KvauxMetadata {
+        format_version: get_u64("format_version") as u32,
+        data_offset_bytes: {
+            let off = get_u64("data_offset_bytes");
+            if off > 0 { off } else { KVAUX_DATA_OFFSET }
+        },
+        device_id: get_str("device_id"),
+        backend: get_str("backend"),
+        sample_rate: get_f64("sample_rate"),
+        channel_count: get_u64("channel_count") as usize,
+        samples_per_block: get_u64("samples_per_block") as usize,
+        block_count: get_u64("block_count"),
+        ttl_line_count: get_u64("ttl_line_count") as usize,
+        enabled_channels: get_usize_array("enabled_channels"),
+        layout: SideChannelLayout {
+            ttl_in_samples: get_optional_usize("ttl_in_samples"),
+            ttl_out_samples: get_optional_usize("ttl_out_samples"),
+            board_adc_channels: get_u64("board_adc_channels") as usize,
+            board_adc_samples: get_u64("board_adc_samples") as usize,
+            aux_streams: get_u64("aux_streams") as usize,
+            aux_channels_per_stream: get_u64("aux_channels_per_stream") as usize,
+            aux_samples: get_u64("aux_samples") as usize,
+        },
     }
 }
 

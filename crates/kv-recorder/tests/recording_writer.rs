@@ -5,8 +5,9 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder, write_benchmark_summary,
-    write_integrity_summary, write_log_file, write_recording,
+    BenchmarkSummary, KVRAW_DATA_OFFSET, KvauxReader, RecorderError, RecordingConfig,
+    StreamingRecorder, ttl_change_events, write_benchmark_summary, write_integrity_summary,
+    write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -616,4 +617,141 @@ fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
     ));
 
     cleanup_dir(&output_dir);
+}
+
+// --- .kvaux side-channel persistence (DA1) + channel mapping (DA17) ---
+
+fn side_channel_block(packet_id: u64, timestamp_start: u64) -> SampleBlock {
+    SampleBlock {
+        device_id: "simulator-0".to_string(),
+        stream_id: 0,
+        packet_id,
+        timestamp_start,
+        sample_rate: 30_000.0,
+        channel_count: 2,
+        samples_per_channel: 4,
+        ttl_bits: 5,
+        data: vec![0; 8],
+        aux_data: Some(vec![vec![
+            vec![100, 101, 102, 103],
+            vec![200, 201, 202, 203],
+            vec![300, 301, 302, 303],
+        ]]),
+        board_adc_data: Some(vec![vec![10, 20, 30, 40]]),
+        ttl_in_per_sample: Some(vec![1, 2, 2, 5]),
+        ttl_out_per_sample: Some(vec![0, 1, 0, 1]),
+    }
+}
+
+#[test]
+fn kvaux_round_trips_side_channels_and_channel_mapping() {
+    let output_dir = unique_output_dir("kvaux-round-trip");
+    let config = RecordingConfig {
+        enabled_channels: vec![3, 7],
+        ttl_line_count: 8,
+    };
+
+    let mut recorder =
+        StreamingRecorder::with_config(&output_dir, config.clone()).expect("recorder with config");
+    recorder
+        .write_block(&side_channel_block(0, 0))
+        .expect("first block");
+    recorder
+        .write_block(&side_channel_block(1, 4))
+        .expect("second block");
+    recorder.finish().expect("finish recording");
+
+    let reader = KvauxReader::open(output_dir.join("recording.kvaux")).expect("open kvaux");
+    let metadata = reader.metadata();
+
+    assert_eq!(metadata.enabled_channels, config.enabled_channels);
+    assert_eq!(metadata.ttl_line_count, config.ttl_line_count);
+    assert_eq!(metadata.block_count, 2);
+    assert_eq!(metadata.layout.ttl_in_samples, Some(4));
+    assert_eq!(metadata.layout.ttl_out_samples, Some(4));
+    assert_eq!(metadata.layout.board_adc_channels, 1);
+    assert_eq!(metadata.layout.board_adc_samples, 4);
+    assert_eq!(metadata.layout.aux_streams, 1);
+    assert_eq!(metadata.layout.aux_channels_per_stream, 3);
+    assert_eq!(metadata.layout.aux_samples, 4);
+
+    // Per-block stride: 4 ttl_in (u32) + 4 ttl_out (u32) + 1*4 adc (u16)
+    // + 1*3*4 aux (u16) = 16 + 16 + 8 + 24 = 64 bytes.
+    let payload = reader.payload();
+    assert_eq!(payload.len(), 128);
+
+    let ttl_in: Vec<u32> = payload[..16]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(ttl_in, vec![1, 2, 2, 5]);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvaux_written_without_side_channels_records_channel_mapping() {
+    let output_dir = unique_output_dir("kvaux-mapping-only");
+    let config = RecordingConfig {
+        enabled_channels: vec![0, 1, 4, 5],
+        ttl_line_count: 0,
+    };
+
+    let mut recorder =
+        StreamingRecorder::with_config(&output_dir, config.clone()).expect("recorder with config");
+    recorder
+        .write_block(&sample_block(0, 0, 2, 2, vec![1, 2, 3, 4]))
+        .expect("block without side channels");
+    recorder.finish().expect("finish recording");
+
+    let reader = KvauxReader::open(output_dir.join("recording.kvaux")).expect("open kvaux");
+    let metadata = reader.metadata();
+
+    assert_eq!(metadata.enabled_channels, config.enabled_channels);
+    assert_eq!(metadata.ttl_line_count, 0);
+    assert!(reader.payload().is_empty());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn ttl_change_events_emit_only_on_transitions() {
+    let block_a = SampleBlock {
+        ttl_in_per_sample: Some(vec![1, 1, 2, 2]),
+        ..side_channel_block(0, 0)
+    };
+    let block_b = SampleBlock {
+        ttl_in_per_sample: Some(vec![2, 3, 3, 7]),
+        ..side_channel_block(1, 4)
+    };
+
+    let events = ttl_change_events(&[block_a, block_b]);
+
+    let transitions: Vec<(u64, u32)> = events
+        .iter()
+        .map(|event| match event {
+            AcquisitionEvent::TtlChanged {
+                timestamp_start,
+                ttl_bits,
+            } => (*timestamp_start, *ttl_bits),
+            other => panic!("unexpected event {other:?}"),
+        })
+        .collect();
+
+    // First sample always emits; subsequent only when the word changes.
+    // block_a: idx0=1, idx2=2; block_b: idx5=3, idx7=7 (idx4=2 unchanged).
+    assert_eq!(transitions, vec![(0, 1), (2, 2), (5, 3), (7, 7)]);
+}
+
+#[test]
+fn ttl_change_events_empty_without_per_sample_ttl() {
+    let blocks = next_simulator_blocks(1)
+        .into_iter()
+        .map(|mut block| {
+            block.ttl_in_per_sample = None;
+            block
+        })
+        .collect::<Vec<_>>();
+
+    assert!(ttl_change_events(&blocks).is_empty());
 }

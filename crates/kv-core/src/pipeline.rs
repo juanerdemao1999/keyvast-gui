@@ -12,8 +12,10 @@ use std::thread;
 use std::time::Instant;
 
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
-use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
-use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
+use kv_integrity::{check_blocks, IncrementalIntegrity, IntegrityError, IntegrityReport};
+use kv_recorder::{
+    LatencyDistribution, RecorderError, RecordingConfig, RecordingSummary, StreamingRecorder,
+};
 use kv_types::{AcquisitionEvent, DeviceConfig, SampleBlock};
 
 use crate::AcquisitionSource;
@@ -406,7 +408,15 @@ where
         producer_loop(source, requested, &shared_producer, events);
     });
 
-    let mut recorder = StreamingRecorder::new(&config.output_dir)?;
+    let recording_config = RecordingConfig {
+        enabled_channels: config.device.enabled_channels.clone(),
+        ttl_line_count: if config.device.ttl_enabled {
+            config.device.ttl_line_count
+        } else {
+            0
+        },
+    };
+    let mut recorder = StreamingRecorder::with_config(&config.output_dir, recording_config)?;
     let mut integrity = IncrementalIntegrity::new();
     let mut first_block_time: Option<Instant> = None;
 

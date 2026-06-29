@@ -9,6 +9,7 @@ The recorder writes a directory, not a single complex container file.
 ```text
 run-YYYYMMDD-HHMMSS/
   recording.kvraw
+  recording.kvaux
   recording.json
   events.csv
   integrity.json
@@ -37,6 +38,60 @@ sample1_ch0, sample1_ch1, ... sample1_chN,
 ```
 
 No metadata should be required to parse the binary values, but metadata is required to interpret channel count, sample rate, and units.
+
+## recording.kvaux
+
+The `.kvraw` file holds only interleaved amplifier samples. Per-sample TTL
+in/out words, board-ADC channels, and auxiliary-command channels are parsed off
+the wire but cannot live in `.kvraw` without breaking its bare-`i16` contract,
+so they are persisted in a companion `recording.kvaux` sidecar (DA1). The same
+file also records the channel→electrode mapping the bare `.kvraw` header lacks
+(DA17). The sidecar is always written, so the mapping is recoverable even when a
+recording carries no side-channel streams.
+
+Layout mirrors the `.kvraw` embedded-header convention:
+
+```text
+[0..8]      magic b"KVAUX1\0\0"
+[8..12]     json_len: u32 LE
+[12..8204]  json_block: 8192 B  (UTF-8 JSON, zero-padded)
+[8204..]    per-block side-channel payload (fixed stride from SideChannelLayout)
+```
+
+JSON header shape:
+
+```json
+{
+  "format": "kvaux",
+  "format_version": 1,
+  "device_id": "simulator-0",
+  "backend": "simulator",
+  "sample_rate": 30000.0,
+  "channel_count": 64,
+  "samples_per_block": 64,
+  "block_count": 1000,
+  "data_offset_bytes": 8204,
+  "enabled_channels": [0, 1, 2, 3],
+  "ttl_line_count": 16,
+  "side_channels": {
+    "per_block_streams": {
+      "ttl_in_samples": 64,
+      "ttl_out_samples": 64,
+      "board_adc_channels": 8,
+      "board_adc_samples": 64,
+      "aux_streams": 4,
+      "aux_channels_per_stream": 3,
+      "aux_samples": 64
+    }
+  }
+}
+```
+
+`enabled_channels` is the selective-save column→electrode mapping (empty means
+all channels in natural order). The `side_channels.per_block_streams` block is
+the `SideChannelLayout` established from the first block and enforced for every
+subsequent block, so the payload is a fixed-stride sequence the reader indexes
+without a per-block table.
 
 ## recording.json
 
@@ -83,6 +138,12 @@ Example rows:
 1024,30720,ttl_changed,1,
 2050,61440,packet_missing,102,expected 102 observed 103
 ```
+
+`ttl_changed` rows are derived from per-sample TTL transitions by
+`ttl_change_events(&[SampleBlock])`, which emits a `TtlChanged` for the first
+sample and every sample whose TTL-in word differs from its predecessor (DA1).
+The fixed-block CLI paths (which retain blocks) feed these into `events.csv`;
+streaming/benchmark paths skip them to avoid an unbounded event log.
 
 ## integrity.json
 

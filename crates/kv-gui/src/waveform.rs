@@ -37,6 +37,15 @@ const MAX_DISPLAY_POINTS: usize = 2000;
 /// Default vertical spacing (in normalized units) between channel baselines.
 pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
 
+/// A normalized sample at or beyond this magnitude (≈0.98 of full scale) is
+/// counted as rail-pinned for the saturation indicator (DA21).
+const SAT_LEVEL: f64 = 0.98;
+
+/// Fraction of a channel's window samples that must be rail-pinned before the
+/// lane is flagged as saturated. A railed/dead electrode sits near 1.0; a
+/// healthy channel with the odd large transient stays far below this.
+const SAT_FRACTION: f64 = 0.5;
+
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
     /// Physical channel index (for colour, label, hover matching).
@@ -49,6 +58,9 @@ struct ChannelTrace {
     sigma: Option<f64>,
     /// Negative-going threshold crossings within the window.
     spike_count: u32,
+    /// True when the channel is rail-pinned (saturated / dead electrode) for
+    /// most of the window, before per-window DC removal hides it (DA21).
+    saturated: bool,
 }
 
 /// Spike metadata retained after `points` is moved into a `Line`.
@@ -256,6 +268,14 @@ pub fn draw_waveform_area(
         Vec::new()
     };
 
+    // Saturated lanes (display_pos), captured before `traces` is consumed so a
+    // "SAT" badge can be painted in screen space after the plot closure (DA21).
+    let saturated_lanes: Vec<usize> = traces
+        .iter()
+        .filter(|t| t.saturated)
+        .map(|t| t.display_pos)
+        .collect();
+
     // Draw zero-reference lines using the painter (screen-space) to avoid
     // creating a Line object + Vec allocation per channel.
     // These are drawn BEFORE the plot so they appear behind traces.
@@ -382,6 +402,13 @@ pub fn draw_waveform_area(
             } else {
                 (brighten_color(base_color, 1.3), 1.5)
             };
+            // A rail-pinned lane is drawn in the warning color so saturation is
+            // never mistaken for a quiet, healthy channel (DA21).
+            let color = if trace.saturated {
+                theme::ACCENT_RED
+            } else {
+                color
+            };
             plot_ui.line(
                 Line::new(PlotPoints::from(trace.points))
                     .color(color)
@@ -409,6 +436,25 @@ pub fn draw_waveform_area(
                 badge_pos,
                 egui::Align2::RIGHT_CENTER,
                 format!("{}", meta.spike_count),
+                egui::FontId::monospace(10.0),
+                theme::ACCENT_RED,
+            );
+        }
+    }
+
+    // "SAT" badges on rail-pinned lanes (DA21). Painted at the left edge so a
+    // saturated/dead electrode reads as a fault, not a quiet channel. Placed
+    // opposite the right-edge spike counts to avoid overlap.
+    if !saturated_lanes.is_empty() {
+        let painter = ui.painter();
+        for &disp_pos in &saturated_lanes {
+            let y_lane = -(disp_pos as f64) * ch_spacing;
+            let plot_pos = egui_plot::PlotPoint::new(x_left, y_lane);
+            let screen_pos = response.transform.position_from_point(&plot_pos);
+            painter.text(
+                screen_pos + egui::vec2(10.0, -1.0),
+                egui::Align2::LEFT_CENTER,
+                "SAT",
                 egui::FontId::monospace(10.0),
                 theme::ACCENT_RED,
             );
@@ -729,6 +775,11 @@ fn collect_from_ring(
             (None, 0)
         };
 
+        // Rail/saturation check on the raw normalized values, BEFORE
+        // finalize_channel's per-window DC removal makes a constant rail look
+        // like a flat baseline indistinguishable from a quiet channel (DA21).
+        let saturated = lane_is_saturated(&pts);
+
         // finalize_channel applies Y-offset using DISPLAY position (not physical channel).
         finalize_channel(&mut pts, disp_pos, gain, ch_spacing);
         traces.push(ChannelTrace {
@@ -737,9 +788,23 @@ fn collect_from_ring(
             points: pts,
             sigma,
             spike_count,
+            saturated,
         });
     }
     traces
+}
+
+/// Whether a lane is rail-pinned (saturated / dead electrode): at least
+/// `SAT_FRACTION` of its window samples sit at or beyond `SAT_LEVEL` of full
+/// scale. Operates on the raw normalized `[time, value]` points before DC
+/// removal, since per-window mean subtraction otherwise hides a constant rail
+/// (DA21).
+fn lane_is_saturated(pts: &[[f64; 2]]) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
+    let railed = pts.iter().filter(|p| p[1].abs() >= SAT_LEVEL).count();
+    railed as f64 / pts.len() as f64 >= SAT_FRACTION
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
@@ -776,4 +841,32 @@ fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pts(ys: &[f64]) -> Vec<[f64; 2]> {
+        ys.iter().enumerate().map(|(i, &y)| [i as f64, y]).collect()
+    }
+
+    #[test]
+    fn saturated_lane_detected_under_dc() {
+        // A channel pinned to the rail (constant ~+1.0) is flagged even though
+        // its per-window mean is large — DC removal would otherwise flatten it
+        // to a quiet-looking baseline (DA21).
+        assert!(lane_is_saturated(&pts(&[1.0, 1.0, 1.0, 1.0])));
+        // Negative rail too.
+        assert!(lane_is_saturated(&pts(&[-0.99, -1.0, -0.985, -1.0])));
+    }
+
+    #[test]
+    fn healthy_lane_not_flagged() {
+        // Small signal with the odd large transient stays below the fraction.
+        assert!(!lane_is_saturated(&pts(&[0.0, 0.1, -0.1, 1.0])));
+        assert!(!lane_is_saturated(&pts(&[0.2, -0.3, 0.05, -0.15])));
+        // Empty window is never saturated.
+        assert!(!lane_is_saturated(&[]));
+    }
 }

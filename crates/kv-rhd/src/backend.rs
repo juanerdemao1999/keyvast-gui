@@ -114,7 +114,8 @@ impl RhdHardwareBackend {
                 parsed.report.timestamp_discontinuities
             );
         }
-        let block = parsed.block;
+        let mut block = parsed.block;
+        block.host_time_ns = Some(kv_types::host_time_ns_now());
 
         if !self.logged_first_block {
             self.logged_first_block = true;

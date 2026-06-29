@@ -29,10 +29,15 @@ pub struct SampleBlock {
     pub ttl_in_per_sample: Option<Vec<u32>>,
     /// Per-sample TTL output words; same length convention as `ttl_in_per_sample`.
     pub ttl_out_per_sample: Option<Vec<u32>>,
+    /// Host wall-clock at the instant a live block was received, in nanoseconds
+    /// since the Unix epoch. `None` for synthetic/replayed blocks that have no
+    /// real arrival time. Pairs with `timestamp_start` to bridge clock domains.
+    pub host_time_ns: Option<i64>,
 }
 ```
 
-The four optional fields carry side-band data that not every backend produces.
+The four side-band fields (`aux_data`, `board_adc_data`, `ttl_in_per_sample`,
+`ttl_out_per_sample`) carry data that not every backend produces.
 They are `None` by default (e.g. the simulator only fills `ttl_in_per_sample`
 when TTL is enabled); the RHD parser populates them when the corresponding
 endpoints are decoded. `ttl_bits` is the legacy scalar mirror of the most
@@ -51,6 +56,22 @@ call `validate()` and use checked indexing, surfacing a bad block as
 `RecorderError::InvalidBlock` rather than panicking mid-write (DA11). GUI render
 paths (e.g. `spike_overlay`) bounds-check `block.data` and skip a malformed block
 rather than indexing out of bounds (DA36).
+
+### Clock domains: FPGA counter vs. host wall-clock (DA16)
+
+`timestamp_start` is the **FPGA sample counter** — a free-running hardware
+counter sampled at the acquisition rate. It is sample-relative and has no
+absolute reference: it starts wherever the board happens to be, and its rate
+drifts against the host clock (different oscillators). It cannot, on its own,
+be converted to a wall-clock time.
+
+`host_time_ns` is the **host wall-clock** captured the moment a live block is
+parsed from the device (`kv_types::host_time_ns_now()`, stamped in the RHD
+backend). Recording the two together at block granularity lets offline tools
+align the FPGA counter to wall-clock time and estimate host↔FPGA drift, without
+forcing a clock model into the live path. Synthetic backends (simulator) and
+the pure parser leave it `None` so generated/replayed data stays deterministic
+and clock-free; the backend is the single place that stamps real arrival time.
 
 ## Data Layout
 

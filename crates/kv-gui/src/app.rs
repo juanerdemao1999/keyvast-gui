@@ -569,6 +569,7 @@ mod tests {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 

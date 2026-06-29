@@ -269,6 +269,7 @@ fn sample_block(
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     }
 }
 
@@ -339,6 +340,50 @@ fn streaming_recorder_writes_blocks_incrementally() {
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_header_records_clock_domain_fields_within_the_reserved_block() {
+    let output_dir = unique_output_dir("streaming-clock-domain");
+
+    // Stamp host wall-clock and distinct FPGA sample counters so the metadata
+    // carries the DA16 alignment fields (first/last for each clock domain).
+    let mut blocks = next_simulator_blocks(3);
+    for (i, block) in blocks.iter_mut().enumerate() {
+        block.timestamp_start = 1_000 + i as u64 * 64;
+        // Use an extreme i64 to exercise the widest possible host-clock render.
+        block.host_time_ns = Some(if i == 0 {
+            i64::MIN
+        } else {
+            1_700_000_000_000_000_000 + i as i64
+        });
+    }
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder should open");
+    for block in &blocks {
+        recorder
+            .write_block(block)
+            .expect("block write should succeed");
+    }
+    recorder.finish().expect("finish should succeed");
+
+    let kvraw_bytes = fs::read(output_dir.join("recording.kvraw")).expect("kvraw readable");
+    let json_len = u32::from_le_bytes(kvraw_bytes[8..12].try_into().unwrap()) as usize;
+    // The fully-populated header must fit inside the reserved JSON block; if it
+    // overflowed, finish() would truncate it into invalid JSON.
+    assert!(
+        json_len < (KVRAW_DATA_OFFSET as usize - 12),
+        "header JSON ({json_len} B) must fit the reserved block"
+    );
+    let metadata =
+        std::str::from_utf8(&kvraw_bytes[12..12 + json_len]).expect("header JSON is valid UTF-8");
+
+    assert!(metadata.contains("\"fpga_timestamp_first\": 1000"));
+    assert!(metadata.contains("\"fpga_timestamp_last\": 1128"));
+    assert!(metadata.contains(&format!("\"host_clock_first_ns\": {}", i64::MIN)));
+    assert!(metadata.contains("\"host_clock_last_ns\": 1700000000000000002"));
 
     cleanup_dir(&output_dir);
 }

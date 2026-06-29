@@ -161,6 +161,7 @@ impl DemoGenerator {
             board_adc_data: None,
             ttl_in_per_sample: Some(ttl_per_sample),
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 }

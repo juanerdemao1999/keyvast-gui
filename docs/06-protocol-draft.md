@@ -84,6 +84,31 @@ previous.timestamp_start + 64
 
 Real hardware timestamp units are TBD.
 
+## Rhythm USB Block Parsing (Hardware Backend)
+
+The `kv-rhd` backend parses fixed-length Rhythm USB data blocks. Each frame is
+self-positioned (fixed stride, leading `RHYTHM_HEADER_MAGIC`), so a single
+transient framing fault must **not** tear down acquisition. The parser is
+therefore non-fatal on recoverable anomalies (DA2):
+
+- A frame whose header word does not equal `RHYTHM_HEADER_MAGIC` is decoded in
+  place; the parser logs a warning and increments `bad_magic_frames`.
+- A sample timestamp that is not exactly one greater than the previous sample
+  is resynced against the *previous* sample (`prev.wrapping_add(1)`), not the
+  block's first sample, so one jump is counted once instead of cascading. The
+  count lands in `timestamp_discontinuities`.
+
+Both counts are returned per block as a `BlockParseReport`:
+
+```rust
+pub struct BlockParseReport { pub bad_magic_frames: u32, pub timestamp_discontinuities: u32 }
+pub fn parse_rhythm_data_block_reporting(..) -> Result<ParsedRhythmBlock, RhythmParseError>;
+// parse_rhythm_data_block(..) is the unchanged wrapper that discards the report.
+```
+
+Only structural errors that make a frame undecodable (truncated buffer, invalid
+config) remain hard `RhythmParseError`s.
+
 ## Open Hardware Questions
 
 These are intentionally not fixed here:

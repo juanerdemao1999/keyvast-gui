@@ -55,6 +55,19 @@ observed)` so a routine counter wrap is **not** misreported as a discontinuity
 first start (`reset_fpga_timestamp`, pulsing `WIRE_IN_RESET_RUN`) so a lazily
 started session begins from zero rather than a stale counter (DA41).
 
+For the Rhythm hardware backend, a per-sample timestamp that does not increment
+by one is a **recoverable** anomaly, not a fatal error (DA2): the parser resyncs
+against the previous sample and tallies the event in `BlockParseReport`. A
+corrupt frame magic is likewise tallied (`bad_magic_frames`) and decoded in
+place. `backend.rs` emits one summary `log::warn!` per block that parsed with
+non-zero counts so operators can see transient framing faults without losing the
+session.
+
+`SampleBlock::validate_against_ttl_lines()` validates not only the summary
+`ttl_bits` but every per-sample TTL word against the configured `ttl_line_count`
+mask, rejecting out-of-range words with `TtlPerSampleOutOfRange { sample_index, .. }`
+(DA39).
+
 ## Sample Count
 
 For a clean observed stream:

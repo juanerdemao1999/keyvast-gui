@@ -21,7 +21,10 @@ pub use impedance::{
     ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceTestConfig, auto_select_scale,
     compute_impedance,
 };
-pub use parser::{RhythmParseError, parse_rhythm_data_block};
+pub use parser::{
+    BlockParseReport, ParsedRhythmBlock, RhythmParseError, parse_rhythm_data_block,
+    parse_rhythm_data_block_reporting,
+};
 pub use protocol::{
     CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_BITFILE_NAME,
     DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT,

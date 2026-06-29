@@ -182,3 +182,24 @@ toast/auto-stop side effects:
 Thresholds are decimal GB to match the headroom indicator, and the `None`
 (unqueryable) case is treated as healthy so an unmonitorable volume never forces
 a spurious stop.
+
+## Selective-save channel scope (DA20)
+
+The unified CHANNELS panel exposes a per-channel **Rec** toggle that drives the
+recording subset (`ChannelSelectState::recording_selection`). It previously
+rendered Rec rows only for the on-screen window
+(`visible = visible_channels.min(channel_count)`), but `selected` is sized to
+the full `channel_count` and defaults to `true`. With the default 16-wide
+window on a 64-channel headstage, enabling "Record subset only" and ticking just
+CH0–3 still wrote CH16–63 to disk, while the summary `Record n/visible` clamped
+the count with `.min(visible)` and hid the surplus — *what you see was not what
+you saved*, and every offline channel→site mapping on the subset file was off.
+
+`visible_channels` controls how many lanes the **waveform** draws; it is not a
+recording scope. The two are now decoupled: the CHANNELS panel lists **every
+acquired channel** (`0..channel_count`) for both the Disp and Rec columns, so
+the recording subset is fully controllable, and the counts summary reports the
+true totals over `channel_count` with no `.min(visible)` masking. The scroll
+area + filter box keep the full list manageable, and `is_channel_enabled`
+already tolerates out-of-range indices, so widening the display-enable vector to
+`channel_count` is safe.

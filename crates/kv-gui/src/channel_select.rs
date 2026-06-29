@@ -238,18 +238,17 @@ pub fn draw_unified_channels(
     rec_locked: bool,
 ) {
     let ch_count = block.map(|b| b.channel_count).unwrap_or(0);
-    let visible = display.visible_channels.min(ch_count);
     select.sync_channel_count(ch_count);
 
     egui::CollapsingHeader::new(
-        egui::RichText::new(format!("CHANNELS ({visible})"))
+        egui::RichText::new(format!("CHANNELS ({ch_count})"))
             .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
     .default_open(false)
     .show(ui, |ui| {
-        if visible == 0 {
+        if ch_count == 0 {
             ui.label(
                 egui::RichText::new("No channels")
                     .size(theme::FONT_BODY)
@@ -258,8 +257,11 @@ pub fn draw_unified_channels(
             return;
         }
 
-        // Ensure the display-enable vector covers every visible channel.
-        while display.channel_enabled.len() < visible {
+        // Ensure the display-enable vector covers every channel. The Rec column
+        // must list every acquired channel — not just the on-screen window —
+        // otherwise channels scrolled off the display default to selected and
+        // are silently written to disk (DA20).
+        while display.channel_enabled.len() < ch_count {
             display.channel_enabled.push(true);
         }
 
@@ -272,14 +274,15 @@ pub fn draw_unified_channels(
             .on_hover_text("When off, every channel is recorded regardless of the Rec column");
         });
 
-        // Counts summary.
-        let disp_on = (0..visible)
+        // Counts summary — reported over every acquired channel so the Record
+        // total can't hide channels selected outside the on-screen window (DA20).
+        let disp_on = (0..ch_count)
             .filter(|&i| display.channel_enabled.get(i).copied().unwrap_or(true))
             .count();
-        let rec_on = select.selected_count().min(visible);
+        let rec_on = select.selected_count();
         ui.label(
             egui::RichText::new(format!(
-                "Display {disp_on}/{visible}  \u{00B7}  Record {rec_on}/{visible}"
+                "Display {disp_on}/{ch_count}  \u{00B7}  Record {rec_on}/{ch_count}"
             ))
             .size(theme::FONT_CAPTION)
             .color(theme::TEXT_DIM),
@@ -293,17 +296,17 @@ pub fn draw_unified_channels(
                     .color(theme::TEXT_DIM),
             );
             if ui.small_button("All").clicked() {
-                for i in 0..visible {
+                for i in 0..ch_count {
                     display.channel_enabled[i] = true;
                 }
             }
             if ui.small_button("None").clicked() {
-                for i in 0..visible {
+                for i in 0..ch_count {
                     display.channel_enabled[i] = false;
                 }
             }
             if ui.small_button("Invert").clicked() {
-                for i in 0..visible {
+                for i in 0..ch_count {
                     display.channel_enabled[i] = !display.channel_enabled[i];
                 }
             }
@@ -421,7 +424,7 @@ pub fn draw_unified_channels(
             .show(ui, |ui| {
                 ui.set_min_width(190.0);
                 let mut shown = 0usize;
-                for ch in 0..visible {
+                for ch in 0..ch_count {
                     if !channel_matches(ch, &filter) {
                         continue;
                     }
@@ -579,5 +582,23 @@ mod tests {
         assert_eq!(s.channel_count, 32);
         assert_eq!(s.selected.len(), 32);
         assert!(s.selected[31]); // new channels default to selected
+    }
+
+    #[test]
+    fn recording_selection_spans_all_channels_not_visible_window() {
+        // 64 acquired channels; the operator enables subset-only and keeps only
+        // CH0-3. The selection (and reported count) must cover the full acquired
+        // range — channels that used to scroll off a 16-wide display window may
+        // no longer default-on into the file unnoticed (DA20).
+        let mut s = ChannelSelectState {
+            enabled: true,
+            channel_count: 64,
+            selected: vec![false; 64],
+        };
+        for ch in 0..4 {
+            s.selected[ch] = true;
+        }
+        assert_eq!(s.selected_count(), 4);
+        assert_eq!(s.recording_selection(), Some(vec![0, 1, 2, 3]));
     }
 }

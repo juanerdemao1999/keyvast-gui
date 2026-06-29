@@ -149,6 +149,15 @@ fn check_packet_continuity(
     Ok(true)
 }
 
+/// FPGA timestamps are 32-bit hardware counters stored zero-extended in
+/// `timestamp_start`. They wrap roughly every 39.7h at 30 kHz, so continuity
+/// must be checked in the 2^32 domain — otherwise a routine wrap (where the
+/// expected value crosses 0xFFFF_FFFF but the observed counter restarts near
+/// zero) is mis-reported as a clock discontinuity.
+fn timestamps_contiguous(expected: u64, observed: u64) -> bool {
+    (expected as u32) == (observed as u32)
+}
+
 fn check_timestamp_continuity(
     previous: &SampleBlock,
     current: &SampleBlock,
@@ -156,7 +165,7 @@ fn check_timestamp_continuity(
 ) {
     let expected_timestamp_start = previous.timestamp_after_block();
 
-    if current.timestamp_start != expected_timestamp_start {
+    if !timestamps_contiguous(expected_timestamp_start, current.timestamp_start) {
         report.summary.timestamp_discontinuities =
             report.summary.timestamp_discontinuities.saturating_add(1);
         report
@@ -254,7 +263,7 @@ impl IncrementalIntegrity {
         // Only check timestamp continuity when there is no packet gap.
         if !had_gap
             && let Some(expected_timestamp) = self.previous_timestamp_after_block
-            && block.timestamp_start != expected_timestamp
+            && !timestamps_contiguous(expected_timestamp, block.timestamp_start)
         {
             self.report.summary.timestamp_discontinuities = self
                 .report

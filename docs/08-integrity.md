@@ -47,6 +47,14 @@ expected_timestamp = previous.timestamp_start + previous.samples_per_channel
 
 Timestamp rules for real FPGA are TBD.
 
+FPGA timestamps are 32-bit hardware counters stored zero-extended in
+`timestamp_start`; at 30 kHz they wrap roughly every 39.7 h. Continuity is
+therefore compared in the 2^32 domain via `timestamps_contiguous(expected,
+observed)` so a routine counter wrap is **not** misreported as a discontinuity
+(DA5). The acquisition path resets the FPGA sample-timestamp counter on the
+first start (`reset_fpga_timestamp`, pulsing `WIRE_IN_RESET_RUN`) so a lazily
+started session begins from zero rather than a stale counter (DA41).
+
 ## Sample Count
 
 For a clean observed stream:

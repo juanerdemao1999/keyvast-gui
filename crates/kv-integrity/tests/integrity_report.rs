@@ -66,6 +66,22 @@ fn simulator_timestamp_jump_reports_discontinuity_detail() {
 }
 
 #[test]
+fn u32_timestamp_wrap_is_not_reported_as_discontinuity() {
+    // FPGA timestamps are 32-bit counters that wrap ~every 39.7h at 30 kHz.
+    // The last block before the wrap ends at 0xFFFF_FFFD + 3 == 2^32, and the
+    // hardware counter restarts at 0; a continuous stream must not flag this.
+    let blocks = vec![
+        sample_block(0, u32::MAX as u64 - 2, 2, 3),
+        sample_block(1, 0, 2, 3),
+    ];
+
+    let report = check_blocks(&blocks).expect("wrap should not be fatal");
+
+    assert_eq!(report.summary.timestamp_discontinuities, 0);
+    assert!(report.timestamp_discontinuities.is_empty());
+}
+
+#[test]
 fn sample_counts_are_summarized_from_blocks() {
     let blocks = vec![
         sample_block(0, 0, 2, 3),
@@ -229,6 +245,25 @@ fn incremental_detects_timestamp_discontinuity() {
             observed_timestamp_start: DEFAULT_SAMPLES_PER_PACKET as u64 + 10,
         }
     );
+}
+
+#[test]
+fn incremental_u32_timestamp_wrap_is_not_a_discontinuity() {
+    let blocks = vec![
+        sample_block(0, u32::MAX as u64 - 2, 2, 3),
+        sample_block(1, 0, 2, 3),
+    ];
+
+    let mut incremental = IncrementalIntegrity::new();
+    for block in &blocks {
+        incremental
+            .push(block)
+            .expect("incremental push should succeed");
+    }
+    let report = incremental.finish();
+
+    assert_eq!(report.summary.timestamp_discontinuities, 0);
+    assert!(report.timestamp_discontinuities.is_empty());
 }
 
 #[test]

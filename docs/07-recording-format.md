@@ -146,6 +146,12 @@ Do not write these during acquisition in the first MVP:
 
 Instead, write stable `kvraw` first, then convert offline.
 
+Offline exporters preserve the real per-sample timestamps: the `.rhd` exporter
+emits `block.timestamp_start.wrapping_add(sample_index)` (truncated to the
+32-bit hardware domain) rather than a synthetic 0-based counter, and trailing
+padding continues `last_ts.wrapping_add(i + 1)` so exported timestamps match the
+acquired FPGA counter (DA10).
+
 ## Initial Rust Contract
 
 The first Rust crate is `kv-recorder`.

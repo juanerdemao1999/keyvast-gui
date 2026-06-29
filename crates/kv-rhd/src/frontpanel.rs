@@ -9,6 +9,7 @@ mod imp {
     };
 
     use libloading::Library;
+    use libloading::os::windows::{LOAD_WITH_ALTERED_SEARCH_PATH, Library as WindowsLibrary};
 
     use super::FrontPanelError;
 
@@ -46,20 +47,31 @@ mod imp {
     impl FrontPanelLibrary {
         pub fn load(path: Option<PathBuf>) -> Result<Self, FrontPanelError> {
             let path = path.unwrap_or_else(default_frontpanel_dll_path);
-            log::info!("loading FrontPanel DLL: {}", path.display());
-            // SAFETY: Library::new loads the DLL into the process address space.
-            // The path is a valid filesystem path. The Library is stored in
-            // Arc<FrontPanelApi>::_library, keeping the DLL loaded for the
+            // Resolve to a fully qualified path so LOAD_WITH_ALTERED_SEARCH_PATH
+            // takes effect: Windows then searches the DLL's own directory first
+            // for its transitive dependencies (VC++ runtime, Opal Kelly helper
+            // DLLs). Plain LoadLibrary only searches the standard path, so a
+            // bring-up machine missing those runtimes fails to load (DA33).
+            let load_path = path.canonicalize().unwrap_or_else(|_| path.clone());
+            log::info!("loading FrontPanel DLL: {}", load_path.display());
+            // SAFETY: load_with_flags loads the DLL into the process address
+            // space. The path is a valid filesystem path. The Library is stored
+            // in Arc<FrontPanelApi>::_library, keeping the DLL loaded for the
             // lifetime of all derived function pointers.
-            let library = unsafe {
-                Library::new(&path).map_err(|source| {
-                    log::error!("FrontPanel DLL load FAILED: {source}");
-                    FrontPanelError::DllLoad {
-                        path: path.clone(),
-                        message: source.to_string(),
-                    }
-                })?
-            };
+            // LOAD_WITH_ALTERED_SEARCH_PATH adds the DLL's directory to the
+            // front of the dependency search order.
+            let library: Library = unsafe {
+                WindowsLibrary::load_with_flags(&load_path, LOAD_WITH_ALTERED_SEARCH_PATH).map_err(
+                    |source| {
+                        log::error!("FrontPanel DLL load FAILED: {source}");
+                        FrontPanelError::DllLoad {
+                            path: load_path.clone(),
+                            message: source.to_string(),
+                        }
+                    },
+                )?
+            }
+            .into();
 
             // SAFETY: Each symbol name is a NUL-terminated byte literal matching
             // the Opal Kelly FrontPanel C API. The Library remains alive via

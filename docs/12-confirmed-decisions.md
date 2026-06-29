@@ -302,3 +302,34 @@ This is the pragmatic half of the audit's fix (gate the badge to resolvable
 windows + make the detection rate explicit). A dedicated minimally-decimated
 AP-band / snippet stream for sorting-grade detection at any zoom remains future
 work; the display ring is a render structure, not a spike-sorting source.
+
+## TTL gate sees every sample and resets per session (DA23, DA38)
+
+**DA23 — sample-accurate gating.** `process_block` watched only the block-level
+`block.ttl_bits` word: `current = (ttl_bits >> bit) & 1`, evaluated once per
+block. An RHD block is 256 samples ≈ 8.53 ms at 30 kHz, so any pulse shorter
+than a block, and any rise+fall pair inside one block, was invisible; two rising
+edges in a block counted as one. Optogenetic / electrical-stim / behavioural TTLs
+are routinely sub-millisecond to a few ms, so triggers were quantized to the
+~8.5 ms block boundary and pulses were dropped — trial alignment and stim logs
+silently diverged.
+
+The gate now scans `block.ttl_in_per_sample` when present (falling back to
+`ttl_bits` only when it is absent), tracking the level across sample and block
+boundaries. Because the recorder is block-granular it records **any block that
+contains at least one active sample** and releases on the first fully-idle
+block, so a sub-block pulse is captured instead of missed. `last_level` now
+reflects the final sample for an accurate live readout. (Depends on DA1 making
+the parser actually retain per-sample TTL.)
+
+**DA38 — per-session reset.** `self.trigger` was only ever touched by
+`ingest_block` and the sidebar UI; `start_demo` / `start_device` / `stop_all`
+(and therefore `select_source`, which routes through them) never cleared it.
+Stopping while the gate held `recording = true` leaked that state into the next
+session: the first block could fire a false stop, or a stale level could swallow
+the first real edge — so the opening stimulus of a new trial/animal was lost
+with no error. A new `TriggerConfig::reset()` clears `recording` and
+`last_level` (preserving `enabled` / `bit_index` / `active_high`) and is now
+called from `start_demo`, `start_device`, and `stop_all`. The gate is
+level-based, so the first block of a fresh session correctly evaluates the
+current line level instead of depending on a remembered edge.

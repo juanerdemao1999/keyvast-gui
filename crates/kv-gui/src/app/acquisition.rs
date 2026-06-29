@@ -19,6 +19,7 @@ impl KvApp {
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
         self.ttl_history.clear();
+        self.trigger.reset();
         self.snippet_store
             .reconfigure(self.demo.channel_count, self.demo.sample_rate);
         self.sweep_start_ms = 0.0;
@@ -46,6 +47,7 @@ impl KvApp {
         self.disp_ring_lfp.reset();
         self.disp_ring_ap.reset();
         self.ttl_history.clear();
+        self.trigger.reset();
         // snippet_store will be reconfigured lazily on the first ingest_block()
         // when the actual channel count and sample rate are known from the device.
         self.sweep_start_ms = 0.0;
@@ -109,6 +111,7 @@ impl KvApp {
         self.demo_started = false;
         // Dropping the handle stops both producer and recorder threads cleanly.
         self.live_pipeline = None;
+        self.trigger.reset();
     }
 
     /// Build LP 250 Hz filter chains (used by the fixed LFP ring).

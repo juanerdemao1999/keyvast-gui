@@ -217,6 +217,29 @@ impl KvApp {
         }
     }
 
+    /// Common-average reference for one time step. Rail-pinned channels are
+    /// excluded so one saturated electrode cannot contaminate every channel.
+    pub(crate) fn car_reference_mean(samples: &[i16]) -> f64 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for &sample in samples {
+            if sample.unsigned_abs() < CAR_RAIL_EXCLUDE_I16 {
+                sum += sample as f64;
+                count += 1;
+            }
+        }
+
+        if count == 0 {
+            samples.iter().map(|&sample| sample as f64).sum::<f64>() / samples.len() as f64
+        } else {
+            sum / count as f64
+        }
+    }
+
     /// Apply filter chains to a single block, producing a new filtered block.
     pub(crate) fn filter_block_with_chains(
         block: &SampleBlock,
@@ -228,16 +251,15 @@ impl KvApp {
         let mut data = block.data.clone();
 
         for s in 0..spc {
-            // CAR: subtract mean across channels at this time step
+            // CAR: subtract mean across channels at this time step.
             if car_enabled && ch_count > 0 {
                 let base = s * ch_count;
-                let mut sum: f64 = 0.0;
+                let mean = Self::car_reference_mean(&data[base..base + ch_count]);
                 for ch in 0..ch_count {
-                    sum += data[base + ch] as f64;
-                }
-                let mean = sum / ch_count as f64;
-                for ch in 0..ch_count {
-                    data[base + ch] = (data[base + ch] as f64 - mean) as i16;
+                    data[base + ch] = (data[base + ch] as f64 - mean)
+                        .round()
+                        .clamp(i16::MIN as f64, i16::MAX as f64)
+                        as i16;
                 }
             }
             // Per-channel biquad filter

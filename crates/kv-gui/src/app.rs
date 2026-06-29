@@ -67,6 +67,10 @@ const DISK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// Minimum spacing between low-disk-space warning toasts.
 const DISK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// Channels whose absolute sample is at or above this (~0.998 of full scale)
+/// are treated as rail-pinned/saturated and excluded from CAR.
+const CAR_RAIL_EXCLUDE_I16: u16 = 32_700;
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -619,6 +623,23 @@ mod tests {
         // Metadata is preserved; only the samples change.
         assert_eq!(out.channel_count, block.channel_count);
         assert_eq!(out.samples_per_channel, block.samples_per_channel);
+    }
+
+    #[test]
+    fn car_reference_mean_excludes_railed_channels() {
+        let mean = KvApp::car_reference_mean(&[90, 100, 110, i16::MAX]);
+        assert!((mean - 100.0).abs() < 1e-9, "got {mean}");
+
+        let all_railed = KvApp::car_reference_mean(&[i16::MAX, i16::MAX]);
+        assert!((all_railed - i16::MAX as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn car_does_not_inject_railed_channel_artifact() {
+        let block = block_interleaved(4, 1, vec![100, 100, 100, i16::MAX]);
+        let mut chains = vec![FilterChain::passthrough(); 4];
+        let out = KvApp::filter_block_with_chains(&block, &mut chains, true);
+        assert_eq!(&out.data[0..3], &[0, 0, 0]);
     }
 }
 

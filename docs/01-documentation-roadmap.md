@@ -46,6 +46,16 @@ These documents prepare the GUI and external integrations.
 | `14-open-questions.md` | Unknowns separated by priority and whether they block implementation. |
 | `15-dev-handoff.md` | Current implementation state, verification status, next steps, and AI handoff notes. |
 
+## Audits And Remediation
+
+These documents capture deep audits of the implementation and how their findings
+are being fixed.
+
+| Document | Purpose |
+| --- | --- |
+| `20-deep-audit.md` | In-vivo electrophysiology productionization audit (44 findings beyond doc 19). |
+| `21-doc20-remediation-plan.md` | Batched fix plan and tracker for the doc 20 findings. |
+
 ## Working Rule
 
 When implementation reveals a better contract, update the document first or in the same change. The docs are not decorative; they are the project memory.

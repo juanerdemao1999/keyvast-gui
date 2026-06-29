@@ -1285,6 +1285,16 @@ impl KvApp {
                 RecorderEvent::BufferStatus { occupancy } => {
                     self.recorder_buffer_occupancy = occupancy;
                 }
+                RecorderEvent::BufferOverflow {
+                    dropped_blocks,
+                    occupancy,
+                } => {
+                    self.recorder_buffer_occupancy = occupancy;
+                    self.toasts.warning(format!(
+                        "Buffer overflow: {dropped_blocks} blocks dropped \
+                         (consumer too slow)"
+                    ));
+                }
                 RecorderEvent::SourceError(e) => {
                     // The producer (device) thread has stopped. Surface the
                     // error and tear down the pipeline so the UI shows
@@ -1311,14 +1321,18 @@ impl KvApp {
             let mut responses: Vec<RemoteResponse> = Vec::new();
             for (id, cmd) in remote_cmds {
                 let result = self.handle_remote_command(&cmd);
-                responses.push(RemoteResponse { id, result });
+                responses.push(RemoteResponse::new(id, result));
             }
             if let Some(ref handle) = self.remote_api_handle {
-                let mut resp_q = remote_api::lock_recover(&handle.responses);
                 for r in responses {
-                    resp_q.push_back(r);
+                    remote_api::push_response(&handle.responses, r);
                 }
             }
+        }
+        // Evict responses whose client already timed out or disconnected so the
+        // shared queue cannot grow without bound over a long session.
+        if let Some(ref handle) = self.remote_api_handle {
+            remote_api::sweep_stale_responses(&handle.responses);
         }
 
         // ── Ingest all preview blocks ─────────────────────────────────────────

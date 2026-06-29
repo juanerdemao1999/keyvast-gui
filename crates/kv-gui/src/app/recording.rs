@@ -19,6 +19,26 @@ impl KvApp {
     /// and the remote API). Captures the channel selection at start so a
     /// mid-recording selection change cannot change the file's layout.
     pub(crate) fn begin_recording(&mut self) {
+        let free = crate::diskspace::free_bytes(&self.recording.output_dir);
+        if let crate::diskspace::StartDecision::Block { free_bytes } =
+            crate::diskspace::evaluate_start(free, None)
+        {
+            let msg = format!(
+                "Not enough free disk space to start recording: {} free (need at least {})",
+                theme::format_bytes(free_bytes),
+                theme::format_bytes(crate::diskspace::RECORDING_MIN_START_FREE_BYTES),
+            );
+            log::warn!("{msg}");
+            self.toasts.error(msg.clone());
+            self.recording_error = Some(msg);
+            if self.recording.state == RecordingState::Armed {
+                self.recording.state = RecordingState::Idle;
+            }
+            return;
+        }
+        self.last_disk_check = None;
+        self.last_disk_warn = None;
+
         let channels = self.channel_select.recording_selection();
         match self.mode {
             AcqMode::Device => {
@@ -52,6 +72,52 @@ impl KvApp {
                     self.recording_error = Some(msg);
                 }
             },
+        }
+    }
+
+    /// Periodically sample free disk while recording and cleanly stop before
+    /// the volume fills, so files finalize instead of truncating.
+    pub(crate) fn poll_recording_disk_space(&mut self) {
+        if self.recording.state != RecordingState::Recording {
+            self.last_disk_check = None;
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(last) = self.last_disk_check
+            && now.duration_since(last) < DISK_CHECK_INTERVAL
+        {
+            return;
+        }
+        self.last_disk_check = Some(now);
+
+        let free = crate::diskspace::free_bytes(&self.recording.output_dir);
+        match crate::diskspace::evaluate_recording(free) {
+            crate::diskspace::RecordingDiskStatus::Ok => {}
+            crate::diskspace::RecordingDiskStatus::Low { free_bytes } => {
+                let warn_due = self
+                    .last_disk_warn
+                    .map(|t| now.duration_since(t) >= DISK_WARN_INTERVAL)
+                    .unwrap_or(true);
+                if warn_due {
+                    self.last_disk_warn = Some(now);
+                    self.toasts.warning(format!(
+                        "Low disk space: {} free; recording will auto-stop near {}",
+                        theme::format_bytes(free_bytes),
+                        theme::format_bytes(crate::diskspace::RECORDING_STOP_FREE_BYTES),
+                    ));
+                }
+            }
+            crate::diskspace::RecordingDiskStatus::Critical { free_bytes } => {
+                let msg = format!(
+                    "Disk nearly full ({} free); recording stopped and finalized to avoid a truncated file",
+                    theme::format_bytes(free_bytes),
+                );
+                log::warn!("{msg}");
+                self.toasts.error(msg.clone());
+                self.recording_error = Some(msg);
+                self.stop_recording();
+            }
         }
     }
 

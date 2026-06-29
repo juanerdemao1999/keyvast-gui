@@ -61,6 +61,12 @@ mod render;
 /// is re-filtered (lets slider drags settle first).
 const REFILTER_DEBOUNCE_MS: u64 = 150;
 
+/// How often the recording disk-space guard samples free space (DA18).
+const DISK_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Minimum spacing between low-disk-space warning toasts.
+const DISK_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +181,10 @@ pub struct KvApp {
     recorder_dropped_blocks: u64,
     /// Latest error from the recorder thread (None = no error / dismissed).
     recording_error: Option<String>,
+    /// Last time the recording disk-space guard sampled free space.
+    last_disk_check: Option<Instant>,
+    /// Last time a low-disk-space warning toast was shown.
+    last_disk_warn: Option<Instant>,
     theme_applied: bool,
     /// When true, the waveform display is frozen at the current view but
     /// acquisition and recording continue uninterrupted.
@@ -284,6 +294,8 @@ impl KvApp {
             recorder_buffer_occupancy: 0.0,
             recorder_dropped_blocks: 0,
             recording_error: None,
+            last_disk_check: None,
+            last_disk_warn: None,
             theme_applied: false,
             display_paused: false,
             paused_elapsed: 0.0,
@@ -405,6 +417,9 @@ impl eframe::App for KvApp {
 
         // Handle keyboard shortcuts
         self.handle_keys(ctx);
+
+        // Warn as recording storage gets low and auto-stop before it fills.
+        self.poll_recording_disk_space();
 
         // Tick the live source (acquisition runs regardless of display pause).
         // Skipped while playing back an offline recording so the two sources

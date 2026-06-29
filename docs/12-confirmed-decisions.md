@@ -150,3 +150,35 @@ sample rate, so this now uses the configured rate passed in from `configure`
 rather than the `DEFAULT_RHD_SAMPLE_RATE` constant; otherwise the headstage
 cable delay would be mis-compensated at any rate other than 30 kHz, degrading
 the MISO sampling phase.
+
+## Recording disk-space guard (DA18)
+
+Free space used to be display-only (the headroom line in the recording panel):
+nothing enforced it, so an unattended overnight/behavioral session (~3.7 MB/s at
+30 kHz × 64 ch ≈ 13 GB/h) could silently fill the volume and truncate the
+in-progress `.kvraw` as an opaque write error — a worst-case loss of hours of
+non-reproducible animal data. The guard now actively enforces headroom.
+
+The policy lives in `kv-gui/src/diskspace.rs` as pure, unit-tested functions
+over plain byte counts, with the GUI supplying the live free-space query and the
+toast/auto-stop side effects:
+
+- **Pre-flight (`evaluate_start`)** — `begin_recording` queries free space
+  before opening the file and refuses to start below
+  `RECORDING_MIN_START_FREE_BYTES` (2 GB), surfacing an error toast and dropping
+  an `Armed`/triggered start back to `Idle` instead of beginning a recording
+  that is already doomed. An unqueryable volume (non-Windows, or a failed query)
+  is *not* blocked — the existing write-error path still covers a genuinely full
+  disk.
+- **In-progress polling (`evaluate_recording`)** — while recording, the update
+  loop samples free space every `DISK_CHECK_INTERVAL` (2 s). Below
+  `RECORDING_WARN_FREE_BYTES` (5 GB) it warns via a rate-limited toast (one per
+  `DISK_WARN_INTERVAL`, 20 s); at or below `RECORDING_STOP_FREE_BYTES` (1 GB) it
+  triggers a **clean** auto-stop through the normal `stop_recording` path, so the
+  recorder finalizes the file (metadata + flush) rather than leaving a truncated
+  one. The 5 GB → 1 GB band gives ~18 min of warning at the 13 GB/h reference
+  rate.
+
+Thresholds are decimal GB to match the headroom indicator, and the `None`
+(unqueryable) case is treated as healthy so an unmonitorable volume never forces
+a spurious stop.

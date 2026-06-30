@@ -358,7 +358,7 @@ mod tests {
 
     #[test]
     fn simulator_events_emit_buffer_overflow_when_blocks_dropped() {
-        let events = simulator_recording_events(&report_with_overflows(7));
+        let events = simulator_recording_events(&report_with_overflows(7), Vec::new());
         let overflow = events.iter().find_map(|e| match e {
             AcquisitionEvent::BufferOverflow {
                 dropped_blocks,
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn no_buffer_overflow_event_without_drops() {
-        let events = simulator_recording_events(&report_with_overflows(0));
+        let events = simulator_recording_events(&report_with_overflows(0), Vec::new());
         assert!(
             !events
                 .iter()

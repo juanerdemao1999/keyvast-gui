@@ -685,6 +685,7 @@ fn side_channel_block(packet_id: u64, timestamp_start: u64) -> SampleBlock {
         board_adc_data: Some(vec![vec![10, 20, 30, 40]]),
         ttl_in_per_sample: Some(vec![1, 2, 2, 5]),
         ttl_out_per_sample: Some(vec![0, 1, 0, 1]),
+        host_time_ns: None,
     }
 }
 

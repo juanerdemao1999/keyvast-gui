@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
 use kv_integrity::{
-    check_blocks_with_expected_start, IncrementalIntegrity, IntegrityError, IntegrityReport,
+    IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks_with_expected_start,
 };
 use kv_recorder::{
     LatencyDistribution, RecorderError, RecordingConfig, RecordingSummary, StreamingRecorder,

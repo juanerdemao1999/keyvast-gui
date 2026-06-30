@@ -429,7 +429,10 @@ fn persist_partial_simulator_recording(
         let mut lines = simulator_recording_log_lines(&integrity);
         lines.insert(0, PARTIAL_RECORDING_WARNING.to_string());
         write_log_file(output_dir, &lines)?;
-        write_events_csv(output_dir, &simulator_recording_events(&integrity))?;
+        write_events_csv(
+            output_dir,
+            &simulator_recording_events(&integrity, Vec::new()),
+        )?;
         let benchmark = simulator_benchmark_summary(summary, &recording, &integrity);
         write_benchmark_summary(output_dir, &benchmark)?;
     }

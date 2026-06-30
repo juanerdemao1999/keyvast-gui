@@ -5,7 +5,7 @@ pub mod process_metrics;
 
 use std::fmt;
 
-use kv_integrity::{check_blocks_with_expected_start, IntegrityError, IntegrityReport};
+use kv_integrity::{IntegrityError, IntegrityReport, check_blocks_with_expected_start};
 use kv_types::{AcquisitionState, DeviceConfig, DeviceConfigError, DeviceStatus, SampleBlock};
 
 pub trait AcquisitionSource {

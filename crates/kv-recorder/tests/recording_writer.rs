@@ -5,8 +5,9 @@ use std::{
 };
 
 use kv_recorder::{
-    BenchmarkSummary, KVRAW_DATA_OFFSET, RecorderError, StreamingRecorder, write_benchmark_summary,
-    write_integrity_summary, write_log_file, write_recording,
+    BenchmarkSummary, KVRAW_DATA_OFFSET, KvauxReader, RecorderError, RecordingConfig,
+    StreamingRecorder, ttl_change_events, write_benchmark_summary, write_integrity_summary,
+    write_log_file, write_recording,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{
@@ -166,6 +167,8 @@ fn writes_benchmark_summary_json() {
     let summary = BenchmarkSummary {
         measurement_kind: "simulator_estimate".to_string(),
         duration_seconds: 0.0064,
+        wall_clock_seconds: Some(0.5),
+        requested_duration_seconds: None,
         channel_count: 64,
         sample_rate: 30_000.0,
         expected_samples: 16_384,
@@ -191,6 +194,8 @@ fn writes_benchmark_summary_json() {
     let benchmark = fs::read_to_string(benchmark_path).expect("benchmark json");
     assert!(benchmark.contains("\"measurement_kind\": \"simulator_estimate\""));
     assert!(benchmark.contains("\"duration_seconds\": 0.006400"));
+    assert!(benchmark.contains("\"wall_clock_seconds\": 0.500000"));
+    assert!(benchmark.contains("\"requested_duration_seconds\": null"));
     assert!(benchmark.contains("\"channel_count\": 64"));
     assert!(benchmark.contains("\"sample_rate\": 30000.0"));
     assert!(benchmark.contains("\"expected_samples\": 16384"));
@@ -264,6 +269,7 @@ fn sample_block(
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     }
 }
 
@@ -334,6 +340,50 @@ fn streaming_recorder_writes_blocks_incrementally() {
     assert!(metadata.contains("\"first_packet_id\": 0"));
     assert!(metadata.contains("\"last_packet_id\": 2"));
     assert!(metadata.contains(&format!("\"written_samples\": {expected_samples}")));
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn streaming_header_records_clock_domain_fields_within_the_reserved_block() {
+    let output_dir = unique_output_dir("streaming-clock-domain");
+
+    // Stamp host wall-clock and distinct FPGA sample counters so the metadata
+    // carries the DA16 alignment fields (first/last for each clock domain).
+    let mut blocks = next_simulator_blocks(3);
+    for (i, block) in blocks.iter_mut().enumerate() {
+        block.timestamp_start = 1_000 + i as u64 * 64;
+        // Use an extreme i64 to exercise the widest possible host-clock render.
+        block.host_time_ns = Some(if i == 0 {
+            i64::MIN
+        } else {
+            1_700_000_000_000_000_000 + i as i64
+        });
+    }
+
+    let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder should open");
+    for block in &blocks {
+        recorder
+            .write_block(block)
+            .expect("block write should succeed");
+    }
+    recorder.finish().expect("finish should succeed");
+
+    let kvraw_bytes = fs::read(output_dir.join("recording.kvraw")).expect("kvraw readable");
+    let json_len = u32::from_le_bytes(kvraw_bytes[8..12].try_into().unwrap()) as usize;
+    // The fully-populated header must fit inside the reserved JSON block; if it
+    // overflowed, finish() would truncate it into invalid JSON.
+    assert!(
+        json_len < (KVRAW_DATA_OFFSET as usize - 12),
+        "header JSON ({json_len} B) must fit the reserved block"
+    );
+    let metadata =
+        std::str::from_utf8(&kvraw_bytes[12..12 + json_len]).expect("header JSON is valid UTF-8");
+
+    assert!(metadata.contains("\"fpga_timestamp_first\": 1000"));
+    assert!(metadata.contains("\"fpga_timestamp_last\": 1128"));
+    assert!(metadata.contains(&format!("\"host_clock_first_ns\": {}", i64::MIN)));
+    assert!(metadata.contains("\"host_clock_last_ns\": 1700000000000000002"));
 
     cleanup_dir(&output_dir);
 }
@@ -590,6 +640,12 @@ fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
     let orig_ch = blocks[1].channel_count;
     blocks[1].samples_per_channel *= 2;
     blocks[1].data = vec![0; orig_ch * blocks[1].samples_per_channel];
+    // Drop per-sample side channels so the block is internally valid and the
+    // only inconsistency under test is samples_per_channel across blocks.
+    blocks[1].ttl_in_per_sample = None;
+    blocks[1].ttl_out_per_sample = None;
+    blocks[1].board_adc_data = None;
+    blocks[1].aux_data = None;
 
     let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
     recorder.write_block(&blocks[0]).expect("first block");
@@ -606,4 +662,142 @@ fn streaming_recorder_rejects_inconsistent_samples_per_channel() {
     ));
 
     cleanup_dir(&output_dir);
+}
+
+// --- .kvaux side-channel persistence (DA1) + channel mapping (DA17) ---
+
+fn side_channel_block(packet_id: u64, timestamp_start: u64) -> SampleBlock {
+    SampleBlock {
+        device_id: "simulator-0".to_string(),
+        stream_id: 0,
+        packet_id,
+        timestamp_start,
+        sample_rate: 30_000.0,
+        channel_count: 2,
+        samples_per_channel: 4,
+        ttl_bits: 5,
+        data: vec![0; 8],
+        aux_data: Some(vec![vec![
+            vec![100, 101, 102, 103],
+            vec![200, 201, 202, 203],
+            vec![300, 301, 302, 303],
+        ]]),
+        board_adc_data: Some(vec![vec![10, 20, 30, 40]]),
+        ttl_in_per_sample: Some(vec![1, 2, 2, 5]),
+        ttl_out_per_sample: Some(vec![0, 1, 0, 1]),
+        host_time_ns: None,
+    }
+}
+
+#[test]
+fn kvaux_round_trips_side_channels_and_channel_mapping() {
+    let output_dir = unique_output_dir("kvaux-round-trip");
+    let config = RecordingConfig {
+        enabled_channels: vec![3, 7],
+        ttl_line_count: 8,
+    };
+
+    let mut recorder =
+        StreamingRecorder::with_config(&output_dir, config.clone()).expect("recorder with config");
+    recorder
+        .write_block(&side_channel_block(0, 0))
+        .expect("first block");
+    recorder
+        .write_block(&side_channel_block(1, 4))
+        .expect("second block");
+    recorder.finish().expect("finish recording");
+
+    let reader = KvauxReader::open(output_dir.join("recording.kvaux")).expect("open kvaux");
+    let metadata = reader.metadata();
+
+    assert_eq!(metadata.enabled_channels, config.enabled_channels);
+    assert_eq!(metadata.ttl_line_count, config.ttl_line_count);
+    assert_eq!(metadata.block_count, 2);
+    assert_eq!(metadata.layout.ttl_in_samples, Some(4));
+    assert_eq!(metadata.layout.ttl_out_samples, Some(4));
+    assert_eq!(metadata.layout.board_adc_channels, 1);
+    assert_eq!(metadata.layout.board_adc_samples, 4);
+    assert_eq!(metadata.layout.aux_streams, 1);
+    assert_eq!(metadata.layout.aux_channels_per_stream, 3);
+    assert_eq!(metadata.layout.aux_samples, 4);
+
+    // Per-block stride: 4 ttl_in (u32) + 4 ttl_out (u32) + 1*4 adc (u16)
+    // + 1*3*4 aux (u16) = 16 + 16 + 8 + 24 = 64 bytes.
+    let payload = reader.payload();
+    assert_eq!(payload.len(), 128);
+
+    let ttl_in: Vec<u32> = payload[..16]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(ttl_in, vec![1, 2, 2, 5]);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn kvaux_written_without_side_channels_records_channel_mapping() {
+    let output_dir = unique_output_dir("kvaux-mapping-only");
+    let config = RecordingConfig {
+        enabled_channels: vec![0, 1, 4, 5],
+        ttl_line_count: 0,
+    };
+
+    let mut recorder =
+        StreamingRecorder::with_config(&output_dir, config.clone()).expect("recorder with config");
+    recorder
+        .write_block(&sample_block(0, 0, 2, 2, vec![1, 2, 3, 4]))
+        .expect("block without side channels");
+    recorder.finish().expect("finish recording");
+
+    let reader = KvauxReader::open(output_dir.join("recording.kvaux")).expect("open kvaux");
+    let metadata = reader.metadata();
+
+    assert_eq!(metadata.enabled_channels, config.enabled_channels);
+    assert_eq!(metadata.ttl_line_count, 0);
+    assert!(reader.payload().is_empty());
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
+fn ttl_change_events_emit_only_on_transitions() {
+    let block_a = SampleBlock {
+        ttl_in_per_sample: Some(vec![1, 1, 2, 2]),
+        ..side_channel_block(0, 0)
+    };
+    let block_b = SampleBlock {
+        ttl_in_per_sample: Some(vec![2, 3, 3, 7]),
+        ..side_channel_block(1, 4)
+    };
+
+    let events = ttl_change_events(&[block_a, block_b]);
+
+    let transitions: Vec<(u64, u32)> = events
+        .iter()
+        .map(|event| match event {
+            AcquisitionEvent::TtlChanged {
+                timestamp_start,
+                ttl_bits,
+            } => (*timestamp_start, *ttl_bits),
+            other => panic!("unexpected event {other:?}"),
+        })
+        .collect();
+
+    // First sample always emits; subsequent only when the word changes.
+    // block_a: idx0=1, idx2=2; block_b: idx5=3, idx7=7 (idx4=2 unchanged).
+    assert_eq!(transitions, vec![(0, 1), (2, 2), (5, 3), (7, 7)]);
+}
+
+#[test]
+fn ttl_change_events_empty_without_per_sample_ttl() {
+    let blocks = next_simulator_blocks(1)
+        .into_iter()
+        .map(|mut block| {
+            block.ttl_in_per_sample = None;
+            block
+        })
+        .collect::<Vec<_>>();
+
+    assert!(ttl_change_events(&blocks).is_empty());
 }

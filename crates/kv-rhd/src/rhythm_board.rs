@@ -9,8 +9,7 @@ use crate::commands::{AuxCommandSlot, BoardPort, RHD_ADC_CALIBRATION_SAMPLES, Rh
 use crate::frame_analysis::{amplifier_mean_raw_word, aux_command_trigger_bit};
 use crate::frontpanel::FrontPanelDevice;
 use crate::protocol::{
-    CHANNELS_PER_STREAM, DEFAULT_RHD_SAMPLE_RATE, MAX_SUPPORTED_STREAMS, RHYTHM_BOARD_ID,
-    RhdChipType, USB3_BLOCK_SIZE_BYTES,
+    CHANNELS_PER_STREAM, MAX_SUPPORTED_STREAMS, RHYTHM_BOARD_ID, RhdChipType, USB3_BLOCK_SIZE_BYTES,
 };
 
 pub(crate) const WIRE_IN_RESET_RUN: i32 = 0x00;
@@ -82,6 +81,7 @@ impl RhythmFrontPanelBoard {
         bitfile_path: &Path,
         enabled_streams: usize,
         cable_length_meters: f64,
+        sample_rate: f64,
     ) -> Result<(Self, usize), RhdReadError> {
         device
             .configure_fpga(bitfile_path)
@@ -111,18 +111,23 @@ impl RhythmFrontPanelBoard {
             board_version,
         };
         board.reset_board()?;
-        board.set_sample_rate_30khz()?;
+        // Program the requested rate (not a hardcoded 30 kHz) and reject rates
+        // the PLL table cannot hit, so the recorded sample_rate always matches
+        // what the hardware actually runs (DA9).
+        if !board.set_sample_rate(sample_rate)? {
+            return Err(RhdReadError::UnsupportedSampleRate { sample_rate });
+        }
         board.set_dsp_settle(false)?;
         board.reset_board_analog_state()?;
-        board.set_cable_length_meters(0, cable_length_meters)?;
+        board.set_cable_length_meters(0, cable_length_meters, sample_rate)?;
         if enabled_streams > 1 {
-            board.set_cable_length_meters(1, cable_length_meters)?;
+            board.set_cable_length_meters(1, cable_length_meters, sample_rate)?;
         }
         board.enable_streams(enabled_streams)?;
         board.set_default_data_sources()?;
         board.clear_ttl_out()?;
         log::info!("data plane configured; initializing RHD chips (ADC calibration)...");
-        let detected_streams = board.initialize_rhd_chips(enabled_streams)?;
+        let detected_streams = board.initialize_rhd_chips(enabled_streams, sample_rate)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
         board.flush_fifo()?;
@@ -183,6 +188,24 @@ impl RhythmFrontPanelBoard {
         }
 
         log::info!("board analog plane reset: DAC re-ref off, DACs off, external fast-settle off");
+        Ok(())
+    }
+
+    /// Pulse the FPGA logic reset (WireInResetRun bit 0) on its own. In the
+    /// Rhythm design this zeroes the sample-timestamp counter and resets the
+    /// data-output FIFO state machine without disturbing the PLL, stream-enable,
+    /// cable-delay or per-channel command configuration already programmed into
+    /// the FPGA. Used to clear bring-up residue right before arming continuous
+    /// acquisition (see `start_continuous_acquisition`).
+    pub(crate) fn reset_fpga_timestamp(&self) -> Result<(), RhdReadError> {
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0x01, 0x01)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
+        self.device
+            .set_wire_in_value(WIRE_IN_RESET_RUN, 0x00, 0x01)
+            .map_err(RhdReadError::FrontPanel)?;
+        self.device.update_wire_ins();
         Ok(())
     }
 
@@ -272,10 +295,6 @@ impl RhythmFrontPanelBoard {
         self.wait_for_data_clock_locked()?;
 
         Ok(true)
-    }
-
-    pub(crate) fn set_sample_rate_30khz(&self) -> Result<bool, RhdReadError> {
-        self.set_sample_rate(30000.0)
     }
 
     pub(crate) fn set_max_time_step(&self, max_time_step: u32) -> Result<(), RhdReadError> {
@@ -376,8 +395,12 @@ impl RhythmFrontPanelBoard {
     pub(crate) fn initialize_rhd_chips(
         &self,
         enabled_streams: usize,
+        sample_rate: f64,
     ) -> Result<usize, RhdReadError> {
-        let mut registers = Rhd2000Registers::open_ephys_default();
+        // MUX/ADC bias and DSP cutoff scale with the sample rate, so build the
+        // register set from the rate actually programmed above rather than a
+        // fixed 30 kHz default (DA9).
+        let mut registers = Rhd2000Registers::new(sample_rate);
         registers.set_dig_out_low();
 
         let dig_out = registers
@@ -498,14 +521,25 @@ impl RhythmFrontPanelBoard {
         self.run()?;
         self.wait_until_not_running()?;
         let verify_raw = self.read_pipe_block(detected_streams, VERIFY_SAMPLES)?;
-        if let Some(mean) =
-            amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, 0)
-        {
-            log::info!("post-delay centering check: amp mean raw word = 0x{mean:04x}");
+        // Gate every detected stream, not just stream 0: on a dual-MISO RHD2164
+        // the upper 32 channels live on stream 1, and a delay chosen from
+        // stream-0 data can leave that half railed/half-scale while stream 0
+        // looks centered. Checking only stream 0 let the upper half record
+        // corrupt 0x4000 data with a clean bring-up report (DA8).
+        for stream in 0..detected_streams {
+            let Some(mean) =
+                amplifier_mean_raw_word(&verify_raw, detected_streams, VERIFY_SAMPLES, stream)
+            else {
+                continue;
+            };
+            log::info!(
+                "post-delay centering check: stream {stream} amp mean raw word = 0x{mean:04x}"
+            );
             if (0x3000..=0x5000).contains(&mean) {
                 log::error!(
-                    "amplifier data is half-scale (mean 0x{mean:04x} ~ 0x4000): the committed \
-                     MISO delay is the wrong sampling phase. Refusing to record corrupt data."
+                    "amplifier data is half-scale on stream {stream} (mean 0x{mean:04x} ~ 0x4000): \
+                     the committed MISO delay is the wrong sampling phase for this stream. \
+                     Refusing to record corrupt data."
                 );
                 return Err(RhdReadError::HalfScaleAmplifierData {
                     mean_raw_word: mean,
@@ -609,6 +643,7 @@ impl RhythmFrontPanelBoard {
         &self,
         port_index: usize,
         length_meters: f64,
+        sample_rate: f64,
     ) -> Result<(), RhdReadError> {
         let speed_of_light = 299_792_458.0_f64;
         let xilinx_lvds_output_delay = 1.9e-9_f64;
@@ -616,7 +651,10 @@ impl RhythmFrontPanelBoard {
         let rhd2000_delay = 9.0e-9_f64;
         let miso_settle_time = 6.7e-9_f64;
 
-        let t_step = 1.0 / (2800.0 * DEFAULT_RHD_SAMPLE_RATE);
+        // MISO timing scales with the per-channel SPI clock, which tracks the
+        // actual sample rate; using a fixed 30 kHz constant mis-times the MISO
+        // delay at any other rate (DA40).
+        let t_step = 1.0 / (2800.0 * sample_rate);
         let cable_velocity = 0.555 * speed_of_light;
         let distance = 2.0 * length_meters;
         let time_delay = distance / cable_velocity

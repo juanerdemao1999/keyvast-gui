@@ -204,6 +204,46 @@ fn streaming_pipeline_writes_blocks_to_disk() {
 }
 
 #[test]
+fn streaming_pipeline_finalizes_recording_on_producer_failure() {
+    let output_dir = unique_output_dir("stream-fail");
+    let config = streaming_config(8, output_dir.clone());
+
+    let mut simulator = SimulatorBackend::default();
+    let mut emitted = 0_usize;
+    let source = move || -> Result<SampleBlock, String> {
+        if emitted >= 3 {
+            return Err("synthetic mid-run failure".to_string());
+        }
+        emitted += 1;
+        simulator.next_block().map_err(|e| e.to_string())
+    };
+
+    // DA12: returning at all proves the producer thread was stopped and joined
+    // rather than orphaned.
+    let error = run_streaming_pipeline(&config, source).expect_err("pipeline should fail");
+    match error {
+        PipelineError::ProducerFailed {
+            message,
+            blocks_acquired,
+        } => {
+            assert_eq!(message, "synthetic mid-run failure");
+            assert_eq!(blocks_acquired, 3);
+        }
+        other => panic!("expected ProducerFailed, got: {other}"),
+    }
+
+    // DA12: the recorder was finalized, so the partial recording is on disk
+    // with a complete header instead of being silently abandoned.
+    let expected_samples = (3 * DEFAULT_CHANNEL_COUNT * DEFAULT_SAMPLES_PER_PACKET) as u64;
+    let raw_size = std::fs::metadata(output_dir.join("recording.kvraw"))
+        .expect("partial raw recording should exist")
+        .len();
+    assert_eq!(raw_size, KVRAW_DATA_OFFSET + expected_samples * 2);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
 fn streaming_pipeline_detects_packet_gaps() {
     let output_dir = unique_output_dir("stream-gap");
     let config = streaming_config(4, output_dir.clone());

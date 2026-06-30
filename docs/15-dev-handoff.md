@@ -20,7 +20,27 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
+Last updated: 2026-06-25 (doc 20 deep audit imported; batched remediation plan started)
+
+### Session 28: Doc 20 deep-audit remediation — planning + tracker
+
+The in-vivo productionization deep audit (44 findings) is now tracked in-repo:
+
+1. **`docs/20-deep-audit.md`** — the audit itself (2 Critical, 21 High, 15
+   Medium, 6 Low), imported verbatim so fixes can reference `DA` numbers.
+2. **`docs/21-doc20-remediation-plan.md`** — 15 batched PRs (P1–P15) covering all
+   44 findings exactly once, ordered by in-vivo risk, each listing the design
+   docs to sync and any earlier branch to reuse.
+3. `docs/01-documentation-roadmap.md` gains an "Audits And Remediation" section.
+
+**Plan**: land the docs first (this PR), then ship P1…P15 progressively, each as
+its own PR that closes its `DA` items and syncs the listed design docs. `⏳ 待核实`
+findings are re-verified against source before any code change.
+
+**Verification environment** (Windows VM, no MSVC): build/test via the bundled
+GNU toolchain — `cargo +stable-x86_64-pc-windows-gnu test --workspace --exclude
+kv-gui` (all green) and `cargo +stable-x86_64-pc-windows-gnu clippy -p kv-gui`.
+CI itself runs the workspace tests on Linux + a Windows-MSVC clippy check.
 
 ### Session 27: Feature triage — remove probe map + per-channel stats
 
@@ -1142,6 +1162,84 @@ These do not block the next core step:
 **Next steps**:
 - Phase 3 features when user is ready (recording format export, gate/trigger, audio monitor, remote API)
 - Hardware testing of all Phase 2 features on Windows with XEM7310
+
+### Session: Deep-audit (doc 20) remediation — DA30 / DA44
+
+**Date**: 2026-06-25
+**Branch**: `devin/1782447326-da30-da44-deviceconfig-playback` (base: `main`)
+**PR**: #61 (CI green: Clippy+fmt, workspace tests, kv-gui Windows tests)
+
+**Context**: This is the latest slice of an ongoing doc-20 deep-audit (DA1–DA44)
+remediation. Earlier slices landed as PRs #45–#60 (each one or a few DA items
+with code + tests + design-doc sync). Note that the audit/plan docs
+(`docs/20-deep-audit.md`, `docs/21-doc20-remediation-plan.md`) and several
+design-doc syncs live in those still-unmerged PR branches, so they are **not on
+`main` yet** — check open PRs #45–#61 for the authoritative DA tracking.
+
+**What changed (this PR)**:
+
+1. **DA30 — type-level `DeviceConfig` validation** (`kv-types`, `kv-core`,
+   `kv-simulator`, `kv-rhd`). Added `DeviceConfig::validate() -> Result<(),
+   DeviceConfigError>` as the single gate (rejects non-finite/≤0 sample rate,
+   zero channel count, zero samples/packet, `ttl_line_count > u32::BITS`,
+   out-of-range `enabled_channels`). Each backend keeps its own error enum and
+   converts via `From<DeviceConfigError>`; validation logic is no longer
+   duplicated.
+
+2. **DA44 — gap-free offline playback streaming** (`kv-gui/playback.rs`). Added
+   a `read_cursor` high-water mark; `tick()` now drains `[read_cursor,
+   cursor_frame)` contiguously in `MAX_DISPLAY_FRAMES` (30k) chunks across
+   ticks instead of reading one fixed block ending at the cursor, so high-speed
+   play / long stalls no longer skip inter-block frames. `seek_to()` collapses
+   `read_cursor = cursor_frame` (jump, not stream).
+
+**Docs synced**: `docs/04-data-model.md` (DeviceConfig validation),
+`docs/16-gui-optimization-plan.md` §3.3 (playback streaming).
+
+**Verification** (GNU toolchain `stable-x86_64-pc-windows-gnu`; MSVC link.exe is
+broken on this box, set repo override):
+- `cargo build` — pass
+- `cargo test -p kv-types -p kv-simulator -p kv-rhd -p kv-core -p kv-gui` — pass
+- `cargo clippy --all-targets` — 0 warnings
+- `cargo fmt --all -- --check` — clean (needed `rustup component add rustfmt
+  --toolchain stable-x86_64-pc-windows-gnu` first)
+
+**Remaining doc-20 work**: DA34 is the main code item still uncovered by any PR;
+confirm the final coverage against `docs/21-doc20-remediation-plan.md` in PR #45.
+### Session: DA34 — per-frame panic isolation in the GUI event loop
+
+**Date**: 2026-06-25
+**Branch**: `devin/<ts>-da34-panic-isolation` (base: `main`)
+**Audit item**: doc 20 DA34 (last uncovered item; DA1–DA44 otherwise covered by
+open PRs #40–#61, authoritative tracker in #45 `docs/21-doc20-remediation-plan.md`).
+
+**Problem**: `eframe` drives `KvApp::update()` per frame and that frame drives the
+live recording pipeline. A panic in the render path unwound out of the event loop
+and killed the recorder thread mid-write, leaving the in-progress `.kvraw` without
+its flushed footer (data loss). The release panic strategy was also implicit.
+
+**What changed**:
+1. `Cargo.toml` — `[profile.release]` now declares `panic = "unwind"` explicitly
+   (with a comment: the GUI guard depends on it; `abort` would defeat `catch_unwind`).
+2. `crates/kv-gui/src/panic_guard.rs` (new) — `guard_frame()` runs a frame body in
+   `std::panic::catch_unwind`, returning `Ok(())` or `Err(message)`; `payload_message()`
+   extracts a readable message from `&str`/`String`/other payloads.
+3. `crates/kv-gui/src/lib.rs` — `mod panic_guard;`.
+4. `crates/kv-gui/src/app.rs` — `KvApp` gains `fatal_panic: Option<String>`; the
+   original `update()` body became inherent `render_frame()`; the `eframe::App::update()`
+   wrapper runs `render_frame()` through `guard_frame()`. On panic it latches the
+   message, sends `RecorderCmd::Terminate` to finalize the recording, drops the live
+   pipeline, and renders a static recovery screen; once latched, later frames render
+   only that screen.
+
+**Verification**:
+- `cargo build -p kv-gui` — pass
+- `cargo test -p kv-gui` — 57 pass (4 new `panic_guard` tests)
+- `cargo clippy --all-targets` — clean
+- `cargo fmt --all -- --check` — clean
+
+**Next steps**:
+- All doc-20 DA items now have a PR; remaining work is reviewing/merging #40–#61.
 
 ## Notes For Future Agents
 

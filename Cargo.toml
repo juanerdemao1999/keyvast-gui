@@ -17,6 +17,16 @@ resolver = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# In-vivo data integrity depends on catching arithmetic overflow in the shipped
+# build, not just in debug tests. Without this, integer wrap in register/seek/
+# timestamp math silently corrupts data in the field while debug tests panic
+# ("tested fine, exploded on site"). Genuine wrap sites use explicit
+# wrapping_*/checked_*; everything else now panics observably (DA15).
+overflow-checks = true
+# DA34: keep the default unwind strategy explicit. The GUI isolates per-frame
+# panics with `catch_unwind` so a panicking panel finalizes the active recording
+# instead of aborting the process; `panic = "abort"` would defeat that guard.
+panic = "unwind"
 
 [workspace.package]
 edition = "2024"

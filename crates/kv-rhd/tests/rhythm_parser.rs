@@ -1,7 +1,7 @@
 use kv_rhd::{
     DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT, RhythmDataConfig,
-    RhythmParseError, bytes_per_block, parse_rhythm_data_block, raw_word_to_signed_count,
-    signed_count_to_microvolts, words_per_frame,
+    RhythmParseError, bytes_per_block, parse_rhythm_data_block, parse_rhythm_data_block_reporting,
+    raw_word_to_signed_count, signed_count_to_microvolts, words_per_frame,
 };
 
 #[test]
@@ -54,21 +54,18 @@ fn parses_two_streams_into_sample_major_stream_order() {
 }
 
 #[test]
-fn rejects_bad_magic() {
+fn recovers_from_bad_magic_in_the_first_frame() {
     let config = test_config(1, 1);
     let mut raw = build_raw_block(&config, 0, 0);
     raw[0] = 0;
 
-    let error =
-        parse_rhythm_data_block(0, &raw, &config).expect_err("corrupt magic should be rejected");
+    let parsed = parse_rhythm_data_block_reporting(0, &raw, &config)
+        .expect("corrupt magic is recoverable, not fatal");
 
-    assert!(matches!(
-        error,
-        RhythmParseError::BadMagic {
-            sample_index: 0,
-            ..
-        }
-    ));
+    assert_eq!(parsed.report.bad_magic_frames, 1);
+    assert_eq!(parsed.report.timestamp_discontinuities, 0);
+    assert!(!parsed.report.is_clean());
+    assert_eq!(parsed.block.samples_per_channel, 1);
 }
 
 #[test]
@@ -89,24 +86,20 @@ fn rejects_short_buffers() {
 }
 
 #[test]
-fn rejects_in_frame_timestamp_gap() {
+fn recovers_from_in_frame_timestamp_gap() {
     let config = test_config(1, 2);
     let mut raw = build_raw_block(&config, 50, 0);
     let second_frame_timestamp_offset = words_per_frame(1).expect("valid words") * 2 + 8;
     raw[second_frame_timestamp_offset..second_frame_timestamp_offset + 4]
         .copy_from_slice(&99_u32.to_le_bytes());
 
-    let error =
-        parse_rhythm_data_block(0, &raw, &config).expect_err("timestamp gap should be rejected");
+    let parsed = parse_rhythm_data_block_reporting(0, &raw, &config)
+        .expect("a timestamp gap is recoverable, not fatal");
 
-    assert!(matches!(
-        error,
-        RhythmParseError::TimestampDiscontinuity {
-            sample_index: 1,
-            expected: 51,
-            observed: 99
-        }
-    ));
+    assert_eq!(parsed.report.timestamp_discontinuities, 1);
+    assert_eq!(parsed.report.bad_magic_frames, 0);
+    // The first observed timestamp still anchors the block.
+    assert_eq!(parsed.block.timestamp_start, 50);
 }
 
 #[test]
@@ -143,22 +136,18 @@ fn timestamps_wrap_across_the_u32_boundary_without_a_discontinuity() {
 }
 
 #[test]
-fn rejects_bad_magic_in_a_non_first_frame() {
+fn recovers_from_bad_magic_in_a_non_first_frame() {
     let config = test_config(1, 3);
     let mut raw = build_raw_block(&config, 0, 0);
     // Corrupt the magic header of the second frame.
     let second_frame_magic = words_per_frame(1).expect("valid words") * 2;
     raw[second_frame_magic] ^= 0xff;
 
-    let error = parse_rhythm_data_block(0, &raw, &config)
-        .expect_err("corrupt magic in a later frame should be rejected");
-    assert!(matches!(
-        error,
-        RhythmParseError::BadMagic {
-            sample_index: 1,
-            ..
-        }
-    ));
+    let parsed = parse_rhythm_data_block_reporting(0, &raw, &config)
+        .expect("corrupt magic in a later frame is recoverable, not fatal");
+    assert_eq!(parsed.report.bad_magic_frames, 1);
+    assert_eq!(parsed.report.timestamp_discontinuities, 0);
+    assert_eq!(parsed.block.samples_per_channel, 3);
 }
 
 fn test_config(enabled_streams: usize, samples_per_block: usize) -> RhythmDataConfig {

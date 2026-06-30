@@ -1,6 +1,6 @@
 use std::fmt;
 
-use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig};
+use kv_types::{DEFAULT_TTL_LINE_COUNT, DeviceBackendKind, DeviceConfig, DeviceConfigError};
 
 pub const RHYTHM_HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 
@@ -142,7 +142,7 @@ impl RhythmDataConfig {
         validate_sample_rate(self.sample_rate)?;
 
         let channel_count = self.channel_count();
-        Ok(DeviceConfig {
+        let config = DeviceConfig {
             device_id: self.device_id.clone(),
             // Transport kind is fixed to USB because the only Rhythm bring-up
             // path is the Opal Kelly XEM7310 USB3 board; revisit if a non-USB
@@ -152,11 +152,22 @@ impl RhythmDataConfig {
             channel_count,
             samples_per_packet: self.samples_per_block,
             enabled_channels: (0..channel_count).collect(),
-            // The Rhythm frame always carries one TTL word per sample, so the
-            // digital inputs are always present at the protocol level.
+            // TTL is fixed on (not config-driven) because the Rhythm frame
+            // always carries one TTL word per sample, so the digital inputs
+            // are physically present at the protocol level regardless of any
+            // user preference. A config-driven `ttl_enabled` only makes sense
+            // once a transport/headstage that can omit the TTL word is
+            // supported; until then surfacing such a toggle would be
+            // misleading. TBD: revisit alongside the non-USB transport
+            // decision (project rule 1) if that hardware materialises.
             ttl_enabled: true,
             ttl_line_count: RHYTHM_TTL_LINE_COUNT,
-        })
+        };
+        // Run the same backend-agnostic structural validation every other
+        // backend uses, so an RHD-built config cannot reach bring-up
+        // malformed (DA30).
+        config.validate()?;
+        Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), RhythmConfigError> {
@@ -169,6 +180,7 @@ pub enum RhythmConfigError {
     InvalidStreamCount { enabled_streams: usize },
     InvalidSamplesPerBlock { samples_per_block: usize },
     InvalidSampleRate,
+    InvalidDeviceConfig(DeviceConfigError),
 }
 
 impl fmt::Display for RhythmConfigError {
@@ -186,7 +198,16 @@ impl fmt::Display for RhythmConfigError {
                 formatter,
                 "RHD sample rate must be finite and greater than zero"
             ),
+            Self::InvalidDeviceConfig(error) => {
+                write!(formatter, "RHD device config is invalid: {error}")
+            }
         }
+    }
+}
+
+impl From<DeviceConfigError> for RhythmConfigError {
+    fn from(error: DeviceConfigError) -> Self {
+        Self::InvalidDeviceConfig(error)
     }
 }
 
@@ -227,6 +248,20 @@ pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
     } else {
         (1_u32 << enabled_streams) - 1
     }
+}
+
+/// Shift a base stream-enable `mask` up to the data-stream slots owned by
+/// `port`. Each SPI port owns 4 consecutive data streams, so port `p` starts at
+/// stream `4 * p`.
+///
+/// Returns `None` when the shift amount is `>= u32::BITS`. With
+/// `MAX_SUPPORTED_STREAMS` this is unreachable, but the `checked_shl` guard
+/// keeps a future stream-layout change from turning into a shift-overflow panic
+/// (debug builds) or a silently masked, wrong mask (release builds).
+#[must_use]
+pub fn port_stream_mask(mask: u32, port: usize) -> Option<u32> {
+    let shift = u32::try_from(port).ok()?.checked_mul(4)?;
+    mask.checked_shl(shift)
 }
 
 /// Word/byte layout of a single Rhythm USB data frame for a given number of
@@ -313,10 +348,100 @@ pub fn bytes_per_block(
         .saturating_mul(2))
 }
 
+/// Round a raw byte count up to the next multiple of `USB3_BLOCK_SIZE_BYTES`.
+///
+/// FrontPanel `ReadFromBlockPipeOut` transfers must be an integer number of
+/// USB3 blocks. A finite zcheck/bring-up capture leaves exactly `byte_count`
+/// bytes in the FIFO, which for typical impedance configs is not 1024-aligned;
+/// the transfer length must be padded up to a block boundary and the meaningful
+/// prefix kept afterwards (DA6).
+#[must_use]
+pub fn block_aligned_len(byte_count: usize) -> usize {
+    byte_count.div_ceil(USB3_BLOCK_SIZE_BYTES) * USB3_BLOCK_SIZE_BYTES
+}
+
 pub fn raw_word_to_signed_count(word: u16) -> i16 {
     (word as i32 - 32_768) as i16
 }
 
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_enable_mask_sets_low_bits_and_saturates() {
+        assert_eq!(stream_enable_mask(0), 0);
+        assert_eq!(stream_enable_mask(1), 0b1);
+        assert_eq!(stream_enable_mask(2), 0b11);
+        assert_eq!(stream_enable_mask(31), 0x7fff_ffff);
+        // At or beyond the bit width we must not shift-overflow; the mask saturates.
+        assert_eq!(stream_enable_mask(32), u32::MAX);
+        assert_eq!(stream_enable_mask(1_000), u32::MAX);
+    }
+
+    #[test]
+    fn port_stream_mask_shifts_to_each_supported_port() {
+        // Two enabled streams (the supported maximum) shifted onto each SPI port.
+        let bits = stream_enable_mask(MAX_SUPPORTED_STREAMS);
+        assert_eq!(port_stream_mask(bits, 0), Some(0b11));
+        assert_eq!(port_stream_mask(bits, 1), Some(0b11 << 4));
+        assert_eq!(port_stream_mask(bits, 7), Some(0b11 << 28));
+    }
+
+    #[test]
+    fn port_stream_mask_guards_overflowing_shift() {
+        // A shift amount of >= u32::BITS returns None instead of panicking
+        // (debug) or silently masking the shift amount mod 32 (release).
+        assert_eq!(port_stream_mask(0b11, 8), None); // shift 32
+        assert_eq!(port_stream_mask(1, usize::MAX), None); // port doesn't fit in u32
+        // In-range shifts stay defined even when high bits are shifted out the top.
+        assert_eq!(port_stream_mask(u32::MAX, 1), Some(0xFFFF_FFF0));
+        assert_eq!(port_stream_mask(0, 7), Some(0));
+    }
+
+    #[test]
+    fn block_aligned_len_rounds_up_to_block_boundary() {
+        assert_eq!(block_aligned_len(0), 0);
+        assert_eq!(block_aligned_len(1), USB3_BLOCK_SIZE_BYTES);
+        assert_eq!(
+            block_aligned_len(USB3_BLOCK_SIZE_BYTES),
+            USB3_BLOCK_SIZE_BYTES
+        );
+        assert_eq!(
+            block_aligned_len(USB3_BLOCK_SIZE_BYTES + 1),
+            2 * USB3_BLOCK_SIZE_BYTES
+        );
+        // Every result is an integer number of USB3 blocks.
+        for byte_count in [1, 513, 62_400, 64_800, 100_001] {
+            assert_eq!(block_aligned_len(byte_count) % USB3_BLOCK_SIZE_BYTES, 0);
+            assert!(block_aligned_len(byte_count) >= byte_count);
+        }
+    }
+
+    #[test]
+    fn default_continuous_block_is_already_block_aligned() {
+        // The continuous acquisition path must never need padding: a non-aligned
+        // block_bytes would force per-block over-reads into the next frame.
+        for streams in 1..=MAX_SUPPORTED_STREAMS {
+            let bytes = bytes_per_block(streams, SAMPLES_PER_USB_BLOCK).unwrap();
+            assert_eq!(
+                bytes % USB3_BLOCK_SIZE_BYTES,
+                0,
+                "continuous block for {streams} stream(s) is not 1024-aligned"
+            );
+        }
+    }
+
+    #[test]
+    fn default_impedance_capture_needs_padding() {
+        // Regression guard for DA6: the default single-stream zcheck capture is
+        // deliberately NOT block-aligned, so the read path must pad it.
+        let bytes = bytes_per_block(1, 600).unwrap();
+        assert_ne!(bytes % USB3_BLOCK_SIZE_BYTES, 0);
+        assert!(block_aligned_len(bytes) > bytes);
+    }
 }

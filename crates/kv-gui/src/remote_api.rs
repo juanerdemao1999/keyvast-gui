@@ -26,6 +26,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -87,6 +88,20 @@ pub struct RemoteResponse {
     pub id: u64,
     /// Result JSON string (success) or error message.
     pub result: Result<String, String>,
+    /// When the GUI produced this response. Used to sweep orphaned responses
+    /// whose client already timed out and disconnected.
+    pub enqueued_at: Instant,
+}
+
+impl RemoteResponse {
+    /// Create a response stamped with the current time.
+    pub fn new(id: u64, result: Result<String, String>) -> Self {
+        Self {
+            id,
+            result,
+            enqueued_at: Instant::now(),
+        }
+    }
 }
 
 /// Current application status (for `get_status` response).
@@ -139,6 +154,30 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// Maximum pending commands / responses in the shared queues.
 const MAX_QUEUE_LEN: usize = 256;
+
+/// Responses older than this are assumed orphaned — the requesting client
+/// timed out waiting (the per-request poll is only ~100 ms) and disconnected,
+/// so its reply will never be collected. They are swept to keep the response
+/// queue from growing without bound.
+const RESPONSE_TTL: Duration = Duration::from_secs(2);
+
+/// Push a response onto the shared queue, enforcing the length cap by dropping
+/// the oldest entry when full. Mirrors the command-queue back-pressure policy.
+pub fn push_response_capped(queue: &mut VecDeque<RemoteResponse>, resp: RemoteResponse) {
+    if queue.len() >= MAX_QUEUE_LEN {
+        queue.pop_front();
+    }
+    queue.push_back(resp);
+}
+
+/// Remove responses that have outlived [`RESPONSE_TTL`], returning how many
+/// were dropped. Called periodically from the GUI tick so replies whose client
+/// already gave up cannot accumulate indefinitely.
+pub fn sweep_stale_responses(queue: &mut VecDeque<RemoteResponse>, now: Instant) -> usize {
+    let before = queue.len();
+    queue.retain(|r| now.duration_since(r.enqueued_at) < RESPONSE_TTL);
+    before - queue.len()
+}
 
 /// Handle to the running server (holds the stop flag and thread handle).
 pub struct RemoteApiHandle {
@@ -289,6 +328,13 @@ fn handle_client(
                     }
 
                     if !response_sent {
+                        // The client is being told this request timed out, so
+                        // drop any reply for it that landed at the boundary —
+                        // otherwise it would linger unmatched in the queue.
+                        {
+                            let mut resps = lock_recover(&responses);
+                            resps.retain(|r| r.id != id);
+                        }
                         let json = format_jsonrpc_response(
                             id,
                             &Err("timeout waiting for response".to_string()),
@@ -577,5 +623,48 @@ mod tests {
     fn parse_invalid_request() {
         assert!(parse_jsonrpc_request("not json").is_none());
         assert!(parse_jsonrpc_request("{}").is_none());
+    }
+
+    #[test]
+    fn push_response_capped_drops_oldest_when_full() {
+        let mut q: VecDeque<RemoteResponse> = VecDeque::new();
+        for id in 0..(MAX_QUEUE_LEN as u64 + 5) {
+            push_response_capped(&mut q, RemoteResponse::new(id, Ok("1".to_string())));
+        }
+        assert_eq!(q.len(), MAX_QUEUE_LEN);
+        // The five oldest ids (0..5) were dropped; the queue holds 5..=260.
+        assert_eq!(q.front().unwrap().id, 5);
+        assert_eq!(q.back().unwrap().id, MAX_QUEUE_LEN as u64 + 4);
+    }
+
+    #[test]
+    fn sweep_stale_responses_removes_only_expired() {
+        let now = Instant::now();
+        let mut q: VecDeque<RemoteResponse> = VecDeque::new();
+        // One fresh response and one that is already older than the TTL.
+        q.push_back(RemoteResponse {
+            id: 1,
+            result: Ok("1".to_string()),
+            enqueued_at: now,
+        });
+        q.push_back(RemoteResponse {
+            id: 2,
+            result: Ok("2".to_string()),
+            enqueued_at: now - RESPONSE_TTL - Duration::from_millis(1),
+        });
+
+        let removed = sweep_stale_responses(&mut q, now);
+        assert_eq!(removed, 1);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front().unwrap().id, 1);
+    }
+
+    #[test]
+    fn sweep_stale_responses_keeps_fresh() {
+        let now = Instant::now();
+        let mut q: VecDeque<RemoteResponse> = VecDeque::new();
+        q.push_back(RemoteResponse::new(7, Ok("7".to_string())));
+        assert_eq!(sweep_stale_responses(&mut q, now), 0);
+        assert_eq!(q.len(), 1);
     }
 }

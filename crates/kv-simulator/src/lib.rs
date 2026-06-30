@@ -1,8 +1,9 @@
 //! Simulator backend for hardware-independent acquisition tests.
 
 use std::fmt;
+use std::time::{Duration, Instant};
 
-use kv_types::{DeviceBackendKind, DeviceConfig, SampleBlock, SampleBlockError};
+use kv_types::{DeviceBackendKind, DeviceConfig, DeviceConfigError, SampleBlock, SampleBlockError};
 
 pub const DEFAULT_SIMULATOR_SEED: u64 = 0x4b56_5354_0000_0001;
 
@@ -22,6 +23,10 @@ pub struct SimulatorConfig {
     pub seed: u64,
     pub stream_id: u32,
     pub drop_packet_ids: Vec<u64>,
+    /// When `true`, [`SimulatorBackend::next_block`] throttles block production
+    /// to the device's real-time cadence so benchmarks observe wall-clock
+    /// timing instead of running as fast as the CPU allows. Defaults to `false`.
+    pub paced: bool,
 }
 
 impl Default for SimulatorConfig {
@@ -31,6 +36,7 @@ impl Default for SimulatorConfig {
             seed: DEFAULT_SIMULATOR_SEED,
             stream_id: 0,
             drop_packet_ids: Vec::new(),
+            paced: false,
         }
     }
 }
@@ -39,6 +45,10 @@ impl Default for SimulatorConfig {
 pub struct SimulatorBackend {
     config: SimulatorConfig,
     next_packet_id: u64,
+    /// Wall-clock reference captured on the first paced block; used to compute
+    /// each subsequent block's real-time deadline. `None` until paced output
+    /// starts (or always `None` when pacing is disabled).
+    paced_start: Option<Instant>,
 }
 
 impl SimulatorBackend {
@@ -50,6 +60,7 @@ impl SimulatorBackend {
         Ok(Self {
             config,
             next_packet_id: 0,
+            paced_start: None,
         })
     }
 
@@ -93,6 +104,8 @@ impl SimulatorBackend {
             board_adc_data: None,
             ttl_in_per_sample,
             ttl_out_per_sample: None,
+            // Synthetic source: keep generated blocks deterministic (no wall-clock).
+            host_time_ns: None,
         };
 
         block
@@ -100,7 +113,29 @@ impl SimulatorBackend {
             .map_err(SimulatorError::InvalidGeneratedBlock)?;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
 
+        if self.config.paced {
+            self.pace_to_deadline(timestamp_start);
+        }
+
         Ok(block)
+    }
+
+    /// Sleep until the wall-clock time at which `timestamp_start + one packet`
+    /// worth of samples would have arrived from real hardware. The first paced
+    /// block anchors the clock; later blocks sleep for whatever slack remains,
+    /// so transient overruns are absorbed rather than accumulated.
+    fn pace_to_deadline(&mut self, timestamp_start: u64) {
+        let sample_rate = self.config.device.sample_rate;
+        if !sample_rate.is_finite() || sample_rate <= 0.0 {
+            return;
+        }
+        let anchor = *self.paced_start.get_or_insert_with(Instant::now);
+        let samples_elapsed =
+            timestamp_start.saturating_add(self.config.device.samples_per_packet as u64);
+        let deadline = Duration::from_secs_f64(samples_elapsed as f64 / sample_rate);
+        if let Some(remaining) = deadline.checked_sub(anchor.elapsed()) {
+            std::thread::sleep(remaining);
+        }
     }
 
     fn samples_for_packet(&self, packet_id: u64, timestamp_start: u64) -> Vec<i16> {
@@ -175,6 +210,7 @@ impl Default for SimulatorBackend {
         Self {
             config,
             next_packet_id: 0,
+            paced_start: None,
         }
     }
 }
@@ -228,6 +264,26 @@ impl fmt::Display for SimulatorConfigError {
 
 impl std::error::Error for SimulatorConfigError {}
 
+impl From<DeviceConfigError> for SimulatorConfigError {
+    fn from(error: DeviceConfigError) -> Self {
+        match error {
+            DeviceConfigError::InvalidSampleRate => Self::InvalidSampleRate,
+            DeviceConfigError::EmptyChannelSet => Self::EmptyChannelSet,
+            DeviceConfigError::EmptyPacket => Self::EmptyPacket,
+            DeviceConfigError::TtlLineCountOutOfRange { ttl_line_count } => {
+                Self::TtlLineCountOutOfRange { ttl_line_count }
+            }
+            DeviceConfigError::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            } => Self::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SimulatorError {
     InvalidGeneratedBlock(SampleBlockError),
@@ -246,40 +302,16 @@ impl fmt::Display for SimulatorError {
 impl std::error::Error for SimulatorError {}
 
 fn validate_device_config(config: &DeviceConfig) -> Result<(), SimulatorConfigError> {
+    // The simulator backend constraint is specific to this backend; the rest of
+    // the structural checks are shared with every other backend through the
+    // type-level `DeviceConfig::validate` (DA30).
     if config.backend != DeviceBackendKind::Simulator {
         return Err(SimulatorConfigError::NonSimulatorBackend {
             backend: config.backend,
         });
     }
 
-    if !config.sample_rate.is_finite() || config.sample_rate <= 0.0 {
-        return Err(SimulatorConfigError::InvalidSampleRate);
-    }
-
-    if config.channel_count == 0 {
-        return Err(SimulatorConfigError::EmptyChannelSet);
-    }
-
-    if config.samples_per_packet == 0 {
-        return Err(SimulatorConfigError::EmptyPacket);
-    }
-
-    if config.ttl_line_count > u32::BITS as usize {
-        return Err(SimulatorConfigError::TtlLineCountOutOfRange {
-            ttl_line_count: config.ttl_line_count,
-        });
-    }
-
-    for &channel in &config.enabled_channels {
-        if channel >= config.channel_count {
-            return Err(SimulatorConfigError::EnabledChannelOutOfRange {
-                channel,
-                channel_count: config.channel_count,
-            });
-        }
-    }
-
-    Ok(())
+    config.validate().map_err(SimulatorConfigError::from)
 }
 
 fn mix_u64(mut value: u64) -> u64 {
@@ -340,4 +372,151 @@ fn sample_period(sample_rate: f64, freq_hz: f64) -> u64 {
 
 fn clamp_i16(value: i32) -> i16 {
     value.clamp(i16::MIN as i32, i16::MAX as i32) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timing_device() -> DeviceConfig {
+        let mut device = DeviceConfig::simulator_default();
+        // 80 samples at 8 kHz => 10 ms of real time per block.
+        device.sample_rate = 8_000.0;
+        device.samples_per_packet = 80;
+        device
+    }
+
+    #[test]
+    fn paced_backend_throttles_to_real_time() {
+        let device = timing_device();
+        let blocks = 3u64;
+        let expected = Duration::from_secs_f64(
+            (blocks * device.samples_per_packet as u64) as f64 / device.sample_rate,
+        );
+
+        let mut paced = SimulatorBackend::new(SimulatorConfig {
+            device: device.clone(),
+            paced: true,
+            ..SimulatorConfig::default()
+        })
+        .expect("paced config is valid");
+        let start = Instant::now();
+        for _ in 0..blocks {
+            paced.next_block().expect("paced block");
+        }
+        let paced_elapsed = start.elapsed();
+        assert!(
+            paced_elapsed >= expected.mul_f64(0.8),
+            "paced run finished too early: {paced_elapsed:?} < {expected:?}"
+        );
+    }
+
+    #[test]
+    fn unpaced_backend_runs_faster_than_real_time() {
+        let device = timing_device();
+        let blocks = 3u64;
+        let expected = Duration::from_secs_f64(
+            (blocks * device.samples_per_packet as u64) as f64 / device.sample_rate,
+        );
+
+        let mut unpaced = SimulatorBackend::new(SimulatorConfig {
+            device,
+            paced: false,
+            ..SimulatorConfig::default()
+        })
+        .expect("default config is valid");
+        let start = Instant::now();
+        for _ in 0..blocks {
+            unpaced.next_block().expect("block");
+        }
+        assert!(
+            start.elapsed() < expected.mul_f64(0.5),
+            "unpaced run should not block on real-time cadence"
+        );
+    }
+
+    fn backend_with_ttl(ttl_enabled: bool, ttl_line_count: usize) -> SimulatorBackend {
+        let mut device = DeviceConfig::simulator_default();
+        device.ttl_enabled = ttl_enabled;
+        device.ttl_line_count = ttl_line_count;
+        SimulatorBackend::new(SimulatorConfig {
+            device,
+            ..SimulatorConfig::default()
+        })
+        .expect("ttl config is valid")
+    }
+
+    #[test]
+    fn ttl_line_mask_covers_boundary_line_counts() {
+        // L15/L16: a zero line count or disabled TTL collapses to no mask, a
+        // partial width fills the low bits, and a full 32-line bank saturates
+        // without shifting past the u32 width.
+        assert_eq!(backend_with_ttl(true, 0).ttl_line_mask(), 0);
+        assert_eq!(backend_with_ttl(false, 8).ttl_line_mask(), 0);
+        assert_eq!(backend_with_ttl(true, 1).ttl_line_mask(), 0b1);
+        assert_eq!(backend_with_ttl(true, 8).ttl_line_mask(), 0xff);
+        assert_eq!(
+            backend_with_ttl(true, 31).ttl_line_mask(),
+            (1_u32 << 31) - 1
+        );
+        assert_eq!(backend_with_ttl(true, 32).ttl_line_mask(), u32::MAX);
+    }
+
+    #[test]
+    fn ttl_in_per_sample_is_none_when_disabled_and_masked_when_enabled() {
+        // L15/L16: disabling TTL drops the per-sample words entirely, while an
+        // enabled bank yields one word per sample, each confined to the mask.
+        assert!(backend_with_ttl(false, 8).ttl_in_per_sample(0).is_none());
+        assert!(backend_with_ttl(true, 0).ttl_in_per_sample(0).is_none());
+
+        let backend = backend_with_ttl(true, 4);
+        let spp = backend.config.device.samples_per_packet;
+        let words = backend
+            .ttl_in_per_sample(123)
+            .expect("enabled TTL yields per-sample words");
+        assert_eq!(words.len(), spp);
+        for word in words {
+            assert_eq!(word & !0xf, 0, "word {word:#x} escaped the 4-line mask");
+        }
+    }
+
+    #[test]
+    fn samples_for_packet_saturates_large_timestamps_without_panicking() {
+        // L15/L16: a near-overflow packet must still produce a full block; the
+        // sample index uses saturating arithmetic instead of wrapping/panicking.
+        let backend = SimulatorBackend::default();
+        let expected =
+            backend.config.device.channel_count * backend.config.device.samples_per_packet;
+        let data = backend.samples_for_packet(u64::MAX, u64::MAX - 1);
+        assert_eq!(data.len(), expected);
+    }
+
+    #[test]
+    fn spike_component_emits_biphasic_template_within_value_set() {
+        // L15/L16: every spike sample is drawn from the fixed biphasic template,
+        // and each firing emits the -180/260/-80 sequence on consecutive samples.
+        let sample_rate = 8_000.0;
+        let mut fired = 0;
+        let mut index = 0u64;
+        while index < 200_000 {
+            let value = spike_component(DEFAULT_SIMULATOR_SEED, index, 0, sample_rate);
+            assert!(
+                matches!(value, 0 | -180 | 260 | -80),
+                "unexpected spike value {value} at index {index}"
+            );
+            if value == -180 {
+                fired += 1;
+                assert_eq!(
+                    spike_component(DEFAULT_SIMULATOR_SEED, index + 1, 0, sample_rate),
+                    260
+                );
+                assert_eq!(
+                    spike_component(DEFAULT_SIMULATOR_SEED, index + 2, 0, sample_rate),
+                    -80
+                );
+            }
+            index += 1;
+        }
+        assert!(fired > 0, "no spikes fired across the scanned window");
+    }
 }

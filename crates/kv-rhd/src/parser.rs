@@ -8,13 +8,52 @@ use crate::protocol::{
     bytes_per_block, raw_word_to_signed_count,
 };
 
-// Index-based loops mirror the Rhythm wire layout (stream-major word order).
-#[allow(clippy::needless_range_loop)]
+/// Per-block tally of recoverable framing anomalies encountered while parsing.
+///
+/// A clean block reports all-zero counts.  Non-zero counts mean the parser
+/// recovered from a transient framing fault (a corrupt frame magic or a
+/// timestamp that did not increment by one) rather than aborting acquisition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlockParseReport {
+    /// Frames whose header word did not match `RHYTHM_HEADER_MAGIC`.
+    pub bad_magic_frames: u32,
+    /// Samples whose timestamp was not exactly one greater than the previous.
+    pub timestamp_discontinuities: u32,
+}
+
+impl BlockParseReport {
+    pub fn is_clean(&self) -> bool {
+        self.bad_magic_frames == 0 && self.timestamp_discontinuities == 0
+    }
+}
+
+/// A parsed sample block paired with its recoverable-anomaly report.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedRhythmBlock {
+    pub block: SampleBlock,
+    pub report: BlockParseReport,
+}
+
+/// Parse a raw Rhythm USB block, discarding the recoverable-anomaly report.
+///
+/// Equivalent to [`parse_rhythm_data_block_reporting`] followed by taking the
+/// `block` field.  Use the reporting variant when callers need to observe or
+/// surface recovered framing faults.
 pub fn parse_rhythm_data_block(
     packet_id: u64,
     raw: &[u8],
     config: &RhythmDataConfig,
 ) -> Result<SampleBlock, RhythmParseError> {
+    parse_rhythm_data_block_reporting(packet_id, raw, config).map(|parsed| parsed.block)
+}
+
+// Index-based loops mirror the Rhythm wire layout (stream-major word order).
+#[allow(clippy::needless_range_loop)]
+pub fn parse_rhythm_data_block_reporting(
+    packet_id: u64,
+    raw: &[u8],
+    config: &RhythmDataConfig,
+) -> Result<ParsedRhythmBlock, RhythmParseError> {
     config.validate().map_err(RhythmParseError::InvalidConfig)?;
 
     let expected_len = bytes_per_block(config.enabled_streams, config.samples_per_block)
@@ -33,6 +72,8 @@ pub fn parse_rhythm_data_block(
     let mut data = Vec::with_capacity(channel_count.saturating_mul(samples));
     let mut offset = 0_usize;
     let mut timestamp_start = None;
+    let mut prev_timestamp: Option<u32> = None;
+    let mut report = BlockParseReport::default();
 
     // Auxiliary data: [stream][aux_ch][sample]
     let mut aux_data: Vec<Vec<Vec<u16>>> = (0..streams)
@@ -55,23 +96,31 @@ pub fn parse_rhythm_data_block(
         let frame_offset = offset;
         let header = read_u64_le(raw, &mut offset)?;
         if header != RHYTHM_HEADER_MAGIC {
-            return Err(RhythmParseError::BadMagic {
-                sample_index,
-                offset: frame_offset,
-                observed: header,
-            });
+            // A corrupt frame magic is a transient framing fault, not a reason
+            // to tear down acquisition.  The block is fixed-length and each
+            // frame is self-positioned, so decode this frame in place and tally
+            // the anomaly for the caller to surface (DA2).
+            report.bad_magic_frames = report.bad_magic_frames.saturating_add(1);
+            log::warn!(
+                "bad Rhythm frame magic in packet {packet_id} at sample {sample_index}, byte offset {frame_offset}: observed {header:#018x}; decoding frame in place"
+            );
         }
 
         let timestamp = read_u32_le(raw, &mut offset)?;
-        let first_timestamp = *timestamp_start.get_or_insert(timestamp);
-        let expected_timestamp = first_timestamp.wrapping_add(sample_index as u32);
-        if timestamp != expected_timestamp {
-            return Err(RhythmParseError::TimestampDiscontinuity {
-                sample_index,
-                expected: expected_timestamp,
-                observed: timestamp,
-            });
+        timestamp_start.get_or_insert(timestamp);
+        if let Some(previous) = prev_timestamp {
+            let expected_timestamp = previous.wrapping_add(1);
+            if timestamp != expected_timestamp {
+                // Accept the observed timestamp and resync the baseline so a
+                // single jump is reported once instead of cascading (DA2).
+                report.timestamp_discontinuities =
+                    report.timestamp_discontinuities.saturating_add(1);
+                log::warn!(
+                    "Rhythm timestamp discontinuity in packet {packet_id} at sample {sample_index}: expected {expected_timestamp}, observed {timestamp}"
+                );
+            }
         }
+        prev_timestamp = Some(timestamp);
 
         // Parse auxiliary command results (3 words per stream).
         for aux_ch in 0..AUX_CHANNELS_PER_STREAM {
@@ -125,13 +174,15 @@ pub fn parse_rhythm_data_block(
         board_adc_data: Some(board_adc),
         ttl_in_per_sample: Some(ttl_in_vec),
         ttl_out_per_sample: Some(ttl_out_vec),
+        // Stamped by the backend at read time; the pure parser stays clock-free.
+        host_time_ns: None,
     };
 
     block
         .validate_against_ttl_lines(RHYTHM_TTL_LINE_COUNT)
         .map_err(RhythmParseError::InvalidSampleBlock)?;
 
-    Ok(block)
+    Ok(ParsedRhythmBlock { block, report })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

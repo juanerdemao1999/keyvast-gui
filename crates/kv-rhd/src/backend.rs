@@ -6,7 +6,7 @@ use kv_types::SampleBlock;
 use crate::commands::RhdCommandError;
 use crate::frontpanel::{FrontPanelError, FrontPanelLibrary};
 use crate::impedance;
-use crate::parser::{RhythmParseError, parse_rhythm_data_block};
+use crate::parser::{RhythmParseError, parse_rhythm_data_block_reporting};
 use crate::protocol::{
     CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID,
     DEFAULT_RHD_SAMPLE_RATE, RhythmConfigError, RhythmDataConfig, SAMPLES_PER_USB_BLOCK,
@@ -70,6 +70,7 @@ impl RhdHardwareBackend {
             &options.bitfile_path,
             options.data.enabled_streams,
             options.cable_length_meters,
+            options.data.sample_rate,
         )?;
 
         let mut config = options.data;
@@ -104,8 +105,17 @@ impl RhdHardwareBackend {
         let raw = self.board.read_raw_block(&self.config)?;
         let packet_id = self.next_packet_id;
         self.next_packet_id = self.next_packet_id.saturating_add(1);
-        let block =
-            parse_rhythm_data_block(packet_id, &raw, &self.config).map_err(RhdReadError::Parse)?;
+        let parsed = parse_rhythm_data_block_reporting(packet_id, &raw, &self.config)
+            .map_err(RhdReadError::Parse)?;
+        if !parsed.report.is_clean() {
+            log::warn!(
+                "RHD packet {packet_id} parsed with framing anomalies: {} bad-magic frame(s), {} timestamp discontinuit(ies)",
+                parsed.report.bad_magic_frames,
+                parsed.report.timestamp_discontinuities
+            );
+        }
+        let mut block = parsed.block;
+        block.host_time_ns = Some(kv_types::host_time_ns_now());
 
         if !self.logged_first_block {
             self.logged_first_block = true;
@@ -154,7 +164,9 @@ pub enum RhdReadError {
     FrontPanel(FrontPanelError),
     Parse(RhythmParseError),
     UnexpectedBoardId { expected: u32, observed: u32 },
+    UnsupportedSampleRate { sample_rate: f64 },
     InvalidPort { port_index: usize },
+    StreamMaskOverflow { mask: u32, port: usize },
     NotEnoughFifoWords { needed: u32, available: u32 },
     ShortPipeRead { expected: usize, observed: usize },
     SpiStillRunning,
@@ -177,9 +189,18 @@ impl fmt::Display for RhdReadError {
                 formatter,
                 "unexpected Rhythm board id: expected {expected}, observed {observed}"
             ),
+            Self::UnsupportedSampleRate { sample_rate } => write!(
+                formatter,
+                "unsupported RHD sample rate {sample_rate} Hz: not in the Rhythm PLL table \
+                 (supported: 1000-30000 Hz in the Intan/Open Ephys step set)"
+            ),
             Self::InvalidPort { port_index } => {
                 write!(formatter, "invalid Rhythm SPI port index {port_index}")
             }
+            Self::StreamMaskOverflow { mask, port } => write!(
+                formatter,
+                "stream-enable mask 0x{mask:08x} overflows u32 when shifted to SPI port {port}"
+            ),
             Self::NotEnoughFifoWords { needed, available } => write!(
                 formatter,
                 "not enough words in Rhythm FIFO: needed {needed}, available {available}"
@@ -219,7 +240,9 @@ impl std::error::Error for RhdReadError {
             Self::FrontPanel(error) => Some(error),
             Self::Parse(error) => Some(error),
             Self::UnexpectedBoardId { .. }
+            | Self::UnsupportedSampleRate { .. }
             | Self::InvalidPort { .. }
+            | Self::StreamMaskOverflow { .. }
             | Self::NotEnoughFifoWords { .. }
             | Self::ShortPipeRead { .. }
             | Self::SpiStillRunning

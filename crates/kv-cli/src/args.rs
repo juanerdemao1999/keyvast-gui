@@ -27,7 +27,7 @@ where
 pub(crate) fn parse_simulator_record_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut args = args.peekable();
@@ -62,13 +62,19 @@ pub(crate) fn parse_simulator_record_args(
     }))
 }
 
+/// Default number of acquisition blocks when `--blocks` is omitted.
+///
+/// A value of 1 captures only a single block (~milliseconds of signal), which
+/// silently produces a near-empty recording when callers forget the flag. This
+/// default acquires a meaningful, non-trivial amount of data instead.
+const DEFAULT_BLOCKS: usize = 1000;
 const DEFAULT_RECORDER_CAPACITY: usize = 2048;
 const DEFAULT_PREVIEW_CAPACITY: usize = 32;
 
 pub(crate) fn parse_simulator_pipeline_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut recorder_capacity = DEFAULT_RECORDER_CAPACITY;
@@ -118,7 +124,7 @@ pub(crate) fn parse_simulator_pipeline_args(
 pub(crate) fn parse_simulator_stream_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut output_dir: Option<PathBuf> = None;
     let mut drop_packet_ids = Vec::new();
     let mut recorder_capacity = DEFAULT_RECORDER_CAPACITY;
@@ -264,13 +270,15 @@ pub(crate) fn parse_benchmark_args(
 pub(crate) fn parse_rhd_smoke_args(
     args: impl Iterator<Item = String>,
 ) -> Result<CliCommand, CliError> {
-    let mut blocks = 1_usize;
+    let mut blocks = DEFAULT_BLOCKS;
     let mut enabled_streams = 2_usize;
+    let mut sample_rate: Option<f64> = None;
     let mut raw_input: Option<PathBuf> = None;
     let mut bitfile_path = default_rhd_bitfile_path();
     let mut frontpanel_dll_path: Option<PathBuf> = None;
     let mut serial: Option<String> = None;
     let mut output_dir: Option<PathBuf> = None;
+    let mut cable_length_meters = DEFAULT_CABLE_LENGTH_METERS;
     let mut args = args.peekable();
 
     while let Some(argument) = args.next() {
@@ -282,6 +290,14 @@ pub(crate) fn parse_rhd_smoke_args(
             "--streams" | "--enabled-streams" => {
                 let value = next_value(&mut args, "--streams")?;
                 enabled_streams = parse_usize("--streams", &value)?;
+            }
+            "--cable-length" => {
+                let value = next_value(&mut args, "--cable-length")?;
+                cable_length_meters = parse_f64("--cable-length", &value)?;
+            }
+            "--sample-rate" => {
+                let value = next_value(&mut args, "--sample-rate")?;
+                sample_rate = Some(parse_f64("--sample-rate", &value)?);
             }
             "--raw-input" => {
                 let value = next_value(&mut args, "--raw-input")?;
@@ -306,6 +322,12 @@ pub(crate) fn parse_rhd_smoke_args(
         }
     }
 
+    if sample_rate.is_some_and(|rate| !(rate.is_finite() && rate > 0.0)) {
+        return Err(CliError::NonPositiveValue {
+            flag: "--sample-rate",
+        });
+    }
+
     let output_dir = match output_dir {
         Some(output_dir) => output_dir,
         None => default_recording_output_dir()?,
@@ -315,10 +337,12 @@ pub(crate) fn parse_rhd_smoke_args(
         output_dir,
         blocks,
         enabled_streams,
+        sample_rate: sample_rate.unwrap_or(DEFAULT_RHD_SAMPLE_RATE),
         raw_input,
         bitfile_path,
         frontpanel_dll_path,
         serial,
+        cable_length_meters,
     }))
 }
 
@@ -468,5 +492,18 @@ mod tests {
         assert_eq!(civil_date_from_unix_days(10_957), (2000, 1, 1));
         // A pre-epoch day stays in 1969.
         assert_eq!(civil_date_from_unix_days(-1), (1969, 12, 31));
+    }
+
+    #[test]
+    fn civil_date_handles_leap_year_month_boundaries() {
+        // L31: the proleptic-Gregorian rule keeps Feb 29 in years divisible by
+        // 400 (2000) but drops it in century years that are not (2100).
+        assert_eq!(civil_date_from_unix_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_date_from_unix_days(11_017), (2000, 3, 1));
+        // 2100 is not a leap year, so Feb has 28 days and rolls straight to Mar.
+        assert_eq!(civil_date_from_unix_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_date_from_unix_days(47_541), (2100, 3, 1));
+        // A common year still ends on Dec 31.
+        assert_eq!(civil_date_from_unix_days(20_088), (2024, 12, 31));
     }
 }

@@ -153,6 +153,10 @@ pub struct Rhd2000Registers {
     zcheck_sel_pol: u8,
     zcheck_en: u8,
     zcheck_select: u8,
+    /// Register 6 holds the impedance-check DAC sample value (0..=255).
+    /// At rest it sits at mid-scale (128); the impedance sweep overwrites it
+    /// per-command via `create_command_list_zcheck_dac`.
+    zcheck_dac: u8,
     off_chip_rh1: u8,
     off_chip_rh2: u8,
     off_chip_rl: u8,
@@ -199,6 +203,7 @@ impl Rhd2000Registers {
             zcheck_sel_pol: 0,
             zcheck_en: 0,
             zcheck_select: 0,
+            zcheck_dac: 128,
             off_chip_rh1: 0,
             off_chip_rh2: 0,
             off_chip_rl: 0,
@@ -271,6 +276,12 @@ impl Rhd2000Registers {
         self.zcheck_select = channel.min(63);
     }
 
+    /// Set the resting impedance-check DAC sample value held in Register 6
+    /// (full 0..=255 range; 128 = mid-scale).
+    pub fn set_zcheck_dac(&mut self, value: u8) {
+        self.zcheck_dac = value;
+    }
+
     pub fn register_value(&self, register: u8) -> Result<u8, RhdCommandError> {
         // Registers are packed bit-fields: combine the (non-overlapping) fields
         // with bitwise OR rather than `+` so a stray out-of-range field can
@@ -308,7 +319,7 @@ impl Rhd2000Registers {
                     | (self.zcheck_sel_pol << 1)
                     | self.zcheck_en
             }
-            6 => 128,
+            6 => self.zcheck_dac,
             7 => self.zcheck_select,
             8 => (self.off_chip_rh1 << 7) | self.rh1_dac1,
             9 => (self.adc_aux1_en << 7) | self.rh1_dac2,
@@ -318,8 +329,10 @@ impl Rhd2000Registers {
             13 => (self.adc_aux3_en << 7) | (self.rl_dac3 << 6) | self.rl_dac2,
             14..=21 => self.amp_power_register(register),
             _ => {
+                // This builds register *write* values; classify an
+                // out-of-range register as a write fault, not a read.
                 return Err(RhdCommandError::ArgumentOutOfRange {
-                    command_type: Rhd2000CommandType::RegisterRead,
+                    command_type: Rhd2000CommandType::RegisterWrite,
                     argument: "register",
                     value: register as u16,
                     max: 21,
@@ -635,6 +648,13 @@ pub enum RhdCommandError {
     InvalidArgumentShape {
         command_type: Rhd2000CommandType,
     },
+    /// The requested impedance test frequency is so low that one period of the
+    /// excitation sine would need more than `MAX_COMMAND_LENGTH` command-RAM
+    /// slots, so a full period cannot be uploaded.
+    FrequencyTooLow {
+        period_samples: usize,
+        max_command_length: usize,
+    },
 }
 
 impl fmt::Display for RhdCommandError {
@@ -659,6 +679,15 @@ impl fmt::Display for RhdCommandError {
                     "{command_type:?} was called with invalid arguments"
                 )
             }
+            Self::FrequencyTooLow {
+                period_samples,
+                max_command_length,
+            } => write!(
+                formatter,
+                "impedance test frequency is too low: one period spans {period_samples} samples \
+                 but the command bank holds at most {max_command_length}; raise the frequency or \
+                 lower the sample rate"
+            ),
         }
     }
 }
@@ -727,10 +756,20 @@ impl Rhd2000Registers {
             return Ok(commands);
         }
 
-        // Compute how many samples make up one complete period of the
-        // test waveform.  Clamp to at most MAX_COMMAND_LENGTH.
+        // Compute how many samples make up one complete period of the test
+        // waveform. A period longer than the command bank cannot be uploaded;
+        // silently clamping it to MAX_COMMAND_LENGTH would emit a truncated
+        // sub-period sine, distorting the excitation and yielding a systematically
+        // wrong single-frequency impedance fit with no warning (DA27). Match the
+        // Intan reference and reject the frequency instead.
         let period_samples = (self.sample_rate / frequency).round() as usize;
-        let period_samples = period_samples.clamp(1, MAX_COMMAND_LENGTH);
+        if period_samples > MAX_COMMAND_LENGTH {
+            return Err(RhdCommandError::FrequencyTooLow {
+                period_samples,
+                max_command_length: MAX_COMMAND_LENGTH,
+            });
+        }
+        let period_samples = period_samples.max(1);
 
         let two_pi = 2.0 * std::f64::consts::PI;
         for i in 0..period_samples {

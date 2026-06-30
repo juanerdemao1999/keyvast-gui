@@ -329,6 +329,11 @@ impl SpikeSnippetStore {
     pub fn process_block(&mut self, block: &SampleBlock) {
         let ch = block.channel_count;
         let spc = block.samples_per_channel;
+        // Skip malformed blocks rather than indexing out of bounds; a render
+        // path must never panic on a short/partial `data` vector.
+        if block.data.len() != ch.saturating_mul(spc) {
+            return;
+        }
         if self.bufs.len() != ch {
             self.reconfigure(ch, block.sample_rate);
         }

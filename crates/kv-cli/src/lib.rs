@@ -13,10 +13,11 @@ pub(crate) use kv_core::pipeline::{
 };
 pub(crate) use kv_core::process_metrics::{ProcessMetrics, ProcessMetricsCollector};
 pub(crate) use kv_core::{AcquisitionRunError, AcquisitionRunSummary, run_fixed_blocks};
-pub(crate) use kv_integrity::IntegrityReport;
+pub(crate) use kv_integrity::{IntegrityReport, check_blocks};
 pub(crate) use kv_recorder::{
-    BenchmarkSummary, RecorderError, RecordingSummary, write_benchmark_summary, write_events_csv,
-    write_integrity_summary, write_log_file, write_recording, write_recording_with_backend,
+    BenchmarkSummary, RecorderError, RecordingSummary, ttl_change_events, write_benchmark_summary,
+    write_events_csv, write_integrity_summary, write_log_file, write_recording,
+    write_recording_with_backend,
 };
 pub(crate) use kv_rhd::{
     DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE,
@@ -26,7 +27,7 @@ pub(crate) use kv_rhd::{
 pub(crate) use kv_simulator::{SimulatorBackend, SimulatorConfig, SimulatorConfigError};
 pub(crate) use kv_types::{
     AcquisitionEvent, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET,
-    DeviceConfig,
+    DeviceConfig, SampleBlock,
 };
 
 mod args;
@@ -156,15 +157,20 @@ pub struct SimulatorStreamResult {
     pub max_write_latency_us: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RhdSmokeOptions {
     pub output_dir: PathBuf,
     pub blocks: usize,
     pub enabled_streams: usize,
+    /// Hardware sample rate to program into the RHD/FPGA PLL. Must be one of the
+    /// Rhythm-supported rates; the recorded sample_rate reflects this value.
+    pub sample_rate: f64,
     pub raw_input: Option<PathBuf>,
     pub bitfile_path: PathBuf,
     pub frontpanel_dll_path: Option<PathBuf>,
     pub serial: Option<String>,
+    /// RHD2000 cable length in meters; drives the MISO sampling delay.
+    pub cable_length_meters: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]

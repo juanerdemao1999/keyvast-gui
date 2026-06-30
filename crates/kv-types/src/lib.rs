@@ -41,7 +41,96 @@ impl DeviceConfig {
             ttl_line_count: DEFAULT_TTL_LINE_COUNT,
         }
     }
+
+    /// Backend-agnostic structural validation of a device configuration.
+    ///
+    /// This is the single source of truth every backend should call after it
+    /// constructs a `DeviceConfig`, so a malformed configuration cannot reach
+    /// bring-up regardless of which backend produced it (DA30). Backend-specific
+    /// constraints (e.g. the simulator requiring the `Simulator` backend) are
+    /// layered on top by the caller.
+    pub fn validate(&self) -> Result<(), DeviceConfigError> {
+        if !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
+            return Err(DeviceConfigError::InvalidSampleRate);
+        }
+
+        if self.channel_count == 0 {
+            return Err(DeviceConfigError::EmptyChannelSet);
+        }
+
+        if self.samples_per_packet == 0 {
+            return Err(DeviceConfigError::EmptyPacket);
+        }
+
+        if self.ttl_line_count > u32::BITS as usize {
+            return Err(DeviceConfigError::TtlLineCountOutOfRange {
+                ttl_line_count: self.ttl_line_count,
+            });
+        }
+
+        for &channel in &self.enabled_channels {
+            if channel >= self.channel_count {
+                return Err(DeviceConfigError::EnabledChannelOutOfRange {
+                    channel,
+                    channel_count: self.channel_count,
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
+
+/// Host wall-clock time in nanoseconds since the Unix epoch, for stamping
+/// [`SampleBlock::host_time_ns`] at the moment a block is received from a live
+/// device. Times before the epoch are returned as a negative value.
+#[must_use]
+pub fn host_time_ns_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(delta) => delta.as_nanos() as i64,
+        Err(err) => -(err.duration().as_nanos() as i64),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceConfigError {
+    InvalidSampleRate,
+    EmptyChannelSet,
+    EmptyPacket,
+    TtlLineCountOutOfRange {
+        ttl_line_count: usize,
+    },
+    EnabledChannelOutOfRange {
+        channel: usize,
+        channel_count: usize,
+    },
+}
+
+impl fmt::Display for DeviceConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSampleRate => {
+                write!(formatter, "sample rate must be finite and positive")
+            }
+            Self::EmptyChannelSet => write!(formatter, "channel count must be greater than zero"),
+            Self::EmptyPacket => write!(formatter, "samples per packet must be greater than zero"),
+            Self::TtlLineCountOutOfRange { ttl_line_count } => write!(
+                formatter,
+                "ttl line count {ttl_line_count} exceeds u32 ttl storage width"
+            ),
+            Self::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            } => write!(
+                formatter,
+                "enabled channel {channel} is outside configured channel count {channel_count}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeviceConfigError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SampleBlock {
@@ -71,6 +160,14 @@ pub struct SampleBlock {
 
     /// Per-sample TTL output words.
     pub ttl_out_per_sample: Option<Vec<u32>>,
+
+    /// Host wall-clock time (nanoseconds since the Unix epoch) captured when the
+    /// host received this block. `timestamp_start` is the FPGA sample counter,
+    /// which has no absolute reference and drifts against the host clock; pairing
+    /// the two lets a recording be aligned to wall-clock time and lets offline
+    /// tools estimate host↔FPGA clock drift (DA16). `None` when the producer has
+    /// no host clock to attach (synthetic/test blocks, replayed recordings).
+    pub host_time_ns: Option<i64>,
 }
 
 impl SampleBlock {
@@ -102,6 +199,65 @@ impl SampleBlock {
             return Err(SampleBlockError::DataLengthMismatch { expected, observed });
         }
 
+        self.validate_side_channels()?;
+
+        Ok(())
+    }
+
+    /// Verify that every populated side-channel vector (per-sample TTL,
+    /// board ADC, auxiliary) carries exactly `samples_per_channel` samples,
+    /// so malformed/partial blocks cannot pass the integrity gate and later
+    /// panic in unchecked export/render paths.
+    fn validate_side_channels(&self) -> Result<(), SampleBlockError> {
+        let spc = self.samples_per_channel;
+
+        for (channel, len) in [
+            (
+                "ttl_in_per_sample",
+                self.ttl_in_per_sample.as_ref().map(Vec::len),
+            ),
+            (
+                "ttl_out_per_sample",
+                self.ttl_out_per_sample.as_ref().map(Vec::len),
+            ),
+        ] {
+            if let Some(observed) = len
+                && observed != spc
+            {
+                return Err(SampleBlockError::SideChannelLengthMismatch {
+                    channel,
+                    expected: spc,
+                    observed,
+                });
+            }
+        }
+
+        if let Some(board_adc) = &self.board_adc_data {
+            for chan in board_adc {
+                if chan.len() != spc {
+                    return Err(SampleBlockError::SideChannelLengthMismatch {
+                        channel: "board_adc_data",
+                        expected: spc,
+                        observed: chan.len(),
+                    });
+                }
+            }
+        }
+
+        if let Some(aux) = &self.aux_data {
+            for stream in aux {
+                for chan in stream {
+                    if chan.len() != spc {
+                        return Err(SampleBlockError::SideChannelLengthMismatch {
+                            channel: "aux_data",
+                            expected: spc,
+                            observed: chan.len(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -130,6 +286,21 @@ impl SampleBlock {
             });
         }
 
+        for per_sample in [&self.ttl_in_per_sample, &self.ttl_out_per_sample]
+            .into_iter()
+            .flatten()
+        {
+            for (sample_index, &ttl_bits) in per_sample.iter().enumerate() {
+                if ttl_bits & !allowed_mask != 0 {
+                    return Err(SampleBlockError::TtlPerSampleOutOfRange {
+                        sample_index,
+                        ttl_bits,
+                        ttl_line_count,
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -147,8 +318,18 @@ pub enum SampleBlockError {
         ttl_bits: u32,
         ttl_line_count: usize,
     },
+    TtlPerSampleOutOfRange {
+        sample_index: usize,
+        ttl_bits: u32,
+        ttl_line_count: usize,
+    },
     TtlLineCountOutOfRange {
         ttl_line_count: usize,
+    },
+    SideChannelLengthMismatch {
+        channel: &'static str,
+        expected: usize,
+        observed: usize,
     },
 }
 
@@ -169,9 +350,25 @@ impl fmt::Display for SampleBlockError {
                 formatter,
                 "ttl bits {ttl_bits:#034b} exceed configured ttl line count {ttl_line_count}"
             ),
+            Self::TtlPerSampleOutOfRange {
+                sample_index,
+                ttl_bits,
+                ttl_line_count,
+            } => write!(
+                formatter,
+                "per-sample ttl bits {ttl_bits:#034b} at sample {sample_index} exceed configured ttl line count {ttl_line_count}"
+            ),
             Self::TtlLineCountOutOfRange { ttl_line_count } => write!(
                 formatter,
                 "ttl line count {ttl_line_count} exceeds u32 ttl storage width"
+            ),
+            Self::SideChannelLengthMismatch {
+                channel,
+                expected,
+                observed,
+            } => write!(
+                formatter,
+                "side-channel {channel} length mismatch: expected {expected}, observed {observed}"
             ),
         }
     }
@@ -262,6 +459,7 @@ mod tests {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 
@@ -313,6 +511,55 @@ mod tests {
     }
 
     #[test]
+    fn validate_accepts_correctly_sized_side_channels() {
+        let mut block = valid_block();
+        block.ttl_in_per_sample = Some(vec![0; 3]);
+        block.ttl_out_per_sample = Some(vec![0; 3]);
+        block.board_adc_data = Some(vec![vec![0; 3], vec![0; 3]]);
+        block.aux_data = Some(vec![vec![vec![0; 3]]]);
+        assert_eq!(block.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_rejects_short_per_sample_ttl() {
+        let mut block = valid_block();
+        block.ttl_in_per_sample = Some(vec![0; 2]);
+        assert_eq!(
+            block.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "ttl_in_per_sample",
+                expected: 3,
+                observed: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn validate_rejects_short_board_adc_and_aux() {
+        let mut adc = valid_block();
+        adc.board_adc_data = Some(vec![vec![0; 3], vec![0; 1]]);
+        assert_eq!(
+            adc.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "board_adc_data",
+                expected: 3,
+                observed: 1,
+            })
+        );
+
+        let mut aux = valid_block();
+        aux.aux_data = Some(vec![vec![vec![0; 3], vec![0; 0]]]);
+        assert_eq!(
+            aux.validate(),
+            Err(SampleBlockError::SideChannelLengthMismatch {
+                channel: "aux_data",
+                expected: 3,
+                observed: 0,
+            })
+        );
+    }
+
+    #[test]
     fn expected_sample_values_saturates_instead_of_overflowing() {
         let mut block = valid_block();
         block.channel_count = usize::MAX;
@@ -341,6 +588,86 @@ mod tests {
         assert_eq!(
             block.validate_against_ttl_lines(33),
             Err(SampleBlockError::TtlLineCountOutOfRange { ttl_line_count: 33 })
+        );
+    }
+
+    #[test]
+    fn validate_against_ttl_lines_enforces_the_mask_per_sample() {
+        let mut block = valid_block();
+        // Summary ttl_bits stays within the mask, but a per-sample word does not.
+        block.ttl_bits = 0b0010;
+        block.ttl_in_per_sample = Some(vec![0b0001, 0b0010, 0b1_0000]);
+        assert_eq!(
+            block.validate_against_ttl_lines(4),
+            Err(SampleBlockError::TtlPerSampleOutOfRange {
+                sample_index: 2,
+                ttl_bits: 0b1_0000,
+                ttl_line_count: 4,
+            })
+        );
+
+        // Within-mask per-sample vectors on both directions pass.
+        block.ttl_in_per_sample = Some(vec![0b0001, 0b0010, 0b0100]);
+        block.ttl_out_per_sample = Some(vec![0b1000, 0b0000, 0b0011]);
+        assert_eq!(block.validate_against_ttl_lines(4), Ok(()));
+    }
+
+    #[test]
+    fn device_config_validate_accepts_the_simulator_default() {
+        assert_eq!(DeviceConfig::simulator_default().validate(), Ok(()));
+    }
+
+    #[test]
+    fn device_config_validate_rejects_bad_sample_rate() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
+            let mut cfg = DeviceConfig::simulator_default();
+            cfg.sample_rate = bad;
+            assert_eq!(
+                cfg.validate(),
+                Err(DeviceConfigError::InvalidSampleRate),
+                "sample_rate {bad} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn device_config_validate_rejects_empty_channels_and_packets() {
+        let mut no_channels = DeviceConfig::simulator_default();
+        no_channels.channel_count = 0;
+        no_channels.enabled_channels.clear();
+        assert_eq!(
+            no_channels.validate(),
+            Err(DeviceConfigError::EmptyChannelSet)
+        );
+
+        let mut no_packet = DeviceConfig::simulator_default();
+        no_packet.samples_per_packet = 0;
+        assert_eq!(no_packet.validate(), Err(DeviceConfigError::EmptyPacket));
+    }
+
+    #[test]
+    fn device_config_validate_rejects_oversized_ttl_line_count() {
+        let mut cfg = DeviceConfig::simulator_default();
+        cfg.ttl_line_count = (u32::BITS as usize) + 1;
+        assert_eq!(
+            cfg.validate(),
+            Err(DeviceConfigError::TtlLineCountOutOfRange {
+                ttl_line_count: (u32::BITS as usize) + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn device_config_validate_rejects_enabled_channel_out_of_range() {
+        let mut cfg = DeviceConfig::simulator_default();
+        cfg.channel_count = 4;
+        cfg.enabled_channels = vec![0, 4];
+        assert_eq!(
+            cfg.validate(),
+            Err(DeviceConfigError::EnabledChannelOutOfRange {
+                channel: 4,
+                channel_count: 4,
+            })
         );
     }
 }

@@ -73,14 +73,49 @@ impl TriggerConfig {
         self.recording
     }
 
+    /// Reset all runtime gate state for a fresh acquisition session (DA38).
+    ///
+    /// Acquisition stop/start and source switches must clear the leaked
+    /// `recording`/`last_level` history so the next session's first block is a
+    /// clean baseline: a stale `Triggered` state can no longer fire a false
+    /// stop, and a stale level can't swallow the first real edge. Configuration
+    /// (`enabled`, `bit_index`, `active_high`) is intentionally preserved.
+    pub fn reset(&mut self) {
+        self.recording = false;
+        self.last_level = false;
+    }
+
     /// Feed one block to the gate and return the recording action to take.
     ///
     /// The watched bit's level is always tracked (even when disabled) so the
-    /// status readout stays live. When enabled, recording starts on the first
-    /// block whose level is active and stops on the first block that is not.
+    /// status readout stays live. Per-sample TTL is consumed when present so a
+    /// pulse shorter than one block (≈8.5 ms at 30 kHz / 256-sample blocks) and
+    /// multiple edges inside a block are not quantized to the block boundary
+    /// (DA23); the block-level [`SampleBlock::ttl_bits`] word is the fallback.
+    ///
+    /// Because the recorder is block-granular, the gate records any block that
+    /// contains at least one active sample and releases on the first fully-idle
+    /// block — so a sub-block pulse is captured rather than missed.
     pub fn process_block(&mut self, block: &SampleBlock) -> TriggerAction {
-        let level = ((block.ttl_bits >> self.bit_index) & 1) == 1;
-        self.last_level = level;
+        let (active_any, last_level) = match block.ttl_in_per_sample.as_ref() {
+            Some(per) if !per.is_empty() => {
+                let mut any = false;
+                let mut last = self.last_level;
+                for &word in per {
+                    let level = bit_set(word, self.bit_index);
+                    last = level;
+                    if level == self.active_high {
+                        any = true;
+                    }
+                }
+                (any, last)
+            }
+            _ => {
+                let level = bit_set(block.ttl_bits, self.bit_index);
+                (level == self.active_high, level)
+            }
+        };
+        self.last_level = last_level;
 
         if !self.enabled {
             // If the gate is switched off mid-capture, release recording once.
@@ -91,13 +126,12 @@ impl TriggerConfig {
             return TriggerAction::None;
         }
 
-        let active = level == self.active_high;
-        match (active, self.recording) {
-            (true, false) => {
+        match (self.recording, active_any) {
+            (false, true) => {
                 self.recording = true;
                 TriggerAction::StartRecording
             }
-            (false, true) => {
+            (true, false) => {
                 self.recording = false;
                 TriggerAction::StopRecording
             }
@@ -451,6 +485,7 @@ mod tests {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 
@@ -526,6 +561,94 @@ mod tests {
             TriggerAction::StopRecording
         );
         assert_eq!(cfg.process_block(&make_block(1)), TriggerAction::None);
+    }
+
+    /// Build a block carrying an explicit per-sample TTL word vector (DA23).
+    fn make_block_per_sample(words: Vec<u32>) -> SampleBlock {
+        let n = words.len();
+        SampleBlock {
+            ttl_bits: *words.last().unwrap_or(&0),
+            samples_per_channel: n,
+            ttl_in_per_sample: Some(words),
+            ..make_block(0)
+        }
+    }
+
+    #[test]
+    fn sub_block_pulse_is_not_missed() {
+        // A pulse that rises and falls entirely inside one block — the block
+        // ends LOW, so the old block-level `ttl_bits` (last sample) would never
+        // see it. Per-sample scan must still start recording (DA23).
+        let mut cfg = TriggerConfig {
+            enabled: true,
+            bit_index: 0,
+            active_high: true,
+            ..Default::default()
+        };
+        let mut words = vec![0u32; 64];
+        words[10] = 1;
+        words[11] = 1; // 2-sample pulse, then back to 0
+        assert_eq!(
+            cfg.process_block(&make_block_per_sample(words)),
+            TriggerAction::StartRecording
+        );
+        assert!(cfg.is_recording());
+        // The block ended LOW, so the status readout reflects the last sample.
+        assert!(!cfg.last_level());
+        // A following fully-idle block releases the gate.
+        assert_eq!(
+            cfg.process_block(&make_block_per_sample(vec![0u32; 64])),
+            TriggerAction::StopRecording
+        );
+    }
+
+    #[test]
+    fn multiple_edges_in_block_do_not_double_fire() {
+        let mut cfg = TriggerConfig {
+            enabled: true,
+            bit_index: 0,
+            active_high: true,
+            ..Default::default()
+        };
+        // up, down, up within one block: a single StartRecording, not two.
+        let words = vec![0, 1, 0, 1, 1, 0, 1];
+        assert_eq!(
+            cfg.process_block(&make_block_per_sample(words)),
+            TriggerAction::StartRecording
+        );
+        // Block ended HIGH → still active, no extra action.
+        assert!(cfg.last_level());
+    }
+
+    #[test]
+    fn reset_clears_leaked_trigger_state() {
+        // Session 1: gate opens and is left in the Triggered state.
+        let mut cfg = TriggerConfig {
+            enabled: true,
+            bit_index: 0,
+            active_high: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.process_block(&make_block(1)),
+            TriggerAction::StartRecording
+        );
+        assert!(cfg.is_recording());
+
+        // Session boundary (stop/start/source switch) must wipe runtime state…
+        cfg.reset();
+        assert!(!cfg.is_recording());
+        assert!(!cfg.last_level());
+        // …but preserve configuration.
+        assert!(cfg.enabled);
+        assert_eq!(cfg.bit_index, 0);
+
+        // Session 2: a still-high line is seen as a fresh start, not swallowed
+        // by stale history, and does not auto-stop.
+        assert_eq!(
+            cfg.process_block(&make_block(1)),
+            TriggerAction::StartRecording
+        );
     }
 
     #[test]

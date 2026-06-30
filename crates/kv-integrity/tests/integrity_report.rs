@@ -1,5 +1,6 @@
 use kv_integrity::{
     IncrementalIntegrity, IntegrityError, PacketGap, TimestampDiscontinuity, check_blocks,
+    check_blocks_with_expected_start,
 };
 use kv_simulator::{SimulatorBackend, SimulatorConfig};
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET, SampleBlock};
@@ -63,6 +64,22 @@ fn simulator_timestamp_jump_reports_discontinuity_detail() {
             observed_timestamp_start: DEFAULT_SAMPLES_PER_PACKET as u64 + 10,
         }]
     );
+}
+
+#[test]
+fn u32_timestamp_wrap_is_not_reported_as_discontinuity() {
+    // FPGA timestamps are 32-bit counters that wrap ~every 39.7h at 30 kHz.
+    // The last block before the wrap ends at 0xFFFF_FFFD + 3 == 2^32, and the
+    // hardware counter restarts at 0; a continuous stream must not flag this.
+    let blocks = vec![
+        sample_block(0, u32::MAX as u64 - 2, 2, 3),
+        sample_block(1, 0, 2, 3),
+    ];
+
+    let report = check_blocks(&blocks).expect("wrap should not be fatal");
+
+    assert_eq!(report.summary.timestamp_discontinuities, 0);
+    assert!(report.timestamp_discontinuities.is_empty());
 }
 
 #[test]
@@ -133,6 +150,7 @@ fn sample_block(
         board_adc_data: None,
         ttl_in_per_sample: None,
         ttl_out_per_sample: None,
+        host_time_ns: None,
     }
 }
 
@@ -229,6 +247,25 @@ fn incremental_detects_timestamp_discontinuity() {
             observed_timestamp_start: DEFAULT_SAMPLES_PER_PACKET as u64 + 10,
         }
     );
+}
+
+#[test]
+fn incremental_u32_timestamp_wrap_is_not_a_discontinuity() {
+    let blocks = vec![
+        sample_block(0, u32::MAX as u64 - 2, 2, 3),
+        sample_block(1, 0, 2, 3),
+    ];
+
+    let mut incremental = IncrementalIntegrity::new();
+    for block in &blocks {
+        incremental
+            .push(block)
+            .expect("incremental push should succeed");
+    }
+    let report = incremental.finish();
+
+    assert_eq!(report.summary.timestamp_discontinuities, 0);
+    assert!(report.timestamp_discontinuities.is_empty());
 }
 
 #[test]
@@ -354,4 +391,175 @@ fn incremental_equivalence_with_gaps() {
     assert_eq!(batch.summary.missing_packets, inc.summary.missing_packets);
     assert_eq!(batch.summary.expected_packets, inc.summary.expected_packets);
     assert_eq!(batch.packet_gaps, inc.packet_gaps);
+}
+
+// --- DA43: packets lost before the first observed block ---
+
+#[test]
+fn pre_first_block_loss_is_counted_against_expected_start() {
+    // The session was expected to start at packet 0, but the first block we
+    // actually observed is packet 3 — packets 0,1,2 were lost before recording
+    // began and must show up as missing rather than being silently skipped.
+    let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
+    let blocks = vec![
+        sample_block(
+            3,
+            3 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+        sample_block(
+            4,
+            4 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+    ];
+
+    let report =
+        check_blocks_with_expected_start(Some(0), &blocks).expect("pre-stream loss is not fatal");
+
+    assert_eq!(report.summary.observed_packets, 2);
+    assert_eq!(report.summary.missing_packets, 3);
+    assert_eq!(report.summary.expected_packets, 5);
+    assert_eq!(
+        report.summary.expected_samples,
+        5 * samples_per_block(),
+        "the 3 pre-stream packets plus the 2 observed ones"
+    );
+    assert_eq!(
+        report.packet_gaps,
+        vec![PacketGap {
+            expected_packet_id: 0,
+            observed_packet_id: 3,
+            missing_count: 3,
+        }]
+    );
+}
+
+#[test]
+fn first_block_at_expected_start_has_no_pre_stream_loss() {
+    let blocks = next_simulator_blocks(SimulatorConfig::default(), 3);
+
+    let report =
+        check_blocks_with_expected_start(Some(0), &blocks).expect("clean stream is not fatal");
+
+    assert_eq!(report.summary.missing_packets, 0);
+    assert!(report.packet_gaps.is_empty());
+}
+
+#[test]
+fn pre_first_block_loss_matches_between_batch_and_incremental() {
+    let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
+    let blocks = vec![
+        sample_block(
+            5,
+            5 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+        sample_block(
+            6,
+            6 * spp,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+    ];
+
+    let batch = check_blocks_with_expected_start(Some(0), &blocks).expect("batch ok");
+    let mut incremental = IncrementalIntegrity::with_expected_first_packet_id(0);
+    for b in &blocks {
+        incremental.push(b).expect("push ok");
+    }
+    let inc = incremental.finish();
+
+    assert_eq!(batch.summary.missing_packets, 5);
+    assert_eq!(batch.summary.missing_packets, inc.summary.missing_packets);
+    assert_eq!(batch.summary.expected_packets, inc.summary.expected_packets);
+    assert_eq!(batch.summary.expected_samples, inc.summary.expected_samples);
+    assert_eq!(batch.packet_gaps, inc.packet_gaps);
+}
+
+// --- DA35: FPGA loss hidden behind a continuous host packet id ---
+
+#[test]
+fn continuous_packet_ids_with_timestamp_jump_count_hardware_loss() {
+    // packet_id stays continuous (host increments it on every read), but the
+    // hardware timestamp jumps further than the first block covered: the FPGA
+    // dropped samples that the host counter cannot see. Those lost sample
+    // values must be folded into the expected total.
+    let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
+    let channels = DEFAULT_CHANNEL_COUNT as u64;
+    let lost_ticks = 20u64;
+    let blocks = vec![
+        sample_block(0, 0, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            1,
+            spp + lost_ticks,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+    ];
+
+    let report = check_blocks(&blocks).expect("hardware jump is not fatal");
+
+    assert_eq!(report.summary.missing_packets, 0, "host ids are continuous");
+    assert_eq!(report.summary.timestamp_discontinuities, 1);
+    assert_eq!(
+        report.summary.expected_samples,
+        2 * samples_per_block() + lost_ticks * channels,
+        "lost FPGA ticks become missing sample values"
+    );
+}
+
+#[test]
+fn backwards_timestamp_jump_is_not_counted_as_loss() {
+    // A timestamp that goes *backwards* (overlap/reset) is a discontinuity but
+    // not data loss, so it must not inflate the expected sample count.
+    let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
+    let blocks = vec![
+        sample_block(0, 100, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            1,
+            100 + spp - 5,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+    ];
+
+    let report = check_blocks(&blocks).expect("backwards jump is not fatal");
+
+    assert_eq!(report.summary.timestamp_discontinuities, 1);
+    assert_eq!(
+        report.summary.expected_samples,
+        2 * samples_per_block(),
+        "a backwards timestamp must not add phantom missing samples"
+    );
+}
+
+#[test]
+fn hardware_loss_matches_between_batch_and_incremental() {
+    let spp = DEFAULT_SAMPLES_PER_PACKET as u64;
+    let blocks = vec![
+        sample_block(0, 0, DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLES_PER_PACKET),
+        sample_block(
+            1,
+            spp + 7,
+            DEFAULT_CHANNEL_COUNT,
+            DEFAULT_SAMPLES_PER_PACKET,
+        ),
+    ];
+
+    let batch = check_blocks(&blocks).expect("batch ok");
+    let mut incremental = IncrementalIntegrity::new();
+    for b in &blocks {
+        incremental.push(b).expect("push ok");
+    }
+    let inc = incremental.finish();
+
+    assert_eq!(batch.summary.expected_samples, inc.summary.expected_samples);
+    assert_eq!(
+        batch.summary.timestamp_discontinuities,
+        inc.summary.timestamp_discontinuities
+    );
 }

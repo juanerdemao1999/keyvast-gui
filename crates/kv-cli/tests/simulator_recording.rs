@@ -173,6 +173,23 @@ fn simulator_record_parse_uses_default_run_directory_when_output_is_omitted() {
 }
 
 #[test]
+fn simulator_record_uses_nontrivial_block_default_when_blocks_omitted() {
+    let command = parse_args(["simulator-record"]).expect("args should parse");
+
+    let CliCommand::SimulatorRecord(options) = command else {
+        panic!("expected SimulatorRecord command");
+    };
+
+    // A default of 1 silently produced a ~millisecond recording; the default
+    // must capture a meaningful amount of data instead.
+    assert!(
+        options.blocks > 1,
+        "default block count should be greater than 1, got {}",
+        options.blocks
+    );
+}
+
+#[test]
 fn kv_acq_binary_runs_simulator_record_command() {
     let output_dir = unique_output_dir("binary-recording");
     let binary = env!("CARGO_BIN_EXE_kv-acq");
@@ -559,11 +576,56 @@ fn rhd_smoke_parse_accepts_raw_input_stream_count_and_default_bitfile() {
     assert_eq!(options.enabled_streams, 1);
     assert_eq!(options.raw_input, Some(PathBuf::from("capture.bin")));
     assert_eq!(options.output_dir, PathBuf::from("rhd-out"));
+    assert_eq!(options.sample_rate, 30000.0);
     assert!(
         options
             .bitfile_path
             .ends_with("keyvast_260607_with_UART.bit")
     );
+    // Cable length defaults to the 3 ft (~0.9144 m) SPI cable.
+    assert!((options.cable_length_meters - 0.9144).abs() < 1e-9);
+}
+
+#[test]
+fn rhd_smoke_parse_accepts_cable_length() {
+    let command = parse_args(["rhd-smoke", "--cable-length", "2.5", "--output", "rhd-out"])
+        .expect("args should parse");
+
+    let CliCommand::RhdSmoke(options) = command else {
+        panic!("expected RhdSmoke command");
+    };
+
+    assert!((options.cable_length_meters - 2.5).abs() < 1e-9);
+}
+
+#[test]
+fn rhd_smoke_parse_rejects_invalid_cable_length() {
+    let result = parse_args(["rhd-smoke", "--cable-length", "not-a-number"]);
+    assert!(matches!(result, Err(CliError::InvalidNumber { .. })));
+}
+
+#[test]
+fn rhd_smoke_parse_accepts_explicit_sample_rate() {
+    let command = parse_args(["rhd-smoke", "--sample-rate", "2500", "--output", "rhd-out"])
+        .expect("args should parse");
+
+    let CliCommand::RhdSmoke(options) = command else {
+        panic!("expected RhdSmoke command");
+    };
+    assert_eq!(options.sample_rate, 2500.0);
+}
+
+#[test]
+fn rhd_smoke_parse_rejects_non_positive_sample_rate() {
+    let error = parse_args(["rhd-smoke", "--sample-rate", "0", "--output", "rhd-out"])
+        .expect_err("non-positive sample rate should be rejected");
+
+    assert!(matches!(
+        error,
+        CliError::NonPositiveValue {
+            flag: "--sample-rate"
+        }
+    ));
 }
 
 #[test]
@@ -577,10 +639,12 @@ fn rhd_smoke_raw_input_writes_rhd_backend_metadata() {
         output_dir: output_dir.clone(),
         blocks: 1,
         enabled_streams: 1,
+        sample_rate: 30000.0,
         raw_input: Some(raw_path),
         bitfile_path: PathBuf::from("unused.bit"),
         frontpanel_dll_path: None,
         serial: None,
+        cable_length_meters: 0.9144,
     })
     .expect("raw RHD smoke should parse");
 

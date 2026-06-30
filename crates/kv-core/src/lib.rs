@@ -5,8 +5,8 @@ pub mod process_metrics;
 
 use std::fmt;
 
-use kv_integrity::{IntegrityError, IntegrityReport, check_blocks};
-use kv_types::{AcquisitionState, DeviceConfig, DeviceStatus, SampleBlock};
+use kv_integrity::{IntegrityError, IntegrityReport, check_blocks_with_expected_start};
+use kv_types::{AcquisitionState, DeviceConfig, DeviceConfigError, DeviceStatus, SampleBlock};
 
 pub trait AcquisitionSource {
     type Error: fmt::Display;
@@ -85,6 +85,26 @@ impl fmt::Display for AcquisitionConfigError {
 
 impl std::error::Error for AcquisitionConfigError {}
 
+impl From<DeviceConfigError> for AcquisitionConfigError {
+    fn from(error: DeviceConfigError) -> Self {
+        match error {
+            DeviceConfigError::InvalidSampleRate => Self::InvalidSampleRate,
+            DeviceConfigError::EmptyChannelSet => Self::EmptyChannelSet,
+            DeviceConfigError::EmptyPacket => Self::EmptyPacket,
+            DeviceConfigError::TtlLineCountOutOfRange { ttl_line_count } => {
+                Self::TtlLineCountOutOfRange { ttl_line_count }
+            }
+            DeviceConfigError::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            } => Self::EnabledChannelOutOfRange {
+                channel,
+                channel_count,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AcquisitionRunError {
     InvalidConfig {
@@ -94,6 +114,10 @@ pub enum AcquisitionRunError {
     BackendRead {
         summary: Box<AcquisitionRunSummary>,
         message: String,
+        /// Blocks acquired before the read failed.  Carried so the caller can
+        /// finalize a partial recording instead of discarding hours of
+        /// unreproducible in-vivo data on a recoverable mid-run error (DA14).
+        blocks: Vec<SampleBlock>,
     },
     Integrity {
         summary: Box<AcquisitionRunSummary>,
@@ -194,6 +218,7 @@ where
                 return Err(AcquisitionRunError::BackendRead {
                     summary: Box::new(summary),
                     message,
+                    blocks,
                 });
             }
         }
@@ -201,7 +226,9 @@ where
 
     state_history.push(AcquisitionState::Stopping);
 
-    let integrity = match check_blocks(&blocks) {
+    // Acquisition numbers packets from 0; anchor there so loss before the first
+    // observed block is counted (DA43).
+    let integrity = match check_blocks_with_expected_start(Some(0), &blocks) {
         Ok(report) => report,
         Err(source) => {
             let message = source.to_string();
@@ -253,34 +280,9 @@ struct StatusFlags {
 }
 
 fn validate_config(config: &DeviceConfig) -> Result<(), AcquisitionConfigError> {
-    if !config.sample_rate.is_finite() || config.sample_rate <= 0.0 {
-        return Err(AcquisitionConfigError::InvalidSampleRate);
-    }
-
-    if config.channel_count == 0 {
-        return Err(AcquisitionConfigError::EmptyChannelSet);
-    }
-
-    if config.samples_per_packet == 0 {
-        return Err(AcquisitionConfigError::EmptyPacket);
-    }
-
-    if config.ttl_line_count > u32::BITS as usize {
-        return Err(AcquisitionConfigError::TtlLineCountOutOfRange {
-            ttl_line_count: config.ttl_line_count,
-        });
-    }
-
-    for &channel in &config.enabled_channels {
-        if channel >= config.channel_count {
-            return Err(AcquisitionConfigError::EnabledChannelOutOfRange {
-                channel,
-                channel_count: config.channel_count,
-            });
-        }
-    }
-
-    Ok(())
+    // Delegate to the type-level validation so every backend shares one source
+    // of truth (DA30).
+    config.validate().map_err(AcquisitionConfigError::from)
 }
 
 fn build_summary(

@@ -32,8 +32,13 @@ pub struct PlaybackManager {
     pub file_path: Option<PathBuf>,
     reader: Option<KvrawReader>,
     metadata: Option<KvrawMetadata>,
-    /// Current playback position in frames.
+    /// Current playback position in frames (the playhead).
     pub cursor_frame: u64,
+    /// High-water mark of frames already streamed out by `tick`. Lags behind
+    /// `cursor_frame` when the playhead jumps forward by more than one display
+    /// window (high speed / long stall); successive ticks advance it
+    /// contiguously so no inter-block samples are ever skipped (DA44).
+    read_cursor: u64,
     /// Playback speed multiplier (1.0 = real-time).
     pub speed: f64,
     /// Wall-clock time of last play tick.
@@ -54,6 +59,7 @@ impl Default for PlaybackManager {
             reader: None,
             metadata: None,
             cursor_frame: 0,
+            read_cursor: 0,
             speed: 1.0,
             last_tick: Instant::now(),
             last_emitted_frame: None,
@@ -91,6 +97,7 @@ impl PlaybackManager {
                 self.reader = Some(reader);
                 self.file_path = Some(path);
                 self.cursor_frame = 0;
+                self.read_cursor = 0;
                 self.last_emitted_frame = None;
                 self.state = PlaybackState::Paused;
                 self.error = None;
@@ -108,6 +115,7 @@ impl PlaybackManager {
         self.metadata = None;
         self.file_path = None;
         self.cursor_frame = 0;
+        self.read_cursor = 0;
         self.last_emitted_frame = None;
         self.state = PlaybackState::Idle;
         self.error = None;
@@ -137,6 +145,12 @@ impl PlaybackManager {
     pub fn seek_to(&mut self, frame: u64) {
         if let Some(ref meta) = self.metadata {
             self.cursor_frame = frame.min(meta.total_frames());
+            // A seek is a jump, not continuous playback: collapse the read
+            // high-water mark onto the new playhead so the next tick shows a
+            // window at the target instead of streaming through everything the
+            // user scrubbed past.
+            self.read_cursor = self.cursor_frame;
+            self.last_emitted_frame = None;
         }
     }
 
@@ -178,23 +192,42 @@ impl PlaybackManager {
             }
         }
 
-        // While paused, only emit a fresh block when the cursor actually
-        // moved (e.g. the user dragged the timeline scrubber) — re-reading
-        // and re-ingesting the same data every frame is wasted work.
+        let block_frames = if samples_per_channel > 0 {
+            samples_per_channel as u64
+        } else {
+            256
+        };
+
+        // DA44: stream every frame between the previously-read position and the
+        // playhead instead of only the fixed block ending at the cursor. When
+        // the playhead jumped forward by more than one display window (high
+        // speed, or a long UI stall), read the gap in `MAX_DISPLAY_FRAMES`
+        // chunks across successive ticks so no inter-block samples are skipped.
+        if self.read_cursor < self.cursor_frame {
+            let start = self.read_cursor;
+            let remaining = self.cursor_frame - start;
+            let frames_to_read = remaining.min(MAX_DISPLAY_FRAMES as u64) as usize;
+            let block = self.read_block_at(start, frames_to_read)?;
+            // Advance by the frames actually backed by file data so a short read
+            // near EOF still terminates the catch-up rather than spinning.
+            let advanced = (block.samples_per_channel as u64).max(1);
+            self.read_cursor = start.saturating_add(advanced).min(self.cursor_frame);
+            self.last_emitted_frame = Some(self.cursor_frame);
+            return Some(block);
+        }
+
+        // Caught up to the playhead (paused, or finished draining): only emit a
+        // fresh static window when the cursor actually moved since the last
+        // emit (e.g. a seek/scrub) — re-reading the same data every frame is
+        // wasted work.
         if self.last_emitted_frame == Some(self.cursor_frame) {
             return None;
         }
 
-        // Read up to one "block" of data (samples_per_channel or a reasonable chunk).
-        let block_frames = if samples_per_channel > 0 {
-            samples_per_channel
-        } else {
-            256
-        };
-        let start = self.cursor_frame.saturating_sub(block_frames as u64);
-        let frames_to_read = ((self.cursor_frame - start) as usize)
+        let start = self.cursor_frame.saturating_sub(block_frames);
+        let frames_to_read = (self.cursor_frame - start)
             .max(block_frames)
-            .min(MAX_DISPLAY_FRAMES);
+            .min(MAX_DISPLAY_FRAMES as u64) as usize;
 
         let block = self.read_block_at(start, frames_to_read)?;
         self.last_emitted_frame = Some(self.cursor_frame);
@@ -232,6 +265,7 @@ impl PlaybackManager {
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         })
     }
 }
@@ -385,20 +419,25 @@ mod tests {
     }
 
     fn block(packet_id: u64) -> SampleBlock {
+        block_n(packet_id, SPC)
+    }
+
+    fn block_n(packet_id: u64, spc: usize) -> SampleBlock {
         SampleBlock {
             device_id: "test".to_string(),
             stream_id: 0,
             packet_id,
-            timestamp_start: packet_id * SPC as u64,
+            timestamp_start: packet_id * spc as u64,
             sample_rate: 30_000.0,
             channel_count: CH,
-            samples_per_channel: SPC,
+            samples_per_channel: spc,
             ttl_bits: 0,
-            data: (0..CH * SPC).map(|i| i as i16).collect(),
+            data: (0..CH * spc).map(|i| i as i16).collect(),
             aux_data: None,
             board_adc_data: None,
             ttl_in_per_sample: None,
             ttl_out_per_sample: None,
+            host_time_ns: None,
         }
     }
 
@@ -408,6 +447,17 @@ mod tests {
         let mut rec = StreamingRecorder::new(&dir).expect("create recorder");
         rec.write_block(&block(0)).expect("write block 0");
         rec.write_block(&block(1)).expect("write block 1");
+        rec.finish().expect("finish recording");
+        dir.join("recording.kvraw")
+    }
+
+    /// Write an `n_blocks`-block recording with `spc` frames per block.
+    fn write_recording_frames(tag: &str, spc: usize, n_blocks: u64) -> PathBuf {
+        let dir = unique_dir(tag);
+        let mut rec = StreamingRecorder::new(&dir).expect("create recorder");
+        for i in 0..n_blocks {
+            rec.write_block(&block_n(i, spc)).expect("write block");
+        }
         rec.finish().expect("finish recording");
         dir.join("recording.kvraw")
     }
@@ -441,5 +491,123 @@ mod tests {
         // 2 blocks * 8 samples = 16 frames total.
         pb.seek_to(9_999);
         assert_eq!(pb.cursor_frame, (2 * SPC) as u64);
+    }
+
+    #[test]
+    fn tick_returns_none_without_a_loaded_file() {
+        // L45: with no reader/metadata the cursor cannot advance and no block
+        // can be read, so a tick is a no-op even if the state is forced.
+        let mut pb = PlaybackManager::default();
+        assert!(!pb.is_loaded());
+        assert_eq!(pb.state, PlaybackState::Idle);
+        assert!(pb.tick().is_none());
+
+        // play() only takes effect with a reader, so the state stays Idle and
+        // tick keeps returning None.
+        pb.play();
+        assert_eq!(pb.state, PlaybackState::Idle);
+        assert!(pb.tick().is_none());
+    }
+
+    #[test]
+    fn playing_tick_auto_pauses_at_end_of_file() {
+        // L45: once the cursor reaches the final frame a playing tick clamps to
+        // total_frames and flips the state back to Paused.
+        let path = write_recording("autopause");
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        let total = pb.total_frames();
+        assert_eq!(total, (2 * SPC) as u64);
+
+        pb.seek_to(total);
+        pb.play();
+        assert_eq!(pb.state, PlaybackState::Playing);
+
+        let _ = pb.tick();
+        assert_eq!(pb.cursor_frame, total);
+        assert_eq!(pb.state, PlaybackState::Paused);
+    }
+
+    #[test]
+    fn toggle_play_pause_is_a_no_op_until_a_file_loads() {
+        // L51: the transport state machine ignores toggles while Idle, then
+        // alternates Playing/Paused once a recording is loaded.
+        let mut pb = PlaybackManager::default();
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Idle);
+
+        let path = write_recording("toggle");
+        pb.load_file(path);
+        assert_eq!(pb.state, PlaybackState::Paused);
+
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Playing);
+        pb.toggle_play_pause();
+        assert_eq!(pb.state, PlaybackState::Paused);
+    }
+
+    /// DA44: when the playhead jumps forward by more than one display window,
+    /// the data between the previous and the new cursor must be streamed in
+    /// full (chunked across ticks) — never skipped.
+    #[test]
+    fn high_speed_play_streams_every_frame_without_skipping() {
+        // 40 blocks * 1000 frames = 40_000 frames (> MAX_DISPLAY_FRAMES), so a
+        // single jump to the end must be drained over several ticks.
+        let path = write_recording_frames("da44_drain", 1000, 40);
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        let total = pb.total_frames();
+        assert_eq!(total, 40_000);
+        assert!(total > MAX_DISPLAY_FRAMES as u64);
+
+        // Simulate a high-speed advance that moves the playhead far past one
+        // display window in a single tick.
+        pb.cursor_frame = total;
+
+        let mut covered = 0u64;
+        let mut ticks = 0;
+        while covered < total {
+            let block = pb.tick().expect("tick yields a block while draining");
+            // Each block is contiguous with the previous one: no inter-block gap.
+            assert_eq!(block.packet_id, covered, "blocks must be contiguous");
+            assert!(
+                block.samples_per_channel as u64 <= MAX_DISPLAY_FRAMES as u64,
+                "each chunk is capped at one display window"
+            );
+            covered += block.samples_per_channel as u64;
+            ticks += 1;
+            assert!(ticks < 100, "draining must terminate");
+        }
+
+        assert_eq!(covered, total, "every frame up to the cursor was read");
+        assert!(
+            ticks >= 2,
+            "a >window jump must chunk across multiple ticks"
+        );
+
+        // Fully drained: a further tick yields nothing until the cursor moves.
+        assert!(pb.tick().is_none());
+    }
+
+    /// DA44: the very first block streamed after a large jump starts at the
+    /// previous read position (0 here), not at `cursor - block_frames`, which
+    /// was the old frame-skipping behaviour.
+    #[test]
+    fn high_speed_play_starts_from_previous_cursor_not_a_trailing_block() {
+        let path = write_recording_frames("da44_start", 8, 50); // 400 frames
+        let mut pb = PlaybackManager::default();
+        pb.load_file(path);
+        let total = pb.total_frames();
+        assert_eq!(total, 400);
+
+        pb.cursor_frame = total; // jump to the end in one go
+
+        let block = pb.tick().expect("first drain tick yields a block");
+        assert_eq!(
+            block.packet_id, 0,
+            "streaming begins at the previous cursor"
+        );
+        // 400 < MAX_DISPLAY_FRAMES, so the whole range is covered at once.
+        assert_eq!(block.samples_per_channel as u64, total);
     }
 }

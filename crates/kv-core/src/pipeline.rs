@@ -6,14 +6,19 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
 
 use kv_buffer::{BufferError, ConsumerBufferStatus, FanoutBlockBuffer};
-use kv_integrity::{IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks};
-use kv_recorder::{LatencyDistribution, RecorderError, RecordingSummary, StreamingRecorder};
-use kv_types::{DeviceConfig, SampleBlock};
+use kv_integrity::{
+    IncrementalIntegrity, IntegrityError, IntegrityReport, check_blocks_with_expected_start,
+};
+use kv_recorder::{
+    LatencyDistribution, RecorderError, RecordingConfig, RecordingSummary, StreamingRecorder,
+};
+use kv_types::{AcquisitionEvent, DeviceConfig, SampleBlock};
 
 use crate::AcquisitionSource;
 
@@ -41,6 +46,8 @@ pub struct PipelineResult {
     pub timing: PipelineTiming,
     pub recorder_status: ConsumerBufferStatus,
     pub preview_status: ConsumerBufferStatus,
+    /// Cumulative blocks dropped across all consumers due to buffer overflow.
+    pub dropped_blocks: u64,
 }
 
 /// Configuration for a streaming fan-out pipeline that writes to disk
@@ -64,6 +71,8 @@ pub struct StreamingPipelineResult {
     pub preview_status: ConsumerBufferStatus,
     pub max_write_latency_us: Option<u64>,
     pub latency_distribution: Option<LatencyDistribution>,
+    /// Cumulative blocks dropped across all consumers due to buffer overflow.
+    pub dropped_blocks: u64,
 }
 
 /// Errors from the threaded pipeline.
@@ -132,6 +141,29 @@ struct SharedState {
     buffer: FanoutBlockBuffer,
     producer_done: bool,
     producer_error: Option<String>,
+    /// Cumulative dropped-block count reported by the fanout buffer, surfaced
+    /// so overflow is observable instead of only logged.
+    dropped_blocks_total: u64,
+    /// Set by the consumer to ask the producer to stop early (e.g. a recorder
+    /// write failure). The producer checks it before each `read_block` so a
+    /// consumer-side error cannot orphan an acquisition thread (DA12).
+    stop_requested: bool,
+}
+
+/// Result of draining the recorder consumer to completion.
+enum ConsumeOutcome {
+    /// The producer finished normally and every block was written.
+    Completed,
+    /// The producer reported an acquisition error after some blocks.
+    ProducerFailed { message: String },
+}
+
+/// Ask the producer thread to stop at its next iteration.
+fn request_stop(shared: &Arc<(Mutex<SharedState>, Condvar)>) {
+    let (lock, cvar) = &**shared;
+    let mut state = lock.lock().expect("shared state lock poisoned");
+    state.stop_requested = true;
+    cvar.notify_all();
 }
 
 /// Run a threaded fan-out acquisition pipeline.
@@ -149,6 +181,23 @@ where
     S: AcquisitionSource + Send + 'static,
     S::Error: Send + 'static,
 {
+    run_threaded_pipeline_with_events(config, source, None)
+}
+
+/// Like [`run_threaded_pipeline`], but also forwards [`AcquisitionEvent`]s to
+/// an optional observer channel. When a consumer queue overflows, a
+/// [`AcquisitionEvent::BufferOverflow`] carrying the cumulative dropped-block
+/// count and worst-case occupancy is sent so callers can surface backpressure
+/// instead of only logging it.
+pub fn run_threaded_pipeline_with_events<S>(
+    config: &PipelineConfig,
+    source: S,
+    events: Option<Sender<AcquisitionEvent>>,
+) -> Result<PipelineResult, PipelineError>
+where
+    S: AcquisitionSource + Send + 'static,
+    S::Error: Send + 'static,
+{
     let start = Instant::now();
 
     let mut fanout = FanoutBlockBuffer::new();
@@ -160,6 +209,8 @@ where
             buffer: fanout,
             producer_done: false,
             producer_error: None,
+            dropped_blocks_total: 0,
+            stop_requested: false,
         }),
         Condvar::new(),
     ));
@@ -168,7 +219,7 @@ where
     let shared_producer = Arc::clone(&shared);
 
     let producer_handle = thread::spawn(move || {
-        producer_loop(source, requested, &shared_producer);
+        producer_loop(source, requested, &shared_producer, events);
     });
 
     let mut recorded_blocks = Vec::with_capacity(requested);
@@ -239,10 +290,14 @@ where
     let state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let dropped_blocks = state.dropped_blocks_total;
     drop(state);
 
     let wall_clock = start.elapsed();
-    let integrity = check_blocks(&recorded_blocks)?;
+    // Acquisition numbers packets from 0; anchor there so loss before the first
+    // recorded block is counted (DA43).
+    let mut integrity = check_blocks_with_expected_start(Some(0), &recorded_blocks)?;
+    integrity.summary.buffer_overflows = dropped_blocks;
 
     let timing = PipelineTiming {
         wall_clock_seconds: wall_clock.as_secs_f64(),
@@ -256,27 +311,50 @@ where
         timing,
         recorder_status,
         preview_status,
+        dropped_blocks,
     })
 }
 
-fn producer_loop<S>(mut source: S, requested: usize, shared: &Arc<(Mutex<SharedState>, Condvar)>)
-where
+fn producer_loop<S>(
+    mut source: S,
+    requested: usize,
+    shared: &Arc<(Mutex<SharedState>, Condvar)>,
+    events: Option<Sender<AcquisitionEvent>>,
+) where
     S: AcquisitionSource,
 {
     let (lock, cvar) = &**shared;
 
     for _ in 0..requested {
+        // Honor a consumer stop request before reading more from hardware.
+        {
+            let state = lock.lock().expect("shared state lock poisoned");
+            if state.stop_requested {
+                break;
+            }
+        }
         match source.read_block() {
             Ok(block) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
-                if let Some(overflow) = state.buffer.push(block) {
+                let overflow = state.buffer.push(block);
+                if let Some(overflow) = &overflow {
+                    state.dropped_blocks_total = overflow.dropped_blocks;
+                }
+                cvar.notify_all();
+                drop(state);
+                if let Some(overflow) = overflow {
                     log::warn!(
                         "buffer overflow: dropped_blocks={}, occupancy={:.1}%",
                         overflow.dropped_blocks,
                         overflow.buffer_occupancy * 100.0
                     );
+                    if let Some(tx) = &events {
+                        let _ = tx.send(AcquisitionEvent::BufferOverflow {
+                            dropped_blocks: overflow.dropped_blocks,
+                            buffer_occupancy: overflow.buffer_occupancy,
+                        });
+                    }
                 }
-                cvar.notify_all();
             }
             Err(error) => {
                 let mut state = lock.lock().expect("shared state lock poisoned");
@@ -293,66 +371,23 @@ where
     cvar.notify_all();
 }
 
-/// Collect Arc pointers from a consumer queue without cloning the data.
-/// The caller is responsible for cloning or processing the blocks outside
-/// the critical section.
-fn collect_consumer(
-    buffer: &mut FanoutBlockBuffer,
-    consumer_id: kv_buffer::BufferConsumerId,
-) -> Vec<Arc<SampleBlock>> {
-    let mut collected = Vec::new();
-    while let Ok(Some(block)) = buffer.pop(consumer_id) {
-        collected.push(block);
-    }
-    collected
-}
-
-fn collect_preview(buffer: &mut FanoutBlockBuffer, consumer_id: kv_buffer::BufferConsumerId) {
-    while let Ok(Some(_)) = buffer.pop(consumer_id) {}
-}
-
-/// Run a streaming fan-out pipeline that writes blocks to disk as they arrive.
+/// Drive the recorder consumer of a streaming pipeline to completion.
 ///
-/// Like `run_threaded_pipeline`, but the recorder consumer writes each block
-/// through a `StreamingRecorder` and checks integrity via
-/// `IncrementalIntegrity`, so memory usage stays bounded regardless of
-/// acquisition length.
-pub fn run_streaming_pipeline<S>(
-    config: &StreamingPipelineConfig,
-    source: S,
-) -> Result<StreamingPipelineResult, PipelineError>
-where
-    S: AcquisitionSource + Send + 'static,
-    S::Error: Send + 'static,
-{
-    let start = Instant::now();
-
-    let mut fanout = FanoutBlockBuffer::new();
-    let recorder_id = fanout.add_consumer("recorder", config.recorder_capacity_blocks)?;
-    let preview_id = fanout.add_consumer("preview", config.preview_capacity_blocks)?;
-
-    let shared = Arc::new((
-        Mutex::new(SharedState {
-            buffer: fanout,
-            producer_done: false,
-            producer_error: None,
-        }),
-        Condvar::new(),
-    ));
-
-    let requested = config.requested_blocks;
-    let shared_producer = Arc::clone(&shared);
-
-    let producer_handle = thread::spawn(move || {
-        producer_loop(source, requested, &shared_producer);
-    });
-
-    let mut recorder = StreamingRecorder::new(&config.output_dir)?;
-    let mut integrity = IncrementalIntegrity::new();
-    let mut first_block_time: Option<Instant> = None;
-
+/// Returns `Ok(Completed)` when the producer finished cleanly, `Ok(
+/// ProducerFailed)` when the producer reported an acquisition error, or `Err`
+/// when a recorder/integrity write failed.  In every case the caller is
+/// responsible for stopping and joining the producer and finalizing the
+/// recorder (DA12).
+fn consume_streaming(
+    shared: &Arc<(Mutex<SharedState>, Condvar)>,
+    recorder_id: kv_buffer::BufferConsumerId,
+    preview_id: kv_buffer::BufferConsumerId,
+    recorder: &mut StreamingRecorder,
+    integrity: &mut IncrementalIntegrity,
+    first_block_time: &mut Option<Instant>,
+) -> Result<ConsumeOutcome, PipelineError> {
     loop {
-        let (lock, cvar) = &*shared;
+        let (lock, cvar) = &**shared;
         let mut state = lock.lock().expect("shared state lock poisoned");
 
         while !state.producer_done {
@@ -391,7 +426,7 @@ where
             recorder.write_block(block)?;
         }
         if first_block_time.is_none() && recorder.block_count() > 0 {
-            first_block_time = Some(Instant::now());
+            *first_block_time = Some(Instant::now());
         }
         for block in &drained_final {
             integrity.push(block)?;
@@ -399,33 +434,148 @@ where
         }
 
         if done {
-            if let Some(error) = error {
-                let blocks_acquired = recorder.block_count();
-                // Finalize the file (flush + rewrite the header) even on the
-                // error path so a partial .kvraw is not left silently truncated.
-                let _ = recorder.finish();
-                return Err(PipelineError::ProducerFailed {
-                    message: error,
-                    blocks_acquired,
-                });
-            }
-            break;
+            return match error {
+                Some(message) => Ok(ConsumeOutcome::ProducerFailed { message }),
+                None => Ok(ConsumeOutcome::Completed),
+            };
         }
     }
+}
 
-    producer_handle
-        .join()
-        .map_err(|_| PipelineError::ProducerPanicked)?;
+/// Collect Arc pointers from a consumer queue without cloning the data.
+/// The caller is responsible for cloning or processing the blocks outside
+/// the critical section.
+fn collect_consumer(
+    buffer: &mut FanoutBlockBuffer,
+    consumer_id: kv_buffer::BufferConsumerId,
+) -> Vec<Arc<SampleBlock>> {
+    let mut collected = Vec::new();
+    while let Ok(Some(block)) = buffer.pop(consumer_id) {
+        collected.push(block);
+    }
+    collected
+}
+
+fn collect_preview(buffer: &mut FanoutBlockBuffer, consumer_id: kv_buffer::BufferConsumerId) {
+    while let Ok(Some(_)) = buffer.pop(consumer_id) {}
+}
+
+/// Run a streaming fan-out pipeline that writes blocks to disk as they arrive.
+///
+/// Like `run_threaded_pipeline`, but the recorder consumer writes each block
+/// through a `StreamingRecorder` and checks integrity via
+/// `IncrementalIntegrity`, so memory usage stays bounded regardless of
+/// acquisition length.
+pub fn run_streaming_pipeline<S>(
+    config: &StreamingPipelineConfig,
+    source: S,
+) -> Result<StreamingPipelineResult, PipelineError>
+where
+    S: AcquisitionSource + Send + 'static,
+    S::Error: Send + 'static,
+{
+    run_streaming_pipeline_with_events(config, source, None)
+}
+
+/// Like [`run_streaming_pipeline`], but also forwards [`AcquisitionEvent`]s to
+/// an optional observer channel (see [`run_threaded_pipeline_with_events`]).
+pub fn run_streaming_pipeline_with_events<S>(
+    config: &StreamingPipelineConfig,
+    source: S,
+    events: Option<Sender<AcquisitionEvent>>,
+) -> Result<StreamingPipelineResult, PipelineError>
+where
+    S: AcquisitionSource + Send + 'static,
+    S::Error: Send + 'static,
+{
+    let start = Instant::now();
+
+    let mut fanout = FanoutBlockBuffer::new();
+    let recorder_id = fanout.add_consumer("recorder", config.recorder_capacity_blocks)?;
+    let preview_id = fanout.add_consumer("preview", config.preview_capacity_blocks)?;
+
+    let shared = Arc::new((
+        Mutex::new(SharedState {
+            buffer: fanout,
+            producer_done: false,
+            producer_error: None,
+            dropped_blocks_total: 0,
+            stop_requested: false,
+        }),
+        Condvar::new(),
+    ));
+
+    // Create the recorder before spawning the producer so a recorder setup
+    // failure cannot orphan an acquisition thread (DA12).
+    let recording_config = RecordingConfig {
+        enabled_channels: config.device.enabled_channels.clone(),
+        ttl_line_count: if config.device.ttl_enabled {
+            config.device.ttl_line_count
+        } else {
+            0
+        },
+    };
+    let mut recorder = StreamingRecorder::with_config(&config.output_dir, recording_config)?;
+    // Acquisition numbers packets from 0, so anchor integrity at 0 to count any
+    // packets lost before the first block reaches the recorder (DA43).
+    let mut integrity = IncrementalIntegrity::with_expected_first_packet_id(0);
+    let mut first_block_time: Option<Instant> = None;
+
+    let requested = config.requested_blocks;
+    let shared_producer = Arc::clone(&shared);
+
+    let producer_handle = thread::spawn(move || {
+        producer_loop(source, requested, &shared_producer, events);
+    });
+
+    // Drain the recorder consumer.  On ANY error (recorder write, integrity)
+    // the loop reports its outcome instead of returning early, so we always
+    // stop and join the producer and finalize the recorder afterwards (DA12).
+    let outcome = consume_streaming(
+        &shared,
+        recorder_id,
+        preview_id,
+        &mut recorder,
+        &mut integrity,
+        &mut first_block_time,
+    );
+
+    // Whatever happened, signal the producer to stop and join it so no
+    // acquisition thread is left streaming from hardware into a buffer no one
+    // drains.
+    request_stop(&shared);
+    let join_result = producer_handle.join();
+
+    match outcome {
+        Err(error) => {
+            // Finalize so a partial .kvraw is not left silently truncated.
+            let _ = recorder.finish();
+            return Err(error);
+        }
+        Ok(ConsumeOutcome::ProducerFailed { message }) => {
+            let blocks_acquired = recorder.block_count();
+            let _ = recorder.finish();
+            return Err(PipelineError::ProducerFailed {
+                message,
+                blocks_acquired,
+            });
+        }
+        Ok(ConsumeOutcome::Completed) => {}
+    }
+
+    join_result.map_err(|_| PipelineError::ProducerPanicked)?;
 
     let (lock, _) = &*shared;
     let state = lock.lock().expect("shared state lock poisoned");
     let recorder_status = state.buffer.consumer_status(recorder_id)?;
     let preview_status = state.buffer.consumer_status(preview_id)?;
+    let dropped_blocks = state.dropped_blocks_total;
     drop(state);
 
     let wall_clock = start.elapsed();
     let streaming_summary = recorder.finish()?;
-    let integrity_report = integrity.finish();
+    let mut integrity_report = integrity.finish();
+    integrity_report.summary.buffer_overflows = dropped_blocks;
 
     let timing = PipelineTiming {
         wall_clock_seconds: wall_clock.as_secs_f64(),
@@ -441,5 +591,102 @@ where
         preview_status,
         max_write_latency_us: streaming_summary.max_write_latency_us,
         latency_distribution: streaming_summary.latency_distribution,
+        dropped_blocks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    use kv_simulator::{SimulatorBackend, SimulatorError};
+
+    /// Let the pipeline pull blocks straight off the simulator backend instead
+    /// of through a hand-written closure wrapper. The trait lives in `kv-core`,
+    /// so the impl stays test-only here to avoid a `kv-core` <-> `kv-simulator`
+    /// dependency cycle.
+    impl AcquisitionSource for SimulatorBackend {
+        type Error = SimulatorError;
+
+        fn read_block(&mut self) -> Result<SampleBlock, Self::Error> {
+            self.next_block()
+        }
+    }
+
+    /// `producer_loop` should emit a `BufferOverflow` event for every push that
+    /// drops a block, carrying the cumulative dropped-block count and the
+    /// worst-case occupancy.
+    #[test]
+    fn producer_loop_emits_buffer_overflow_events() {
+        // A single consumer with capacity 1 overflows on every push after the
+        // first, so the event count is fully deterministic.
+        let mut fanout = FanoutBlockBuffer::new();
+        fanout
+            .add_consumer("recorder", 1)
+            .expect("consumer capacity is non-zero");
+
+        let shared = Arc::new((
+            Mutex::new(SharedState {
+                buffer: fanout,
+                producer_done: false,
+                producer_error: None,
+                dropped_blocks_total: 0,
+                stop_requested: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let simulator = SimulatorBackend::default();
+
+        producer_loop(simulator, 3, &shared, Some(tx));
+
+        let events: Vec<AcquisitionEvent> = rx.iter().collect();
+        assert_eq!(events.len(), 2, "two of three pushes overflow capacity 1");
+
+        match events[0] {
+            AcquisitionEvent::BufferOverflow {
+                dropped_blocks,
+                buffer_occupancy,
+            } => {
+                assert_eq!(dropped_blocks, 1);
+                assert_eq!(buffer_occupancy, 1.0);
+            }
+            ref other => panic!("expected BufferOverflow, got {other:?}"),
+        }
+        match events[1] {
+            AcquisitionEvent::BufferOverflow { dropped_blocks, .. } => {
+                assert_eq!(dropped_blocks, 2, "dropped count is cumulative");
+            }
+            ref other => panic!("expected BufferOverflow, got {other:?}"),
+        }
+    }
+
+    /// With enough capacity to hold every block, no overflow event is emitted.
+    #[test]
+    fn producer_loop_emits_no_events_without_overflow() {
+        let mut fanout = FanoutBlockBuffer::new();
+        fanout
+            .add_consumer("recorder", 16)
+            .expect("consumer capacity is non-zero");
+
+        let shared = Arc::new((
+            Mutex::new(SharedState {
+                buffer: fanout,
+                producer_done: false,
+                producer_error: None,
+                dropped_blocks_total: 0,
+                stop_requested: false,
+            }),
+            Condvar::new(),
+        ));
+
+        let (tx, rx) = mpsc::channel();
+        let simulator = SimulatorBackend::default();
+
+        producer_loop(simulator, 4, &shared, Some(tx));
+
+        assert_eq!(rx.iter().count(), 0);
+    }
 }

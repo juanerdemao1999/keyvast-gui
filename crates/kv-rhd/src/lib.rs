@@ -18,10 +18,13 @@ pub use commands::{
 };
 pub use frontpanel::{FrontPanelError, default_frontpanel_dll_path};
 pub use impedance::{
-    ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceTestConfig, auto_select_scale,
-    compute_impedance,
+    ChannelImpedance, ImpedanceError, ImpedanceResult, ImpedanceSample, ImpedanceTestConfig,
+    approximate_saturation_voltage, auto_select_scale, compute_impedance,
 };
-pub use parser::{RhythmParseError, parse_rhythm_data_block};
+pub use parser::{
+    BlockParseReport, ParsedRhythmBlock, RhythmParseError, parse_rhythm_data_block,
+    parse_rhythm_data_block_reporting,
+};
 pub use protocol::{
     CHANNELS_PER_STREAM, DEFAULT_CABLE_LENGTH_METERS, DEFAULT_RHD_BITFILE_NAME,
     DEFAULT_RHD_DEVICE_ID, DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT,

@@ -29,14 +29,49 @@ pub struct SampleBlock {
     pub ttl_in_per_sample: Option<Vec<u32>>,
     /// Per-sample TTL output words; same length convention as `ttl_in_per_sample`.
     pub ttl_out_per_sample: Option<Vec<u32>>,
+    /// Host wall-clock at the instant a live block was received, in nanoseconds
+    /// since the Unix epoch. `None` for synthetic/replayed blocks that have no
+    /// real arrival time. Pairs with `timestamp_start` to bridge clock domains.
+    pub host_time_ns: Option<i64>,
 }
 ```
 
-The four optional fields carry side-band data that not every backend produces.
+The four side-band fields (`aux_data`, `board_adc_data`, `ttl_in_per_sample`,
+`ttl_out_per_sample`) carry data that not every backend produces.
 They are `None` by default (e.g. the simulator only fills `ttl_in_per_sample`
 when TTL is enabled); the RHD parser populates them when the corresponding
 endpoints are decoded. `ttl_bits` is the legacy scalar mirror of the most
 recent `ttl_in_per_sample` entry and is always present.
+
+### Validation
+
+`SampleBlock::validate()` is the gate every consumer must pass a block through
+before indexing it. Besides the core invariants (`data.len() == channel_count *
+samples_per_channel`) it also checks that **every populated side-channel vector**
+has the expected length — per-sample TTL words equal `samples_per_channel`, each
+board-ADC and aux channel equals `samples_per_channel` — rejecting a malformed
+block with `SampleBlockError::SideChannelLengthMismatch { channel, expected,
+observed }` instead of letting a later unchecked index panic (DA29). Exporters
+call `validate()` and use checked indexing, surfacing a bad block as
+`RecorderError::InvalidBlock` rather than panicking mid-write (DA11). GUI render
+paths (e.g. `spike_overlay`) bounds-check `block.data` and skip a malformed block
+rather than indexing out of bounds (DA36).
+
+### Clock domains: FPGA counter vs. host wall-clock (DA16)
+
+`timestamp_start` is the **FPGA sample counter** — a free-running hardware
+counter sampled at the acquisition rate. It is sample-relative and has no
+absolute reference: it starts wherever the board happens to be, and its rate
+drifts against the host clock (different oscillators). It cannot, on its own,
+be converted to a wall-clock time.
+
+`host_time_ns` is the **host wall-clock** captured the moment a live block is
+parsed from the device (`kv_types::host_time_ns_now()`, stamped in the RHD
+backend). Recording the two together at block granularity lets offline tools
+align the FPGA counter to wall-clock time and estimate host↔FPGA drift, without
+forcing a clock model into the live path. Synthetic backends (simulator) and
+the pure parser leave it `None` so generated/replayed data stays deterministic
+and clock-free; the backend is the single place that stamps real arrival time.
 
 ## Data Layout
 
@@ -70,6 +105,24 @@ pub struct DeviceConfig {
     pub ttl_line_count: usize,
 }
 ```
+
+### Validation (DA30)
+
+`DeviceConfig::validate(&self) -> Result<(), DeviceConfigError>` is the single,
+type-level gate every backend runs before bring-up, so a malformed config is
+rejected the same way regardless of where it originates (simulator, core
+orchestration, RHD/USB, Ethernet, PCIe). It rejects:
+
+- a non-finite or non-positive `sample_rate` (`InvalidSampleRate`),
+- a zero `channel_count` (`EmptyChannelSet`),
+- a zero `samples_per_packet` (`EmptyPacket`),
+- a `ttl_line_count` wider than the `u32` TTL storage word
+  (`TtlLineCountOutOfRange`),
+- any `enabled_channels` entry `>= channel_count`
+  (`EnabledChannelOutOfRange`).
+
+Backends keep their own error enums but convert from `DeviceConfigError` via
+`From`, so the validation logic itself lives in exactly one place.
 
 ## DeviceBackendKind
 

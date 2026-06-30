@@ -19,7 +19,7 @@ use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::disp_ring::{DisplayRing, RING_DWNSP};
+use crate::disp_ring::DisplayRing;
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
@@ -37,6 +37,21 @@ const MAX_DISPLAY_POINTS: usize = 2000;
 /// Default vertical spacing (in normalized units) between channel baselines.
 pub const DEFAULT_CHANNEL_SPACING: f64 = 2.2;
 
+/// A normalized sample at or beyond this magnitude (≈0.98 of full scale) is
+/// counted as rail-pinned for the saturation indicator (DA21).
+const SAT_LEVEL: f64 = 0.98;
+
+/// Fraction of a channel's window samples that must be rail-pinned before the
+/// lane is flagged as saturated. A railed/dead electrode sits near 1.0; a
+/// healthy channel with the odd large transient stays far below this.
+const SAT_FRACTION: f64 = 0.5;
+
+/// Minimum *effective* sample rate (after RING_DWNSP + render stride2) at which
+/// the spike-count badge is trusted. Below this the display points are too
+/// sparse to resolve a ~1 ms spike, so the count would alias and drift with the
+/// zoom level — the badge is suppressed instead of showing a wrong number (DA37).
+const SPIKE_MIN_DETECT_HZ: f64 = 1000.0;
+
 /// Per-channel rendered trace plus optional spike detection metadata.
 struct ChannelTrace {
     /// Physical channel index (for colour, label, hover matching).
@@ -49,6 +64,9 @@ struct ChannelTrace {
     sigma: Option<f64>,
     /// Negative-going threshold crossings within the window.
     spike_count: u32,
+    /// True when the channel is rail-pinned (saturated / dead electrode) for
+    /// most of the window, before per-window DC removal hides it (DA21).
+    saturated: bool,
 }
 
 /// Spike metadata retained after `points` is moved into a `Line`.
@@ -139,16 +157,7 @@ pub fn draw_waveform_area(
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
     let traces = collect_from_ring(
-        ring,
-        settings,
-        filters,
-        start_ch,
-        visible,
-        block.sample_rate,
-        x_left,
-        x_right,
-        gain,
-        ch_spacing,
+        ring, settings, filters, start_ch, visible, x_left, x_right, gain, ch_spacing,
     );
 
     // Y axis bounds
@@ -256,6 +265,14 @@ pub fn draw_waveform_area(
         Vec::new()
     };
 
+    // Saturated lanes (display_pos), captured before `traces` is consumed so a
+    // "SAT" badge can be painted in screen space after the plot closure (DA21).
+    let saturated_lanes: Vec<usize> = traces
+        .iter()
+        .filter(|t| t.saturated)
+        .map(|t| t.display_pos)
+        .collect();
+
     // Draw zero-reference lines using the painter (screen-space) to avoid
     // creating a Line object + Vec allocation per channel.
     // These are drawn BEFORE the plot so they appear behind traces.
@@ -268,11 +285,14 @@ pub fn draw_waveform_area(
         ));
 
         // Determine which channel the cursor is hovering over.
-        // Returns the PHYSICAL channel index for consistent comparison with trace.channel.
+        // Returns the PHYSICAL channel index for consistent comparison with
+        // trace.channel. The lane's display index (start_ch + lane) is mapped
+        // through the active channel order so hover follows a non-identity map
+        // (DA19).
         let hovered_ch: Option<usize> = plot_ui.pointer_coordinate().and_then(|pos| {
             let disp_pos = (-pos.y / ch_spacing).round() as i64;
             if disp_pos >= 0 && (disp_pos as usize) < visible {
-                Some(start_ch + disp_pos as usize)
+                Some(settings.display_to_physical(start_ch + disp_pos as usize))
             } else {
                 None
             }
@@ -297,7 +317,7 @@ pub fn draw_waveform_area(
         // Use display_pos for Y-offset; check physical channel for enable/disable.
         if settings.show_grid {
             for disp_pos in 0..visible {
-                if !settings.is_channel_enabled(start_ch + disp_pos) {
+                if !settings.is_channel_enabled(settings.display_to_physical(start_ch + disp_pos)) {
                     continue;
                 }
                 let y_off = -(disp_pos as f64) * ch_spacing;
@@ -382,6 +402,13 @@ pub fn draw_waveform_area(
             } else {
                 (brighten_color(base_color, 1.3), 1.5)
             };
+            // A rail-pinned lane is drawn in the warning color so saturation is
+            // never mistaken for a quiet, healthy channel (DA21).
+            let color = if trace.saturated {
+                theme::ACCENT_RED
+            } else {
+                color
+            };
             plot_ui.line(
                 Line::new(PlotPoints::from(trace.points))
                     .color(color)
@@ -415,6 +442,25 @@ pub fn draw_waveform_area(
         }
     }
 
+    // "SAT" badges on rail-pinned lanes (DA21). Painted at the left edge so a
+    // saturated/dead electrode reads as a fault, not a quiet channel. Placed
+    // opposite the right-edge spike counts to avoid overlap.
+    if !saturated_lanes.is_empty() {
+        let painter = ui.painter();
+        for &disp_pos in &saturated_lanes {
+            let y_lane = -(disp_pos as f64) * ch_spacing;
+            let plot_pos = egui_plot::PlotPoint::new(x_left, y_lane);
+            let screen_pos = response.transform.position_from_point(&plot_pos);
+            painter.text(
+                screen_pos + egui::vec2(10.0, -1.0),
+                egui::Align2::LEFT_CENTER,
+                "SAT",
+                egui::FontId::monospace(10.0),
+                theme::ACCENT_RED,
+            );
+        }
+    }
+
     // Colored lane tabs (#4): a small chip in each channel's trace color at
     // the left edge of its lane, tying the grey "CHn" axis label to its
     // colored waveform.  Only on labeled lanes so it tracks the visible ticks.
@@ -422,7 +468,7 @@ pub fn draw_waveform_area(
         let painter = ui.painter();
         let frame = *response.transform.frame();
         for disp_pos in (0..visible).step_by(label_stride) {
-            let phys_ch = start_ch + disp_pos;
+            let phys_ch = settings.display_to_physical(start_ch + disp_pos);
             if !settings.is_channel_enabled(phys_ch) {
                 continue;
             }
@@ -457,8 +503,10 @@ pub fn draw_waveform_area(
         // where y_offset = -(ch * ch_spacing).
         // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
         // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
-        // hovered_ch is the physical channel; display_pos = physical_ch - start_ch.
-        let disp_pos = hovered_ch.saturating_sub(start_ch);
+        // Recover the lane from the cursor's plot-Y directly: under a non-identity
+        // channel map the physical channel is not start_ch + lane, so we can't
+        // derive the lane by subtracting start_ch from hovered_ch (DA19).
+        let disp_pos = (-plot_val.y / ch_spacing).round().max(0.0) as usize;
         let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
         let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
@@ -657,7 +705,6 @@ fn collect_from_ring(
     filters: &FilterSettings,
     start_ch: usize,
     visible: usize,
-    sample_rate: f64,
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
@@ -673,7 +720,10 @@ fn collect_from_ring(
     let mut traces: Vec<ChannelTrace> = Vec::with_capacity(visible);
 
     for disp_pos in 0..visible {
-        let phys_ch = start_ch + disp_pos;
+        // Map the lane's display index through the active channel order so the
+        // Channel Map panel actually reorders which physical channel each lane
+        // reads/draws/spike-detects (DA19). Identity map => start_ch + disp_pos.
+        let phys_ch = settings.display_to_physical(start_ch + disp_pos);
 
         // Per-channel enable/disable is indexed by physical channel.
         if !settings.is_channel_enabled(phys_ch) {
@@ -702,32 +752,24 @@ fn collect_from_ring(
         };
 
         // Spike detection on the pre-finalize (un-offset, un-gained) values.
-        let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
-            let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-            let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
-            let sig = var.sqrt();
-            let thresh = -filters.spike_threshold_sigma * sig;
-            let ring_sr = sample_rate / RING_DWNSP as f64;
-            let refractory = (ring_sr * 0.001).max(1.0) as usize;
-            let mut count = 0u32;
-            let mut last_cross: Option<usize> = None;
-            let mut prev = 0.0_f64;
-            for (i, p) in pts.iter().enumerate() {
-                let centered = p[1] - mean;
-                if i > 0
-                    && prev >= thresh
-                    && centered < thresh
-                    && last_cross.is_none_or(|l| i - l >= refractory)
-                {
-                    count = count.saturating_add(1);
-                    last_cross = Some(i);
-                }
-                prev = centered;
+        // The refractory window and a resolvability gate are derived from the
+        // *effective* sample rate of `pts` (after RING_DWNSP and the render-time
+        // stride2), so counts no longer drift with the zoom level and a coarse
+        // window suppresses the badge instead of reporting aliased garbage (DA37).
+        let window_secs = (t_right_ms - t_left_ms) / 1000.0;
+        let (sigma, spike_count) = if filters.spike_threshold_enabled {
+            match detect_spikes(&pts, window_secs, filters.spike_threshold_sigma) {
+                Some((sig, count)) => (Some(sig), count),
+                None => (None, 0),
             }
-            (Some(sig), count)
         } else {
             (None, 0)
         };
+
+        // Rail/saturation check on the raw normalized values, BEFORE
+        // finalize_channel's per-window DC removal makes a constant rail look
+        // like a flat baseline indistinguishable from a quiet channel (DA21).
+        let saturated = lane_is_saturated(&pts);
 
         // finalize_channel applies Y-offset using DISPLAY position (not physical channel).
         finalize_channel(&mut pts, disp_pos, gain, ch_spacing);
@@ -737,9 +779,67 @@ fn collect_from_ring(
             points: pts,
             sigma,
             spike_count,
+            saturated,
         });
     }
     traces
+}
+
+/// Whether a lane is rail-pinned (saturated / dead electrode): at least
+/// `SAT_FRACTION` of its window samples sit at or beyond `SAT_LEVEL` of full
+/// scale. Operates on the raw normalized `[time, value]` points before DC
+/// removal, since per-window mean subtraction otherwise hides a constant rail
+/// (DA21).
+fn lane_is_saturated(pts: &[[f64; 2]]) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
+    let railed = pts.iter().filter(|p| p[1].abs() >= SAT_LEVEL).count();
+    railed as f64 / pts.len() as f64 >= SAT_FRACTION
+}
+
+/// Negative-going threshold spike detection on the decimated display points.
+///
+/// Returns `(sigma, count)` or `None` when the points are too coarse to
+/// resolve spikes. The effective sample rate is derived from the *actual*
+/// point density (`pts.len() / window_secs`) — i.e. after both `RING_DWNSP`
+/// and the render-time stride2 — so the refractory window is expressed in true
+/// milliseconds and the count no longer changes with the zoom level. When the
+/// effective rate falls below `SPIKE_MIN_DETECT_HZ` the badge is suppressed
+/// rather than reporting an aliased number (DA37).
+fn detect_spikes(pts: &[[f64; 2]], window_secs: f64, sigma_mult: f64) -> Option<(f64, u32)> {
+    if pts.len() < 2 || window_secs <= 0.0 {
+        return None;
+    }
+    let det_sr = pts.len() as f64 / window_secs;
+    if det_sr < SPIKE_MIN_DETECT_HZ {
+        return None;
+    }
+
+    let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
+    let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
+    let sig = var.sqrt();
+    let thresh = -sigma_mult * sig;
+
+    // 1 ms refractory expressed in *display points* at the effective rate.
+    let refractory = (det_sr * 0.001).round().max(1.0) as usize;
+
+    let mut count = 0u32;
+    let mut last_cross: Option<usize> = None;
+    let mut prev = 0.0_f64;
+    for (i, p) in pts.iter().enumerate() {
+        let centered = p[1] - mean;
+        if i > 0
+            && prev >= thresh
+            && centered < thresh
+            && last_cross.is_none_or(|l| i - l >= refractory)
+        {
+            count = count.saturating_add(1);
+            last_cross = Some(i);
+        }
+        prev = centered;
+    }
+    Some((sig, count))
 }
 
 /// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
@@ -776,4 +876,80 @@ fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pts(ys: &[f64]) -> Vec<[f64; 2]> {
+        ys.iter().enumerate().map(|(i, &y)| [i as f64, y]).collect()
+    }
+
+    #[test]
+    fn saturated_lane_detected_under_dc() {
+        // A channel pinned to the rail (constant ~+1.0) is flagged even though
+        // its per-window mean is large — DC removal would otherwise flatten it
+        // to a quiet-looking baseline (DA21).
+        assert!(lane_is_saturated(&pts(&[1.0, 1.0, 1.0, 1.0])));
+        // Negative rail too.
+        assert!(lane_is_saturated(&pts(&[-0.99, -1.0, -0.985, -1.0])));
+    }
+
+    #[test]
+    fn healthy_lane_not_flagged() {
+        // Small signal with the odd large transient stays below the fraction.
+        assert!(!lane_is_saturated(&pts(&[0.0, 0.1, -0.1, 1.0])));
+        assert!(!lane_is_saturated(&pts(&[0.2, -0.3, 0.05, -0.15])));
+        // Empty window is never saturated.
+        assert!(!lane_is_saturated(&[]));
+    }
+
+    #[test]
+    fn detect_spikes_suppressed_when_window_too_coarse() {
+        // 100 points over a 60 s window => ~1.7 Hz effective rate, far below the
+        // resolvability floor: the badge must be suppressed, not aliased (DA37).
+        let mut v = vec![0.0; 100];
+        v[50] = -10.0; // a clear dip that would cross any threshold
+        assert_eq!(detect_spikes(&pts(&v), 60.0, 4.0), None);
+    }
+
+    #[test]
+    fn detect_spikes_counts_when_resolvable() {
+        // 1000 points over 0.1 s => 10 kHz effective rate (well resolved).
+        // Three well-separated negative dips below -4 sigma.
+        let mut v = vec![0.0; 1000];
+        for &i in &[100usize, 400, 700] {
+            v[i] = -20.0;
+        }
+        let (sigma, count) = detect_spikes(&pts(&v), 0.1, 4.0).expect("resolvable");
+        assert!(sigma > 0.0);
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn detect_spikes_refractory_merges_adjacent_dips() {
+        // Two dips one point apart fall inside the 1 ms refractory (10 points at
+        // 10 kHz) and count once, not twice.
+        let mut v = vec![0.0; 1000];
+        v[500] = -20.0;
+        v[501] = -20.0;
+        let (_, count) = detect_spikes(&pts(&v), 0.1, 4.0).expect("resolvable");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn detect_spikes_count_is_zoom_independent() {
+        // Same physical 3-spike signal sampled into the same number of display
+        // points yields the same count whether the window is 0.1 s or 0.5 s, as
+        // long as both stay above the resolvability floor (DA37: count tracks
+        // firing rate, not zoom).
+        let mut v = vec![0.0; 1000];
+        for &i in &[100usize, 400, 700] {
+            v[i] = -20.0;
+        }
+        let a = detect_spikes(&pts(&v), 0.1, 4.0).unwrap().1;
+        let b = detect_spikes(&pts(&v), 0.5, 4.0).unwrap().1;
+        assert_eq!(a, b);
+    }
 }

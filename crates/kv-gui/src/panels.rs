@@ -23,20 +23,31 @@ pub enum DisplayMode {
     Roll,
 }
 
-/// 8-color palette for channel group coloring.
+/// 8-color palette for channel group coloring — a curated, perceptually
+/// distinct subset of the authoritative `theme::CHANNEL_PALETTE` rather than a
+/// separate hand-tuned set, so group colors match the rest of the UI's blues,
+/// greens and reds instead of being subtly-different shades (C9).
 pub const CHANNEL_GROUP_COLORS: &[egui::Color32] = &[
-    egui::Color32::from_rgb(100, 180, 255), // blue
-    egui::Color32::from_rgb(120, 220, 120), // green
-    egui::Color32::from_rgb(255, 160, 80),  // orange
-    egui::Color32::from_rgb(200, 120, 255), // purple
-    egui::Color32::from_rgb(255, 100, 100), // red
-    egui::Color32::from_rgb(80, 220, 200),  // teal
-    egui::Color32::from_rgb(255, 220, 80),  // yellow
-    egui::Color32::from_rgb(200, 200, 200), // gray
+    theme::CHANNEL_PALETTE[1], // blue
+    theme::CHANNEL_PALETTE[0], // green
+    theme::CHANNEL_PALETTE[2], // orange
+    theme::CHANNEL_PALETTE[4], // purple
+    theme::CHANNEL_PALETTE[6], // red
+    theme::CHANNEL_PALETTE[5], // cyan
+    theme::CHANNEL_PALETTE[3], // yellow
+    theme::CHANNEL_PALETTE[9], // pink
 ];
 
 /// Time-window presets in seconds (total visible window width).
-pub const TIME_WINDOWS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0];
+///
+/// Sub-second timebases were added so a single ~1-2 ms action potential can be
+/// zoomed into and inspected in the time domain — at the old 1 s floor a spike
+/// was <0.2% of the trace width and its shape was unreadable (C15). `[` / `]`
+/// step across this whole list; `format_time_window` renders <1 s as ms.
+pub const TIME_WINDOWS: &[f64] = &[0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0];
+/// Index of the default 5 s window within [`TIME_WINDOWS`]. Kept as a named
+/// constant so prepending shorter presets can't silently repoint the default.
+pub const DEFAULT_TIME_WINDOW_IDX: usize = 8;
 
 /// Amplitude presets in microvolts per division (display only — raw i16 scaled).
 pub const AMP_SCALES: &[f64] = &[50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0];
@@ -86,8 +97,8 @@ impl Default for DisplaySettings {
     fn default() -> Self {
         Self {
             visible_channels: 16,
-            time_scale_idx: 2, // 5 s window
-            amp_scale_idx: 4,  // 1000 uV/div
+            time_scale_idx: DEFAULT_TIME_WINDOW_IDX, // 5 s window
+            amp_scale_idx: 3,                        // 500 uV/div (headroom, OE-like)
             show_grid: true,
             show_channel_labels: true,
             overlay_mode: false,
@@ -130,7 +141,7 @@ impl DisplaySettings {
             let group = ch / self.channels_per_group;
             CHANNEL_GROUP_COLORS[group % CHANNEL_GROUP_COLORS.len()]
         } else {
-            egui::Color32::from_rgb(100, 180, 255) // default blue
+            theme::CHANNEL_PALETTE[1] // default blue, from the canonical palette (C9)
         }
     }
 
@@ -203,6 +214,22 @@ pub enum RecordingState {
     Recording,
 }
 
+/// Canonical at-a-glance acquisition label. One word, used by every status
+/// surface (toolbar pill, bottom status bar, sidebar) so the same state never
+/// reads as "ACQ" here, "ACQUIRING" there and "LIVE" elsewhere (C4).
+pub fn acq_label(running: bool) -> &'static str {
+    if running { "LIVE" } else { "IDLE" }
+}
+
+/// Canonical at-a-glance recording label, paired with [`acq_label`] (C4).
+pub fn rec_label(state: &RecordingState) -> &'static str {
+    match state {
+        RecordingState::Recording => "REC",
+        RecordingState::Armed => "ARMED",
+        RecordingState::Idle => "OFF",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordingSettings {
     pub state: RecordingState,
@@ -210,6 +237,10 @@ pub struct RecordingSettings {
     pub file_prefix: String,
     pub recorded_blocks: u64,
     pub recorded_bytes: u64,
+    /// Resolved unique per-session folder the current recording writes to
+    /// (Some only while recording). Surfaced so the operator can see exactly
+    /// where data is landing (C2). `None` when idle.
+    pub active_dir: Option<String>,
 }
 
 impl Default for RecordingSettings {
@@ -220,6 +251,7 @@ impl Default for RecordingSettings {
             file_prefix: "session".to_string(),
             recorded_blocks: 0,
             recorded_bytes: 0,
+            active_dir: None,
         }
     }
 }
@@ -325,10 +357,6 @@ pub fn draw_acquire_core(
     rec_elapsed_secs: Option<f64>,
     // Recorder buffer fill level 0.0..=1.0 (from live pipeline).
     buffer_occupancy: f64,
-    // Last recorder error message, if any.
-    recording_error: Option<&str>,
-    // Set to true by the panel when the user clicks "dismiss error".
-    dismiss_error: &mut bool,
 ) {
     // Primary actions first: connect → acquire → record.
     draw_device_section(ui, acquiring, device, block);
@@ -342,8 +370,6 @@ pub fn draw_acquire_core(
         toggle_rec,
         rec_elapsed_secs,
         buffer_occupancy,
-        recording_error,
-        dismiss_error,
         block,
     );
 }
@@ -358,7 +384,7 @@ fn draw_device_section(
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("DEVICE")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
@@ -369,14 +395,14 @@ fn draw_device_section(
                 theme::status_dot(ui, theme::STATUS_CONNECTED);
                 ui.label(
                     egui::RichText::new("Connected")
-                        .size(11.0)
+                        .size(theme::FONT_HEADING)
                         .color(theme::STATUS_CONNECTED),
                 );
             } else {
                 theme::status_dot(ui, theme::STATUS_IDLE);
                 ui.label(
                     egui::RichText::new("Disconnected")
-                        .size(11.0)
+                        .size(theme::FONT_HEADING)
                         .color(theme::STATUS_IDLE),
                 );
             }
@@ -390,7 +416,7 @@ fn draw_device_section(
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Source")
-                        .size(10.0)
+                        .size(theme::FONT_BODY)
                         .color(theme::TEXT_DIM),
                 );
                 ui.selectable_value(&mut device.kind, DeviceKind::Simulator, "Simulator");
@@ -424,13 +450,17 @@ fn draw_device_section(
                         .as_ref()
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "Select an FPGA bitfile to upload".to_string());
-                    ui.label(egui::RichText::new(label).size(10.0).color(color))
-                        .on_hover_text(hover);
+                    ui.label(
+                        egui::RichText::new(label)
+                            .size(theme::FONT_BODY)
+                            .color(color),
+                    )
+                    .on_hover_text(hover);
                 });
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Headstages")
-                            .size(10.0)
+                            .size(theme::FONT_BODY)
                             .color(theme::TEXT_DIM),
                     );
                     ui.selectable_value(&mut device.rhd_streams, 1, "1 (32ch)");
@@ -469,17 +499,17 @@ fn draw_acquisition_controls(
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("ACQUISITION")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
     .default_open(true)
     .show(ui, |ui| {
         ui.horizontal(|ui| {
-            if theme::transport_button(ui, "  Start  ", theme::BTN_PLAY, !acquiring) {
+            if theme::transport_button(ui, "Start", theme::BTN_PLAY, !acquiring) {
                 *start_clicked = true;
             }
-            if theme::transport_button(ui, "  Stop  ", theme::BTN_STOP, acquiring) {
+            if theme::transport_button(ui, "Stop", theme::BTN_STOP, acquiring) {
                 *stop_clicked = true;
             }
         });
@@ -489,16 +519,16 @@ fn draw_acquisition_controls(
             if acquiring {
                 theme::status_dot(ui, theme::ACCENT_GREEN);
                 ui.label(
-                    egui::RichText::new("ACQUIRING")
-                        .size(11.0)
+                    egui::RichText::new(acq_label(true))
+                        .size(theme::FONT_HEADING)
                         .strong()
                         .color(theme::ACCENT_GREEN),
                 );
             } else {
                 theme::status_dot(ui, theme::STATUS_IDLE);
                 ui.label(
-                    egui::RichText::new("IDLE")
-                        .size(11.0)
+                    egui::RichText::new(acq_label(false))
+                        .size(theme::FONT_HEADING)
                         .color(theme::STATUS_IDLE),
                 );
             }
@@ -511,7 +541,7 @@ fn draw_acquisition_controls(
 pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
     egui::CollapsingHeader::new(
         egui::RichText::new("DISPLAY")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
@@ -521,7 +551,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Channels")
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             let mut ch = display.visible_channels as i32;
@@ -541,7 +571,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Time")
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             egui::ComboBox::from_id_salt("time_scale")
@@ -549,7 +579,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
                 .selected_text(
                     egui::RichText::new(format_time_window(display.time_window_secs()))
                         .monospace()
-                        .size(11.0)
+                        .size(theme::FONT_HEADING)
                         .color(theme::TEXT_PRIMARY),
                 )
                 .show_ui(ui, |ui| {
@@ -562,13 +592,17 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
 
         // Amplitude scale — dropdown
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Amp").size(10.0).color(theme::TEXT_DIM));
+            ui.label(
+                egui::RichText::new("Amp")
+                    .size(theme::FONT_BODY)
+                    .color(theme::TEXT_DIM),
+            );
             egui::ComboBox::from_id_salt("amp_scale")
                 .width(ui.available_width() - 4.0)
                 .selected_text(
                     egui::RichText::new(format_uv(display.amp_scale_uv()))
                         .monospace()
-                        .size(11.0)
+                        .size(theme::FONT_HEADING)
                         .color(theme::TEXT_PRIMARY),
                 )
                 .show_ui(ui, |ui| {
@@ -582,7 +616,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Spacing")
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             ui.add(
@@ -598,15 +632,15 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut display.show_grid,
-                egui::RichText::new("Grid").size(10.0),
+                egui::RichText::new("Grid").size(theme::FONT_BODY),
             );
             ui.checkbox(
                 &mut display.show_channel_labels,
-                egui::RichText::new("Labels").size(10.0),
+                egui::RichText::new("Labels").size(theme::FONT_BODY),
             );
             ui.checkbox(
                 &mut display.hover_highlight,
-                egui::RichText::new("Hover hl").size(10.0),
+                egui::RichText::new("Hover hl").size(theme::FONT_BODY),
             )
             .on_hover_text("Highlight hovered channel, dim others");
         });
@@ -616,19 +650,19 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Mode")
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             ui.selectable_value(
                 &mut display.display_mode,
                 DisplayMode::Sweep,
-                egui::RichText::new("Sweep").size(10.0),
+                egui::RichText::new("Sweep").size(theme::FONT_BODY),
             )
             .on_hover_text("Fixed window, cursor sweeps right (SpikeGLX/Intan RHX style)");
             ui.selectable_value(
                 &mut display.display_mode,
                 DisplayMode::Roll,
-                egui::RichText::new("Roll").size(10.0),
+                egui::RichText::new("Roll").size(theme::FONT_BODY),
             )
             .on_hover_text("Continuous scrolling, latest data on the right");
         });
@@ -638,7 +672,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut display.color_by_group,
-                egui::RichText::new("Group colors").size(10.0),
+                egui::RichText::new("Group colors").size(theme::FONT_BODY),
             )
             .on_hover_text("Color channels by group (cycling 8-color palette)");
             if display.color_by_group {
@@ -663,7 +697,7 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("Browse step")
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .color(theme::TEXT_DIM),
             );
             ui.add(
@@ -682,17 +716,17 @@ pub fn draw_display_settings(ui: &mut egui::Ui, display: &mut DisplaySettings) {
 pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
     egui::CollapsingHeader::new(
         egui::RichText::new("FILTERS")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
-    .default_open(false)
+    .default_open(true)
     .show(ui, |ui| {
         // High-pass
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut filters.hp_enabled,
-                egui::RichText::new("HP").size(10.0).strong(),
+                egui::RichText::new("HP").size(theme::FONT_BODY).strong(),
             );
             ui.add(
                 egui::DragValue::new(&mut filters.hp_cutoff_hz)
@@ -706,7 +740,7 @@ pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut filters.lp_enabled,
-                egui::RichText::new("LP").size(10.0).strong(),
+                egui::RichText::new("LP").size(theme::FONT_BODY).strong(),
             );
             ui.add(
                 egui::DragValue::new(&mut filters.lp_cutoff_hz)
@@ -720,13 +754,13 @@ pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut filters.notch_enabled,
-                egui::RichText::new("Notch").size(10.0).strong(),
+                egui::RichText::new("Notch").size(theme::FONT_BODY).strong(),
             );
             for (i, &f) in NOTCH_FREQS.iter().enumerate() {
                 ui.selectable_value(
                     &mut filters.notch_idx,
                     i,
-                    egui::RichText::new(format!("{}Hz", f as u32)).size(10.0),
+                    egui::RichText::new(format!("{}Hz", f as u32)).size(theme::FONT_BODY),
                 );
             }
         });
@@ -736,14 +770,14 @@ pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
         // Common Average Reference
         ui.checkbox(
             &mut filters.car_enabled,
-            egui::RichText::new("CAR (Common Avg Ref)").size(10.0),
+            egui::RichText::new("CAR (Common Avg Ref)").size(theme::FONT_BODY),
         );
 
         // Spike threshold
         ui.horizontal(|ui| {
             ui.checkbox(
                 &mut filters.spike_threshold_enabled,
-                egui::RichText::new("Spike σ").size(10.0),
+                egui::RichText::new("Spike σ").size(theme::FONT_BODY),
             );
             ui.add(
                 egui::DragValue::new(&mut filters.spike_threshold_sigma)
@@ -757,7 +791,7 @@ pub fn draw_filter_settings(ui: &mut egui::Ui, filters: &mut FilterSettings) {
             ui.add_space(2.0);
             ui.label(
                 egui::RichText::new("Display only — recording is raw")
-                    .size(9.0)
+                    .size(theme::FONT_CAPTION)
                     .italics()
                     .color(theme::TEXT_DIM),
             );
@@ -775,13 +809,11 @@ fn draw_recording_section(
     toggle_rec: &mut bool,
     rec_elapsed_secs: Option<f64>,
     buffer_occupancy: f64,
-    recording_error: Option<&str>,
-    dismiss_error: &mut bool,
     block: Option<&SampleBlock>,
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("RECORDING")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
@@ -799,7 +831,11 @@ fn draw_recording_section(
                 ),
             };
             theme::status_dot(ui, dot_color);
-            ui.label(egui::RichText::new(label).size(11.0).color(label_color));
+            ui.label(
+                egui::RichText::new(label)
+                    .size(theme::FONT_HEADING)
+                    .color(label_color),
+            );
         });
 
         // Output directory — text field + folder picker button.
@@ -813,11 +849,22 @@ fn draw_recording_section(
                         .size(theme::FONT_BODY)
                         .color(theme::TEXT_DIM),
                 );
-                ui.add(
+                let dir_resp = ui.add(
                     egui::TextEdit::singleline(&mut recording.output_dir)
                         .desired_width(110.0)
                         .font(egui::FontId::monospace(theme::FONT_BODY)),
                 );
+                // The field truncates long paths; hovering reveals the fully
+                // resolved folder so the operator can confirm where data lands (C34).
+                let p = std::path::Path::new(recording.output_dir.trim());
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    std::env::current_dir()
+                        .map(|c| c.join(p))
+                        .unwrap_or_else(|_| p.to_path_buf())
+                };
+                dir_resp.on_hover_text(format!("Recording folder:\n{}", full.display()));
                 if ui
                     .button(egui::RichText::new("📁").size(13.0))
                     .on_hover_text("Browse for output folder")
@@ -831,11 +878,26 @@ fn draw_recording_section(
             });
         });
         if recording_active {
-            ui.label(
-                egui::RichText::new("\u{1F512} Output locked while recording")
-                    .size(theme::FONT_CAPTION)
-                    .color(theme::TEXT_DIM),
-            );
+            // Show the actual unique session folder data is landing in, so the
+            // operator can see each recording goes somewhere new (C2).
+            if let Some(dir) = recording.active_dir.as_deref() {
+                let name = std::path::Path::new(dir)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(dir);
+                ui.label(
+                    egui::RichText::new(format!("\u{1F512} Writing to {name}"))
+                        .size(theme::FONT_CAPTION)
+                        .color(theme::TEXT_DIM),
+                )
+                .on_hover_text(format!("Recording session folder:\n{dir}"));
+            } else {
+                ui.label(
+                    egui::RichText::new("\u{1F512} Output locked while recording")
+                        .size(theme::FONT_CAPTION)
+                        .color(theme::TEXT_DIM),
+                );
+            }
         }
 
         // Arm / Record / Stop buttons — all go through toggle_rec so that
@@ -843,7 +905,7 @@ fn draw_recording_section(
         // (creating / finishing the StreamingRecorder).
         ui.horizontal(|ui| match recording.state {
             RecordingState::Idle => {
-                if theme::transport_button(ui, " Arm ", theme::ACCENT_YELLOW, acquiring) {
+                if theme::transport_button(ui, "Arm", theme::ACCENT_YELLOW, acquiring) {
                     *toggle_rec = true;
                 }
             }
@@ -852,7 +914,7 @@ fn draw_recording_section(
                     *toggle_rec = true;
                 }
                 if ui
-                    .button(egui::RichText::new("Disarm").size(11.0))
+                    .button(egui::RichText::new("Disarm").size(theme::FONT_HEADING))
                     .clicked()
                 {
                     // Disarm: go directly back to Idle without creating a file
@@ -884,23 +946,25 @@ fn draw_recording_section(
         if let Some(free) = crate::diskspace::free_bytes(&recording.output_dir) {
             ui.add_space(2.0);
             let free_gb = free as f64 / 1_000_000_000.0;
-            let disk_color = if free_gb < 2.0 {
-                theme::ACCENT_RED
+            // Severity is carried by a text tag as well as hue so a red/green
+            // colorblind operator still sees the warning (C25).
+            let (disk_color, disk_tag) = if free_gb < 2.0 {
+                (theme::ACCENT_RED, " CRITICAL")
             } else if free_gb < 10.0 {
-                theme::ACCENT_YELLOW
+                (theme::ACCENT_YELLOW, " LOW")
             } else {
-                theme::ACCENT_GREEN
+                (theme::ACCENT_GREEN, "")
             };
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Disk")
-                        .size(10.0)
+                        .size(theme::FONT_BODY)
                         .color(theme::TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("{free_gb:.1} GB free"))
-                        .size(10.0)
+                    egui::RichText::new(format!("{free_gb:.1} GB free{disk_tag}"))
+                        .size(theme::FONT_BODY)
                         .monospace()
                         .color(disk_color),
                 );
@@ -920,7 +984,7 @@ fn draw_recording_section(
                         theme::format_clock(secs_left),
                         format_bytes(rate as u64)
                     ))
-                    .size(9.0)
+                    .size(theme::FONT_CAPTION)
                     .color(theme::TEXT_DIM),
                 )
                 .on_hover_text("Estimated recording time remaining on this volume");
@@ -954,13 +1018,13 @@ fn draw_recording_section(
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Buffer")
-                        .size(10.0)
+                        .size(theme::FONT_BODY)
                         .color(theme::TEXT_DIM),
                 );
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(format!("{occ_pct:3}%"))
-                        .size(10.0)
+                        .size(theme::FONT_BODY)
                         .monospace()
                         .color(bar_color),
                 );
@@ -970,45 +1034,31 @@ fn draw_recording_section(
                     .fill(bar_color)
                     .desired_width(ui.available_width()),
             );
+            // Text cue at both amber and red tiers so the severity is not
+            // conveyed by the bar's hue alone (C25).
             if buffer_occupancy > 0.75 {
                 ui.label(
-                    egui::RichText::new("⚠ Disk may be too slow")
-                        .size(9.0)
+                    egui::RichText::new("⚠ Buffer critical — disk may be too slow")
+                        .size(theme::FONT_CAPTION)
                         .color(theme::ACCENT_RED),
+                );
+            } else if buffer_occupancy > 0.40 {
+                ui.label(
+                    egui::RichText::new("⚠ Buffer filling")
+                        .size(theme::FONT_CAPTION)
+                        .color(theme::ACCENT_YELLOW),
                 );
             }
         }
-
-        // ── Recorder error banner (dismissable) ──────────────────
-        if let Some(err) = recording_error {
-            ui.add_space(4.0);
-            egui::Frame::new()
-                .fill(egui::Color32::from_rgb(70, 15, 15))
-                .inner_margin(egui::Margin::same(6))
-                .corner_radius(egui::CornerRadius::same(4))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("⚠").size(11.0).color(theme::ACCENT_RED));
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(err)
-                                .size(9.5)
-                                .color(egui::Color32::from_rgb(255, 170, 170)),
-                        );
-                    });
-                    if ui
-                        .small_button(egui::RichText::new("Dismiss").size(9.0))
-                        .clicked()
-                    {
-                        *dismiss_error = true;
-                    }
-                });
-        }
+        // Recorder failures now surface as a top-level error banner (rendered in
+        // app.rs) matching the device-error banner, rather than an inline card
+        // buried in this collapsible section (C9/C17).
     });
 }
 
 // ── Status bar (bottom) ─────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_status_bar(
     ui: &mut egui::Ui,
     acquiring: bool,
@@ -1016,57 +1066,66 @@ pub fn draw_status_bar(
     stats: Option<&BlockStats>,
     block: Option<&SampleBlock>,
     elapsed_secs: f64,
+    // Recorder input-buffer occupancy 0.0..=1.0 (shown while recording).
+    buffer_occupancy: f64,
+    // Free bytes on the recording volume, polled by the app (~1/s).
+    disk_free_bytes: Option<u64>,
+    // Blocks dropped within the recent activity window (drives "dropping now").
+    recent_drops: u64,
 ) {
     ui.horizontal(|ui| {
-        // Acquisition status
+        // Acquisition status — canonical single-source label (C4).
         if acquiring {
             theme::status_dot(ui, theme::ACCENT_GREEN);
             ui.label(
-                egui::RichText::new("ACQ")
-                    .size(10.0)
+                egui::RichText::new(acq_label(true))
+                    .size(theme::FONT_BODY)
                     .strong()
                     .color(theme::ACCENT_GREEN),
             );
         } else {
             theme::status_dot(ui, theme::STATUS_IDLE);
             ui.label(
-                egui::RichText::new("IDLE")
-                    .size(10.0)
+                egui::RichText::new(acq_label(false))
+                    .size(theme::FONT_BODY)
                     .color(theme::STATUS_IDLE),
             );
         }
 
         ui.separator();
 
-        // Recording state
+        // Recording state — same canonical labels as the toolbar pill (C4).
         match recording.state {
             RecordingState::Recording => {
                 // Filled red badge so an active recording is unmistakable (A5).
                 egui::Frame::new()
                     .fill(theme::STATUS_RECORDING)
-                    .corner_radius(egui::CornerRadius::same(3))
+                    .corner_radius(egui::CornerRadius::same(theme::RADIUS_WIDGET))
                     .inner_margin(egui::Margin::symmetric(5, 1))
                     .show(ui, |ui| {
                         ui.label(
-                            egui::RichText::new("\u{25CF} REC")
-                                .size(theme::FONT_BODY)
-                                .strong()
-                                .color(egui::Color32::WHITE),
+                            egui::RichText::new(format!(
+                                "\u{25CF} {}",
+                                rec_label(&RecordingState::Recording)
+                            ))
+                            .size(theme::FONT_BODY)
+                            .strong()
+                            .color(egui::Color32::WHITE),
                         );
                     });
             }
             RecordingState::Armed => {
                 theme::status_dot(ui, theme::STATUS_ARMED);
                 ui.label(
-                    egui::RichText::new("ARMED")
-                        .size(10.0)
+                    egui::RichText::new(rec_label(&RecordingState::Armed))
+                        .size(theme::FONT_BODY)
                         .color(theme::STATUS_ARMED),
                 );
             }
             RecordingState::Idle => {
                 ui.label(
-                    egui::RichText::new("REC OFF")
-                        .size(10.0)
+                    egui::RichText::new(rec_label(&RecordingState::Idle))
+                        .size(theme::FONT_BODY)
                         .color(theme::TEXT_DIM),
                 );
             }
@@ -1077,7 +1136,7 @@ pub fn draw_status_bar(
         // Clock
         ui.label(
             egui::RichText::new(theme::format_clock(elapsed_secs))
-                .size(11.0)
+                .size(theme::FONT_HEADING)
                 .monospace()
                 .color(if acquiring {
                     theme::ACCENT_YELLOW
@@ -1092,7 +1151,7 @@ pub fn draw_status_bar(
         if let Some(b) = block {
             ui.label(
                 egui::RichText::new(format!("{}ch @ {:.0}Hz", b.channel_count, b.sample_rate))
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .monospace()
                     .color(theme::TEXT_SECONDARY),
             );
@@ -1103,52 +1162,94 @@ pub fn draw_status_bar(
         if let Some(s) = stats {
             ui.label(
                 egui::RichText::new(format!("{:.2} MB/s", s.data_rate_mb_s))
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .monospace()
                     .color(theme::ACCENT_CYAN),
             );
             ui.separator();
             ui.label(
                 egui::RichText::new(format!("{:.0} blk/s", s.block_rate_hz))
-                    .size(10.0)
+                    .size(theme::FONT_BODY)
                     .monospace()
                     .color(theme::ACCENT_BLUE),
             );
             ui.separator();
 
-            // Buffer health — three-tier green→amber→red on the drop count (#12).
-            // Green = none lost; amber = a small fraction (transient hiccup);
-            // red = a sustained loss rate that warrants attention.
+            // Drop health — color reflects RECENT activity, not the sticky
+            // lifetime ratio, so "dropping right now" (red) is distinct from
+            // "recovered, lost some earlier" (neutral) and "clean" (green) (C12).
             let dropped = s.dropped_blocks;
             let ratio = if s.total_blocks > 0 {
                 dropped as f64 / s.total_blocks as f64
             } else {
                 0.0
             };
-            let (health_color, warn) = if dropped == 0 {
-                (theme::ACCENT_GREEN, false)
-            } else if ratio < 0.01 {
-                (theme::ACCENT_YELLOW, true)
+            let (health_color, text, strong) = if recent_drops > 0 {
+                (
+                    theme::ACCENT_RED,
+                    format!("\u{26A0} Dropping +{recent_drops}"),
+                    true,
+                )
+            } else if dropped > 0 {
+                // No active loss, but the session lost blocks at some point.
+                (theme::TEXT_SECONDARY, format!("Drops: {dropped}"), false)
             } else {
-                (theme::ACCENT_RED, true)
+                (theme::ACCENT_GREEN, "Drop: 0".to_string(), false)
             };
-            let drop_text = if warn {
-                egui::RichText::new(format!("\u{26A0} Drop: {dropped}"))
-                    .size(theme::FONT_BODY)
-                    .monospace()
-                    .strong()
-                    .color(health_color)
-            } else {
-                egui::RichText::new("Drop: 0")
-                    .size(theme::FONT_BODY)
-                    .monospace()
-                    .color(health_color)
-            };
-            ui.label(drop_text).on_hover_text(format!(
-                "Blocks lost to packet-ID gaps (disk or CPU can't keep up)\n{dropped} of {} blocks ({:.3}%)",
+            let mut rt = egui::RichText::new(text)
+                .size(theme::FONT_BODY)
+                .monospace()
+                .color(health_color);
+            if strong {
+                rt = rt.strong();
+            }
+            ui.label(rt).on_hover_text(format!(
+                "Blocks lost to packet-ID gaps (disk or CPU can't keep up)\nrecent (~3s): {recent_drops} · total: {dropped} of {} ({:.3}%)",
                 s.total_blocks,
                 ratio * 100.0
             ));
+        }
+
+        // Buffer occupancy — mirrored here from the ACQUIRE tab so this critical
+        // data-loss predictor is visible no matter which tab is open (C10).
+        if recording.state == RecordingState::Recording {
+            ui.separator();
+            let occ_pct = (buffer_occupancy * 100.0) as u32;
+            let (buf_color, buf_tag) = if buffer_occupancy > 0.75 {
+                (theme::ACCENT_RED, " HIGH")
+            } else if buffer_occupancy > 0.40 {
+                (theme::ACCENT_YELLOW, "")
+            } else {
+                (theme::ACCENT_GREEN, "")
+            };
+            ui.label(
+                egui::RichText::new(format!("Buf {occ_pct}%{buf_tag}"))
+                    .size(theme::FONT_BODY)
+                    .monospace()
+                    .color(buf_color),
+            )
+            .on_hover_text("Recorder input-buffer fill — sustained high means disk can't keep up");
+        }
+
+        // Disk headroom — always visible so a full volume is caught before the
+        // recorder errors out on it (C10).
+        if let Some(free) = disk_free_bytes {
+            ui.separator();
+            let free_gb = free as f64 / 1_000_000_000.0;
+            let (disk_color, disk_tag) = if free_gb < 2.0 {
+                (theme::ACCENT_RED, " LOW")
+            } else if free_gb < 10.0 {
+                (theme::ACCENT_YELLOW, " LOW")
+            } else {
+                (theme::TEXT_SECONDARY, "")
+            };
+            ui.label(
+                egui::RichText::new(format!("Disk {free_gb:.0}G{disk_tag}"))
+                    .size(theme::FONT_BODY)
+                    .monospace()
+                    .color(disk_color),
+            )
+            .on_hover_text("Free space on the recording volume");
         }
 
         // Right-aligned: total blocks and samples
@@ -1156,7 +1257,7 @@ pub fn draw_status_bar(
             if let Some(s) = stats {
                 ui.label(
                     egui::RichText::new(format!("{} blk", format_large_number(s.total_blocks)))
-                        .size(9.0)
+                        .size(theme::FONT_CAPTION)
                         .monospace()
                         .color(theme::TEXT_DIM),
                 );

@@ -498,6 +498,46 @@ fn kvraw_reader_round_trips_streaming_data() {
 }
 
 #[test]
+fn dropping_without_finish_still_leaves_a_valid_readable_file() {
+    // C1 safety-net: if the recorder is dropped without an explicit finish()
+    // (app quit / thread unwind), the Drop impl must rewrite the embedded header
+    // so the file is a valid, readable v2 kvraw rather than the zeroed
+    // placeholder that would make channel_count/offset garbage.
+    use kv_recorder::KvrawReader;
+
+    let output_dir = unique_output_dir("drop-finalize");
+    let blocks = next_simulator_blocks(3);
+    let ch = blocks[0].channel_count;
+    let sr = blocks[0].sample_rate;
+
+    {
+        let mut recorder = StreamingRecorder::new(&output_dir).expect("recorder");
+        for block in &blocks {
+            recorder.write_block(block).expect("write");
+        }
+        // Intentionally NO finish() — recorder is dropped here at end of scope.
+    }
+
+    let raw_path = output_dir.join("recording.kvraw");
+    let mut reader = KvrawReader::open(&raw_path).expect("drop-finalized file should open");
+    let meta = reader.metadata();
+    assert_eq!(
+        meta.format_version, 2,
+        "header must be finalized, not placeholder"
+    );
+    assert_eq!(meta.channel_count, ch);
+    assert!((meta.sample_rate - sr).abs() < 0.1);
+    assert_eq!(meta.block_count, blocks.len() as u64);
+    assert!(meta.total_frames() > 0);
+
+    // The data is actually readable end-to-end.
+    let frames = reader.read_frames(0, 1).expect("read first frame");
+    assert_eq!(frames.len(), ch);
+
+    cleanup_dir(&output_dir);
+}
+
+#[test]
 fn kvraw_reader_errors_on_legacy_file_without_metadata() {
     use kv_recorder::KvrawReader;
 

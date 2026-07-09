@@ -165,14 +165,26 @@ impl RhythmFrontPanelBoard {
                 let raw = self.read_pipe_block(enabled_streams, PROBE_SAMPLES)?;
 
                 let has_id = verify_chip_id_in_probe(&raw, enabled_streams, PROBE_SAMPLES);
-                if has_id {
+                let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
+                let chip_id = probe_chip_id(&raw, enabled_streams, PROBE_SAMPLES, 0);
+
+                // Drive delay selection off the FULL register-63 chip ID
+                // (`chip_id.is_some()`), NOT the lenient INTAN ROM marker (`has_id`).
+                // On marginal MISO phases the ROM marker can still be decoded while the
+                // chip-ID register cannot; those phases yield half-scale 0x4000
+                // amplifier data after ADC calibration and are then rejected by the
+                // centering gate at commit time. Gating on the chip ID keeps the
+                // candidate run on solidly-locked phases (e.g. delays 4-7 here, not the
+                // marginal 2-3 that put the old `has_id` rule on the half-scale delay 3).
+                if chip_id.is_some() {
                     id_verified_delays.push(delay);
+                    if port_chip_id.is_none() {
+                        port_chip_id = chip_id;
+                    }
                 }
 
-                let railed = min_stream_railed_fraction(&raw, enabled_streams, PROBE_SAMPLES);
-                if railed < 0.9 || has_id {
+                if railed < 0.9 || has_id || chip_id.is_some() {
                     let amp_mean = amplifier_mean_raw_word(&raw, enabled_streams, PROBE_SAMPLES, 0);
-                    let chip_id = probe_chip_id(&raw, enabled_streams, PROBE_SAMPLES, 0);
                     log::info!(
                         "  scan port {} delay {:2}: has_id={} chip_id={:?} railed_s0={:.3} amp_mean_raw_s0={}",
                         port_letter,
@@ -184,9 +196,6 @@ impl RhythmFrontPanelBoard {
                             .map(|m| format!("0x{m:04x}"))
                             .unwrap_or_else(|| "n/a".to_string()),
                     );
-                    if has_id && port_chip_id.is_none() {
-                        port_chip_id = chip_id;
-                    }
                 }
                 if railed < 0.5 {
                     low_railed_delays.push(delay);
@@ -200,11 +209,12 @@ impl RhythmFrontPanelBoard {
                 (low_railed_delays, false)
             };
 
-            // Match Open Ephys DeviceThread::scanPorts exactly: 1-2 good delays ->
-            // the first; >2 -> the SECOND good delay (indexSecondGoodDelay), NOT the
-            // middle. good_delays is in ascending order, so index 1 is the second.
-            // On this rig the second good delay (5 for good delays 4-7) reads
-            // measurably quieter in the 5-300 Hz / mains band than the middle (6).
+            // good_delays is now the chip-ID-confirmed run. Match Open Ephys
+            // DeviceThread::scanPorts: 1-2 good delays -> the first; >2 -> the SECOND
+            // good delay (indexSecondGoodDelay), NOT the middle. good_delays is in
+            // ascending order, so index 1 is the second. On this rig the confirmed run
+            // is 4-7, so the second good delay is 5 (a solidly-locked phase) rather
+            // than the marginal delay 3 the old INTAN-marker run selected.
             let chosen_delay = if good_delays.len() > 2 {
                 good_delays[1]
             } else if let Some(&d) = good_delays.first() {

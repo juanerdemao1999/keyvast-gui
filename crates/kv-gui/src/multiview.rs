@@ -37,7 +37,6 @@ pub enum TileKind {
     /// Main waveform tile using the user-configured filter ring.
     MainWaveform {
         start_ch: usize,
-        visible_count: usize,
         /// Per-tile scroll accumulators (Y-amp, X-time, browse).
         scroll_accum_y: f32,
         scroll_accum_t: f32,
@@ -72,10 +71,9 @@ pub enum TileKind {
 }
 
 impl TileKind {
-    pub fn new_main(visible_count: usize) -> Self {
+    pub fn new_main() -> Self {
         Self::MainWaveform {
             start_ch: 0,
-            visible_count,
             scroll_accum_y: 0.0,
             scroll_accum_t: 0.0,
             scroll_accum_browse: 0.0,
@@ -174,7 +172,6 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
         match pane {
             TileKind::MainWaveform {
                 start_ch,
-                visible_count: _,
                 scroll_accum_y,
                 scroll_accum_t,
                 scroll_accum_browse,
@@ -252,11 +249,13 @@ impl<'a> egui_tiles::Behavior<TileKind> for KvTileBehavior<'a> {
 
     fn tab_title_for_pane(&mut self, pane: &TileKind) -> egui::WidgetText {
         match pane {
-            TileKind::MainWaveform {
-                start_ch,
-                visible_count,
-                ..
-            } => format!("Waveform  CH{}–{}", start_ch, start_ch + visible_count).into(),
+            TileKind::MainWaveform { start_ch, .. } => {
+                // The main tile renders self.display.visible_channels, not its own
+                // (never-updated) visible_count field, so derive the title from
+                // the live setting to avoid a stale channel range (L9).
+                let vis = self.display.visible_channels;
+                format!("Waveform  CH{}–{}", start_ch, start_ch + vis).into()
+            }
             TileKind::LfpView {
                 start_ch,
                 visible_count,
@@ -554,6 +553,14 @@ impl<'a> KvTileBehavior<'a> {
             self.sweep_start_ms
         };
 
+        // The user's spike-threshold overlay is only meaningful on the AP/spike
+        // band. Suppress it on the LFP (LP 250 Hz) band, which cannot contain
+        // spikes, so no phantom threshold lines / counts are drawn there (L7).
+        let mut band_filters = *self.filters;
+        if !label.contains("AP") {
+            band_filters.spike_threshold_enabled = false;
+        }
+
         // Override visible_channels with this tile's visible_count for the
         // draw call, then restore it. Temporarily mutating the shared settings
         // avoids cloning the whole struct (two Vecs) every frame per tile.
@@ -565,7 +572,7 @@ impl<'a> KvTileBehavior<'a> {
             self.latest_block,
             *start_ch,
             self.display,
-            self.filters,
+            &band_filters,
             sweep_left_ms,
             self.empty_hint,
         );
@@ -596,6 +603,13 @@ impl<'a> KvTileBehavior<'a> {
     ) {
         let total_ch = self.snippet_store.channel_count();
         let tile_salt = tile_id.0 as usize;
+
+        // Drop any previously-selected channels that no longer exist (e.g. after
+        // switching to a source with fewer channels) so we never render a stale
+        // channel's snippets under an out-of-range CHn label (M7).
+        if total_ch > 0 {
+            channels.retain(|c| c.ch < total_ch);
+        }
 
         // ── Config strip ─────────────────────────────────────────────
         // Read current store values into locals so we can borrow snippet_store
@@ -789,9 +803,9 @@ fn draw_perf_overlay_in_rect(
 // ── Tree construction helper ─────────────────────────────────────────
 
 /// Create the initial tree with a single main waveform pane.
-pub fn make_initial_tree(visible_channels: usize) -> egui_tiles::Tree<TileKind> {
+pub fn make_initial_tree() -> egui_tiles::Tree<TileKind> {
     let mut tiles = egui_tiles::Tiles::default();
-    let main_id = tiles.insert_pane(TileKind::new_main(visible_channels));
+    let main_id = tiles.insert_pane(TileKind::new_main());
     let root = tiles.insert_tab_tile(vec![main_id]);
     egui_tiles::Tree::new("kv_tiles", root, tiles)
 }

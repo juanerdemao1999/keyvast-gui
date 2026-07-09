@@ -12,14 +12,21 @@
 //! - Data comes from `DisplayRing`: pre-decimated at ingestion time.
 //! - Render reads O(output_points) with no block-history iteration.
 //! - `show_x` / `show_y` disabled to skip egui_plot's O(N) hover search.
-//! - Zero-reference lines drawn via painter (no extra Line object allocations).
-//! - `.points` moved (not cloned) into Line to eliminate per-frame alloc.
+//! - Zero-reference / grid lines are thin two-point egui_plot Lines (one per
+//!   channel per frame — negligible next to trace tessellation).
+//! - Each channel is a **density-graded min/max envelope** (Open Ephys style):
+//!   `collect_channel_band` returns per-column min / max / mean, drawn in screen
+//!   space as a triangle-strip mesh with a solid colour core around the mean
+//!   fading to faint at the extremes. A thin trace stays flat/uniform; a wide
+//!   timebase (many samples/pixel) shows structure instead of a solid block.
+//!   (A screen-space mesh is used because egui_plot's `Polygon` fills via
+//!   `convex_polygon`, which mis-fills a concave spiky band.)
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 use kv_types::SampleBlock;
 
-use crate::disp_ring::{DisplayRing, RING_DWNSP};
+use crate::disp_ring::{ChannelBand, DisplayRing};
 use crate::panels::{DisplaySettings, FilterSettings};
 use crate::theme;
 
@@ -44,7 +51,9 @@ struct ChannelTrace {
     /// Slot position in the display stack (0 = top lane, 1 = next, …).
     /// Used for Y-axis offset; independent of the physical channel number.
     display_pos: usize,
-    points: Vec<[f64; 2]>,
+    /// Finalized min/max envelope (plot coords), drawn as a filled triangle-strip
+    /// mesh between the max and min lines in screen space after the plot renders.
+    band: ChannelBand,
     /// RMS sigma in normalized-input units (only set when threshold is enabled).
     sigma: Option<f64>,
     /// Negative-going threshold crossings within the window.
@@ -122,10 +131,14 @@ pub fn draw_waveform_area(
     // Uses the default lane height as the reference (like Intan RHX where
     // amplitude scale and channel spacing are independent controls).
     //
-    // The ring stores values normalized to [-1, 1] (i16 / 32767).  A norm
-    // value of 1.0 corresponds to RHD_FULL_SCALE_UV microvolts.  We want
-    // amp_scale µV to fill one lane (= 3 * DEFAULT_CHANNEL_SPACING Y-units).
-    let gain = DEFAULT_CHANNEL_SPACING * 3.0 * (RHD_FULL_SCALE_UV / amp_scale.max(1.0));
+    // The ring stores values normalized to [-1, 1] (i16 / 32767).  A norm value
+    // of 1.0 corresponds to RHD_FULL_SCALE_UV microvolts.  amp_scale µV maps to
+    // DEFAULT_CHANNEL_SPACING Y-units (≈ 0.73 of a default lane), so a signal
+    // smaller than amp_scale sits well within its lane with black gaps between
+    // channels — the amplitude headroom that keeps a busy display from becoming a
+    // wall of solid colour (Open Ephys ties amplitude to the channel height the
+    // same way; ±50% of range = the lane edge).
+    let gain = DEFAULT_CHANNEL_SPACING * (RHD_FULL_SCALE_UV / amp_scale.max(1.0));
 
     // Sweep-mode window: FIXED bounds for the duration of this sweep.
     // The cursor (ring.latest_time_ms) sweeps from x_left to x_right.
@@ -139,16 +152,7 @@ pub fn draw_waveform_area(
     // Collect display data from the pre-computed ring buffer.
     // Data is already filtered (ring is fed from the filtered pipeline).
     let traces = collect_from_ring(
-        ring,
-        settings,
-        filters,
-        start_ch,
-        visible,
-        block.sample_rate,
-        x_left,
-        x_right,
-        gain,
-        ch_spacing,
+        ring, settings, filters, start_ch, visible, x_left, x_right, gain, ch_spacing,
     );
 
     // Y axis bounds
@@ -256,9 +260,8 @@ pub fn draw_waveform_area(
         Vec::new()
     };
 
-    // Draw zero-reference lines using the painter (screen-space) to avoid
-    // creating a Line object + Vec allocation per channel.
-    // These are drawn BEFORE the plot so they appear behind traces.
+    // Zero-reference lines are drawn inside the plot closure below (plot-space,
+    // behind the traces) as thin two-point egui_plot Lines — one per channel.
 
     let response = plot.show(ui, |plot_ui| {
         // Lock to exact bounds — X from wall clock, Y from channel layout
@@ -362,36 +365,93 @@ pub fn draw_waveform_area(
             );
         }
 
-        // Draw waveform traces — highlight hovered channel.
-        // Points are MOVED (not cloned) into Line to avoid per-channel alloc.
-        for trace in traces {
+        // Waveform traces are drawn AFTER the plot (in screen space) — egui_plot's
+        // Polygon fills via convex_polygon, which mis-fills a concave min/max band
+        // (deep spikes produce phantom triangles). See the mesh block below.
+        hovered_ch
+    });
+
+    // Draw each channel as a min/max envelope with a **density-graded** fill: a
+    // solid same-colour core of fixed pixel half-width `CORE_PX` centred on the
+    // per-column mean (where the signal actually dwells), fading to near-
+    // transparent at the min/max extremes. This is a mesh port of Open Ephys's
+    // intensity ("supersampled") shading. The key property: when the band is
+    // thinner than the core (a clean trace at a narrow timebase) the whole band
+    // is inside the solid core → a flat uniform colour with NO visible gradient;
+    // only when a wide timebase packs many samples per pixel and the envelope
+    // grows tall does the bright-core/faint-edge structure appear, so a busy
+    // signal reads as a trace with a soft envelope instead of a solid block.
+    // A mean-line stroke keeps a continuous ≥1 px trace. Screen-space triangle
+    // strip fills the concave band correctly; one mesh per channel, clipped.
+    {
+        const CORE_PX: f32 = 1.6; // solid-core half-height in pixels
+        let transform = &response.transform;
+        let painter = ui.painter_at(*transform.frame());
+        let hovered_ch = response.inner;
+        for trace in &traces {
+            let band = &trace.band;
+            let n = band.t.len();
+            if n < 2 {
+                continue;
+            }
             let base_color = if settings.color_by_group {
                 settings.channel_color(trace.channel)
             } else {
                 theme::channel_color(trace.channel)
             };
             let is_hovered = hovered_ch == Some(trace.channel);
-            // Default: all channels always at full brightness (1.3× base color).
-            // Hover highlight mode (settings.hover_highlight) must be ON for
-            // dimming to activate — matches professional tool conventions where
-            // the waveform display is always fully lit until user requests focus.
-            let (color, width) = if settings.hover_highlight && is_hovered {
-                (egui::Color32::WHITE, 2.0_f32)
+            let line_color = if settings.hover_highlight && is_hovered {
+                egui::Color32::WHITE
             } else if settings.hover_highlight && hovered_ch.is_some() {
-                (dim_color(base_color, 0.35), 1.0_f32)
+                dim_color(base_color, 0.35)
             } else {
-                (brighten_color(base_color, 1.3), 1.5_f32)
+                brighten_color(base_color, 1.3)
             };
-            plot_ui.line(
-                Line::new(PlotPoints::from(trace.points))
-                    .color(color)
-                    .width(width)
-                    .name(""),
-            );
-        }
+            let (r, g, b) = (line_color.r(), line_color.g(), line_color.b());
+            let core_a: u8 = if is_hovered { 235 } else { 200 };
+            let core = egui::Color32::from_rgba_unmultiplied(r, g, b, core_a);
+            let edge = egui::Color32::from_rgba_unmultiplied(r, g, b, 14);
+            let mean_stroke = egui::Stroke::new(if is_hovered { 1.3 } else { 1.0 }, core);
 
-        hovered_ch
-    });
+            let pt =
+                |t: f64, y: f64| transform.position_from_point(&egui_plot::PlotPoint::new(t, y));
+            let mut mesh = egui::epaint::Mesh::default();
+            let mut mean_pts: Vec<egui::Pos2> = Vec::with_capacity(n);
+            for k in 0..n {
+                // Screen y grows downward, so max is the smaller y (top).
+                let top_y = pt(band.t[k], band.max[k]).y;
+                let bot_y = pt(band.t[k], band.min[k]).y;
+                let md = pt(band.t[k], band.mean[k]);
+                let x = md.x;
+                // Solid core clamped inside [top_y, bot_y]; collapses to the whole
+                // band when the band is thinner than the core (→ flat fill).
+                let ct = (md.y - CORE_PX).max(top_y);
+                let cb = (md.y + CORE_PX).min(bot_y);
+                mesh.colored_vertex(egui::pos2(x, top_y), edge);
+                mesh.colored_vertex(egui::pos2(x, ct), core);
+                mesh.colored_vertex(egui::pos2(x, cb), core);
+                mesh.colored_vertex(egui::pos2(x, bot_y), edge);
+                mean_pts.push(md);
+                if k > 0 {
+                    let a = (4 * (k - 1)) as u32;
+                    let b = (4 * k) as u32;
+                    // top→core-top (faint→solid)
+                    mesh.add_triangle(a, a + 1, b);
+                    mesh.add_triangle(a + 1, b, b + 1);
+                    // solid core
+                    mesh.add_triangle(a + 1, a + 2, b + 1);
+                    mesh.add_triangle(a + 2, b + 1, b + 2);
+                    // core-bottom→bot (solid→faint)
+                    mesh.add_triangle(a + 2, a + 3, b + 2);
+                    mesh.add_triangle(a + 3, b + 2, b + 3);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+            // Crisp trace along the mean — continuous ≥1 px even where the band is
+            // sub-pixel thin, and marks where the signal spends its time.
+            painter.add(egui::Shape::line(mean_pts, mean_stroke));
+        }
+    }
 
     // Spike-count badges on the right edge of each lane (overlay painted in screen space).
     // Y position uses display_pos, not physical channel.
@@ -453,15 +513,14 @@ pub fn draw_waveform_area(
         let time_at_cursor = plot_val.x;
 
         // Reverse the gain/offset transform to recover amplitude in µV.
-        // finalize_channel applies: y_plot = value_norm * gain + y_offset
-        // where y_offset = -(ch * ch_spacing).
-        // Scale bar definition: DEFAULT_CHANNEL_SPACING Y-units = amp_scale/3 µV
-        // → 1 Y-unit = amp_scale / (3 * DEFAULT_CHANNEL_SPACING) µV
+        // finalize applies: y_plot = value_norm * gain + y_offset, gain =
+        // DEFAULT_CHANNEL_SPACING * FULL_SCALE / amp_scale, so
+        // µV = delta_y * amp_scale / DEFAULT_CHANNEL_SPACING.
         // hovered_ch is the physical channel; display_pos = physical_ch - start_ch.
         let disp_pos = hovered_ch.saturating_sub(start_ch);
         let y_baseline = -(disp_pos as f64) * ch_spacing;
         let delta_y = plot_val.y - y_baseline;
-        let amp_uv = delta_y * amp_scale / (3.0 * DEFAULT_CHANNEL_SPACING);
+        let amp_uv = delta_y * amp_scale / DEFAULT_CHANNEL_SPACING;
         let amp_str = if amp_uv.abs() >= 1000.0 {
             format!("{:+.2} mV", amp_uv / 1000.0)
         } else {
@@ -534,11 +593,10 @@ fn draw_scale_bar(
     let painter = ui.painter();
     let plot_rect = response.response.rect;
 
-    // The scale bar shows the amp_scale setting as a visual reference.
-    // gain maps amp_scale µV to one full lane (3 * DEFAULT_CHANNEL_SPACING Y-units).
-    // Show 1/3 of the lane = amp_scale/3 µV:
+    // gain maps amp_scale µV to DEFAULT_CHANNEL_SPACING Y-units, so a bar that
+    // tall reads exactly amp_scale µV.
     let bar_y_units = DEFAULT_CHANNEL_SPACING;
-    let bar_voltage_uv = amp_scale_uv / 3.0;
+    let bar_voltage_uv = amp_scale_uv;
 
     // Convert bar height from plot Y-units to screen pixels using the transform
     let top_point = egui_plot::PlotPoint::new(0.0, 0.0);
@@ -657,7 +715,6 @@ fn collect_from_ring(
     filters: &FilterSettings,
     start_ch: usize,
     visible: usize,
-    sample_rate: f64,
     t_left_ms: f64,
     t_right_ms: f64,
     gain: f64,
@@ -680,61 +737,22 @@ fn collect_from_ring(
             continue;
         }
 
-        // Read display-ready points from the ring using the PHYSICAL channel index.
-        // Peak-hold rings (AP band) use the envelope variant so narrow spikes
-        // are not skipped by decimation (#4b).
-        let mut pts = if ring.peak_hold {
-            ring.collect_channel_minmax(
-                phys_ch,
-                t_left_ms,
-                t_right_ms,
-                MAX_DISPLAY_POINTS,
-                window_ring_entries,
-            )
-        } else {
-            ring.collect_channel(
-                phys_ch,
-                t_left_ms,
-                t_right_ms,
-                MAX_DISPLAY_POINTS,
-                window_ring_entries,
-            )
-        };
-
-        // Spike detection on the pre-finalize (un-offset, un-gained) values.
-        let (sigma, spike_count) = if filters.spike_threshold_enabled && !pts.is_empty() {
-            let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-            let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / pts.len() as f64;
-            let sig = var.sqrt();
-            let thresh = -filters.spike_threshold_sigma * sig;
-            let ring_sr = sample_rate / RING_DWNSP as f64;
-            let refractory = (ring_sr * 0.001).max(1.0) as usize;
-            let mut count = 0u32;
-            let mut last_cross: Option<usize> = None;
-            let mut prev = 0.0_f64;
-            for (i, p) in pts.iter().enumerate() {
-                let centered = p[1] - mean;
-                if i > 0
-                    && prev >= thresh
-                    && centered < thresh
-                    && last_cross.is_none_or(|l| i - l >= refractory)
-                {
-                    count = count.saturating_add(1);
-                    last_cross = Some(i);
-                }
-                prev = centered;
-            }
-            (Some(sig), count)
-        } else {
-            (None, 0)
-        };
-
-        // finalize_channel applies Y-offset using DISPLAY position (not physical channel).
-        finalize_channel(&mut pts, disp_pos, gain, ch_spacing);
+        // Open-Ephys / Intan-RHX style min/max envelope for this column set.
+        let mut band = ring.collect_channel_band(
+            phys_ch,
+            t_left_ms,
+            t_right_ms,
+            MAX_DISPLAY_POINTS,
+            window_ring_entries,
+        );
+        // Spike detection on the un-offset min (most-negative) envelope.
+        let (sigma, spike_count) = detect_neg_spikes_band(&band, filters);
+        // DC-remove + gain + display-position offset applied to the envelope.
+        finalize_band(&mut band, disp_pos, gain, ch_spacing);
         traces.push(ChannelTrace {
             channel: phys_ch,
             display_pos: disp_pos,
-            points: pts,
+            band,
             sigma,
             spike_count,
         });
@@ -742,15 +760,128 @@ fn collect_from_ring(
     traces
 }
 
-/// DC-remove + apply gain + per-channel vertical offset.  Mutates in place.
-fn finalize_channel(pts: &mut [[f64; 2]], ch: usize, gain: f64, ch_spacing: f64) {
-    if pts.is_empty() {
+/// DC-remove + apply gain + per-channel vertical offset to the min/max/mean band.
+fn finalize_band(band: &mut ChannelBand, disp_pos: usize, gain: f64, ch_spacing: f64) {
+    let n = band.min.len();
+    if n == 0 {
         return;
     }
-    let mean = pts.iter().map(|p| p[1]).sum::<f64>() / pts.len() as f64;
-    let y_offset = -(ch as f64) * ch_spacing;
-    for p in pts.iter_mut() {
-        p[1] = (p[1] - mean) * gain + y_offset;
+    // DC baseline: mean of the column midlines, so the band sits centred on its lane.
+    let baseline = band
+        .min
+        .iter()
+        .zip(&band.max)
+        .map(|(lo, hi)| (lo + hi) * 0.5)
+        .sum::<f64>()
+        / n as f64;
+    let y_off = -(disp_pos as f64) * ch_spacing;
+    // Allow a large transient to bleed up to ~2 lanes (Open Ephys' default
+    // overlap factor) before clipping, instead of hard-flattening at the lane
+    // edge — flattening turns a saturated signal into a featureless block.
+    let clip = ch_spacing * 2.0;
+    let (lo, hi) = (y_off - clip, y_off + clip);
+    for k in 0..n {
+        band.min[k] = ((band.min[k] - baseline) * gain + y_off).clamp(lo, hi);
+        band.max[k] = ((band.max[k] - baseline) * gain + y_off).clamp(lo, hi);
+        band.mean[k] = ((band.mean[k] - baseline) * gain + y_off).clamp(lo, hi);
+    }
+}
+
+/// Spike detection on the min (most-negative) envelope of a band. Builds the
+/// `(time, value)` series the shared detector expects (only when enabled, so the
+/// extra allocation is off the default path).
+fn detect_neg_spikes_band(band: &ChannelBand, filters: &FilterSettings) -> (Option<f64>, u32) {
+    if !filters.spike_threshold_enabled || band.is_empty() {
+        return (None, 0);
+    }
+    let pts: Vec<[f64; 2]> = band
+        .t
+        .iter()
+        .zip(&band.min)
+        .map(|(&t, &v)| [t, v])
+        .collect();
+    detect_neg_spikes(&pts, filters)
+}
+
+/// Real-time refractory window (ms) between counted negative crossings.
+const SPIKE_REFRACTORY_MS: f64 = 1.0;
+
+/// Count negative-going threshold crossings (below `mean - N*sigma`) in a series
+/// of `(time_ms, value)` points, with a 1 ms **time-based** refractory window.
+/// Returns `(sigma, count)`; `sigma` is `None` when detection is disabled or the
+/// series is empty.
+///
+/// Two properties make this robust to the display pipeline:
+/// - The noise scale is the median absolute deviation (MAD/0.6745, Quiroga 2004)
+///   rather than the standard deviation, so large spikes — and the peak-hold
+///   magnitude bias of the decimated points — do not inflate the threshold the
+///   way variance does.
+/// - The refractory is expressed in real time via each point's timestamp, so it
+///   stays ~1 ms regardless of the display window width / render decimation
+///   (the old index-based refractory grew with the time window).
+///
+/// The count is still a coarse per-window indicator: peak-hold render
+/// decimation merges spikes closer than one render bucket, so very high firing
+/// rates at wide windows read low. It is a display aid, not a spike sorter.
+fn detect_neg_spikes(pts: &[[f64; 2]], filters: &FilterSettings) -> (Option<f64>, u32) {
+    if !filters.spike_threshold_enabled || pts.is_empty() {
+        return (None, 0);
+    }
+    let n = pts.len();
+    let mean = pts.iter().map(|p| p[1]).sum::<f64>() / n as f64;
+
+    // Robust noise scale: MAD around the median, scaled to an equivalent sigma.
+    let mut vals: Vec<f64> = pts.iter().map(|p| p[1]).collect();
+    let med = median(&mut vals);
+    for v in vals.iter_mut() {
+        *v = (*v - med).abs();
+    }
+    let mad = median(&mut vals);
+    // mad ≥ 0 (median of magnitudes) and var.sqrt() ≥ 0, so `<= 0.0` (not a
+    // negated `>`) cleanly catches the degenerate/flat cases.
+    let mut sigma = mad / 0.6745;
+    if sigma <= 0.0 {
+        // Degenerate window (flat/constant) — fall back to the std deviation.
+        let var = pts.iter().map(|p| (p[1] - mean).powi(2)).sum::<f64>() / n as f64;
+        sigma = var.sqrt();
+    }
+    if sigma <= 0.0 {
+        return (Some(0.0), 0);
+    }
+
+    // Threshold in mean-centered coordinates so it aligns with the mean-centered
+    // trace drawn by finalize_channel and the drawn threshold line.
+    let thresh = -filters.spike_threshold_sigma * sigma;
+    let mut count = 0u32;
+    let mut last_cross_t: Option<f64> = None;
+    let mut prev = pts[0][1] - mean;
+    for p in pts.iter().skip(1) {
+        let t = p[0];
+        let centered = p[1] - mean;
+        if prev >= thresh
+            && centered < thresh
+            && last_cross_t.is_none_or(|lt| t - lt >= SPIKE_REFRACTORY_MS)
+        {
+            count = count.saturating_add(1);
+            last_cross_t = Some(t);
+        }
+        prev = centered;
+    }
+    (Some(sigma), count)
+}
+
+/// Median of `vals`, computed in place (partial-sorts the slice). Returns 0.0
+/// for an empty slice.
+fn median(vals: &mut [f64]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = vals.len() / 2;
+    if vals.len() % 2 == 1 {
+        vals[mid]
+    } else {
+        (vals[mid - 1] + vals[mid]) / 2.0
     }
 }
 
@@ -776,4 +907,73 @@ fn draw_empty_state(ui: &mut egui::Ui, hint: &str) {
         egui::FontId::proportional(11.0),
         theme::TEXT_DIM,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panels::FilterSettings;
+
+    fn spike_filters(sigma: f64) -> FilterSettings {
+        FilterSettings {
+            spike_threshold_enabled: true,
+            spike_threshold_sigma: sigma,
+            ..FilterSettings::default()
+        }
+    }
+
+    /// Baseline of tiny alternating noise at `dt_ms` spacing (in `(t_ms, value)`
+    /// points), with deep negative spikes injected at the given times (ms).
+    fn series(dt_ms: f64, n: usize, spikes_ms: &[f64]) -> Vec<[f64; 2]> {
+        let mut pts: Vec<[f64; 2]> = (0..n)
+            .map(|i| {
+                let v = if i % 2 == 0 { 0.005 } else { -0.005 };
+                [i as f64 * dt_ms, v]
+            })
+            .collect();
+        for &st in spikes_ms {
+            let idx = (st / dt_ms).round() as usize;
+            if idx < pts.len() {
+                pts[idx][1] = -1.0;
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn refractory_suppresses_crossings_within_1ms() {
+        // Two spikes 0.5 ms apart → counted once (time-based refractory).
+        let pts = series(0.1, 60, &[2.0, 2.5]);
+        let (_, count) = detect_neg_spikes(&pts, &spike_filters(4.0));
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn refractory_allows_crossings_beyond_1ms() {
+        // Two spikes 2 ms apart → counted twice.
+        let pts = series(0.1, 60, &[2.0, 4.0]);
+        let (_, count) = detect_neg_spikes(&pts, &spike_filters(4.0));
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn count_is_independent_of_point_spacing() {
+        // The same two well-separated spikes at two different point spacings
+        // (narrow vs wide display window) must yield the same count — the old
+        // index-based refractory made this window-dependent.
+        let narrow = series(0.1, 60, &[2.0, 4.0]);
+        let wide = series(0.5, 60, &[10.0, 20.0]);
+        let (_, c_narrow) = detect_neg_spikes(&narrow, &spike_filters(4.0));
+        let (_, c_wide) = detect_neg_spikes(&wide, &spike_filters(4.0));
+        assert_eq!(c_narrow, 2);
+        assert_eq!(c_wide, 2);
+    }
+
+    #[test]
+    fn disabled_detection_returns_none() {
+        let pts = series(0.1, 60, &[2.0]);
+        let (sigma, count) = detect_neg_spikes(&pts, &FilterSettings::default());
+        assert!(sigma.is_none());
+        assert_eq!(count, 0);
+    }
 }

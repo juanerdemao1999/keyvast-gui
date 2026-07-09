@@ -638,6 +638,9 @@ pub struct StreamingRecorder {
     write_latencies_us: Vec<u64>,
     latency_sample_count: u64,
     sample_scratch: Vec<u8>,
+    /// Set once the embedded header has been written back, so an explicit
+    /// `finish()` and the `Drop` safety-net never finalize twice.
+    finalized: bool,
 }
 
 impl StreamingRecorder {
@@ -688,6 +691,7 @@ impl StreamingRecorder {
             write_latencies_us: Vec::with_capacity(LATENCY_RESERVOIR_CAP),
             latency_sample_count: 0,
             sample_scratch: Vec::new(),
+            finalized: false,
         })
     }
 
@@ -747,46 +751,46 @@ impl StreamingRecorder {
         Ok(())
     }
 
-    /// Flush raw data, write embedded JSON header, return summary.
+    /// Flush pending samples and overwrite the placeholder header in place with
+    /// the final embedded JSON metadata. Idempotent via the `finalized` flag so
+    /// both `finish()` and the `Drop` safety-net can call it.
     ///
-    /// Seeks back to byte 8 (after the magic) to overwrite the placeholder
-    /// header with the final metadata.  No separate `.json` file is created —
-    /// all information is self-contained in `recording.kvraw`.
-    pub fn finish(mut self) -> Result<StreamingRecordingSummary, RecorderError> {
-        // 1. Flush all pending sample data to disk
+    /// Uses `BufWriter::get_mut()` (a seekable `&mut File`) rather than
+    /// `into_inner()` so it works from `&mut self` — the header is written after
+    /// the buffered samples are flushed, so the internal writer position is not
+    /// used again.
+    fn finalize_header(&mut self) -> Result<(), RecorderError> {
+        if self.finalized {
+            return Ok(());
+        }
+        self.finalized = true;
+
+        // 1. Flush all pending sample data (appended after the 524-byte header).
         self.writer.flush().map_err(|source| RecorderError::Io {
             path: self.raw_path.clone(),
             source,
         })?;
 
-        // 2. Build the final JSON BEFORE moving out of self.writer.
-        //    (into_inner() partially moves self, so we can't borrow self after.)
+        // 2. Build the final JSON header.
         let metadata = self.streaming_metadata_json();
         let path = self.raw_path.clone();
+        let file = self.writer.get_mut();
 
-        // 3. Take the underlying File out of the BufWriter so we can seek.
-        let mut file = self.writer.into_inner().map_err(|e| RecorderError::Io {
-            path: path.clone(),
-            source: e.into_error(),
-        })?;
-
-        // 4. Seek back to byte 8 (right after the 8-byte magic)
+        // 3. Seek back to byte 8 (right after the 8-byte magic).
         file.seek(SeekFrom::Start(8))
             .map_err(|source| RecorderError::Io {
                 path: path.clone(),
                 source,
             })?;
 
-        // 5. Write json_len + padded json_block
+        // 4. Write json_len + padded json_block.
         let json_bytes = metadata.as_bytes();
         let json_len = json_bytes.len().min(KVRAW_JSON_RESERVED);
-
         file.write_all(&(json_len as u32).to_le_bytes())
             .map_err(|source| RecorderError::Io {
                 path: path.clone(),
                 source,
             })?;
-
         let mut json_block = [0u8; KVRAW_JSON_RESERVED];
         json_block[..json_len].copy_from_slice(&json_bytes[..json_len]);
         file.write_all(&json_block)
@@ -795,17 +799,26 @@ impl StreamingRecorder {
                 source,
             })?;
 
-        file.flush().map_err(|source| RecorderError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        file.flush()
+            .map_err(|source| RecorderError::Io { path, source })?;
+        Ok(())
+    }
 
+    /// Flush raw data, write embedded JSON header, return summary.
+    ///
+    /// Seeks back to byte 8 (after the magic) to overwrite the placeholder
+    /// header with the final metadata.  No separate `.json` file is created —
+    /// all information is self-contained in `recording.kvraw`.
+    pub fn finish(mut self) -> Result<StreamingRecordingSummary, RecorderError> {
+        self.finalize_header()?;
+
+        let path = self.raw_path.clone();
         let max_write_latency_us = self.write_latencies_us.iter().copied().max();
         let latency_distribution = LatencyDistribution::from_samples(&self.write_latencies_us);
 
         Ok(StreamingRecordingSummary {
             recording: RecordingSummary {
-                output_dir: self.output_dir,
+                output_dir: self.output_dir.clone(),
                 // Metadata is embedded in the kvraw file; metadata_path == raw_path
                 metadata_path: path.clone(),
                 raw_path: path,
@@ -921,6 +934,29 @@ impl StreamingRecorder {
                 .unwrap_or_else(|| "null".to_string()),
             self.written_samples
         )
+    }
+}
+
+impl Drop for StreamingRecorder {
+    /// Safety-net: if the recorder is dropped without an explicit `finish()`
+    /// (e.g. the app quits or a thread unwinds mid-recording), rewrite the
+    /// embedded header on a best-effort basis so the `.kvraw` is left as a valid
+    /// v2 file with `json_len > 0` instead of the zeroed placeholder that would
+    /// make it unreadable. Errors can only be logged from `drop`.
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        match self.finalize_header() {
+            Ok(()) => eprintln!(
+                "warning: StreamingRecorder dropped without finish(); header finalized on drop ({} blocks) at {}",
+                self.block_count,
+                self.raw_path.display()
+            ),
+            Err(e) => eprintln!(
+                "error: StreamingRecorder dropped without finish() and best-effort finalize failed: {e}"
+            ),
+        }
     }
 }
 

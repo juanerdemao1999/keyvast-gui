@@ -154,6 +154,15 @@ impl PlaybackManager {
 
     /// Advance the playback cursor and return a SampleBlock for display.
     /// Returns None if there's no more data or not playing.
+    ///
+    /// During continuous play this reads the **whole span** from the end of the
+    /// last emitted block up to the new cursor, so the display ring sees a
+    /// gapless, contiguous stream (the old version read only a fixed small block
+    /// ending at the cursor, which both skipped frames — the cursor advances
+    /// ~Fs/fps ≈ 500 frames per tick but a recorded block is 64–256 frames — and
+    /// produced forward-gapped blocks that froze the ring). On a seek/scrub or a
+    /// jump larger than the read cap it reads one block ending at the cursor and
+    /// lets the ring re-seed there.
     pub fn tick(&mut self) -> Option<SampleBlock> {
         let meta = self.metadata.as_ref()?;
         self.reader.as_ref()?;
@@ -185,18 +194,33 @@ impl PlaybackManager {
             return None;
         }
 
-        // Read up to one "block" of data (samples_per_channel or a reasonable chunk).
         let block_frames = if samples_per_channel > 0 {
             samples_per_channel
         } else {
             256
         };
-        let start = self.cursor_frame.saturating_sub(block_frames as u64);
-        let frames_to_read = ((self.cursor_frame - start) as usize)
-            .max(block_frames)
-            .min(MAX_DISPLAY_FRAMES);
+        let read_end = self.cursor_frame;
 
-        let block = self.read_block_at(start, frames_to_read)?;
+        // Choose the read span. A contiguous forward advance within the cap is
+        // read whole (gapless); anything else (first tick, backward seek, or a
+        // jump larger than the cap) reads a single block ending at the cursor
+        // (or the first `block_frames` at the very start of the file).
+        let (read_start, num_frames) = match self.last_emitted_frame {
+            Some(prev_end)
+                if read_end > prev_end && read_end - prev_end <= MAX_DISPLAY_FRAMES as u64 =>
+            {
+                (prev_end, (read_end - prev_end) as usize)
+            }
+            _ => {
+                let start = read_end.saturating_sub(block_frames as u64);
+                let n = (read_end - start).max(block_frames as u64) as usize;
+                (start, n)
+            }
+        };
+        if num_frames == 0 {
+            return None;
+        }
+        let block = self.read_block_at(read_start, num_frames)?;
         self.last_emitted_frame = Some(self.cursor_frame);
         Some(block)
     }
@@ -244,11 +268,13 @@ pub fn draw_playback_section(
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("PLAYBACK")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
-    .default_open(false)
+    // Open by default so the TOOLS tab shows content instead of a stack of
+    // collapsed headers (C23).
+    .default_open(true)
     .show(ui, |ui| {
         // File info / open button
         if let Some(ref path) = playback.file_path {

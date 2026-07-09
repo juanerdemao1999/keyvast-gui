@@ -110,10 +110,12 @@ fn rejects_in_frame_timestamp_gap() {
 }
 
 #[test]
-fn single_stream_round_trips_through_the_4_stream_filler_padding() {
-    // streams=1 exercises the `(4 - streams % 4) % 4 == 3` filler branch that a
-    // multiple-of-4 stream count never hits.
-    assert_eq!(words_per_frame(1).expect("valid stream count"), 54);
+fn single_stream_frame_is_52_words_with_one_filler_per_stream() {
+    // One filler word per enabled stream (Open Ephys per-stream block = 36 words):
+    // streams=1 -> 4 + 2 + 1*36 + 8 + 2 = 52. Verified against a live RHD2132,
+    // whose FPGA emits 52-word frames; the old `(4 - streams % 4) % 4 == 3` model
+    // wrongly expected 54 and underran the Rhythm FIFO.
+    assert_eq!(words_per_frame(1).expect("valid stream count"), 52);
 
     let config = test_config(1, 2);
     let raw = build_raw_block(&config, 10, 0x0003);
@@ -195,7 +197,8 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
             }
         }
 
-        for _ in 0..((4 - config.enabled_streams % 4) % 4) {
+        // One filler word per enabled stream (matches FrameLayout::filler_words).
+        for _ in 0..config.enabled_streams {
             raw.extend_from_slice(&0_u16.to_le_bytes());
         }
 

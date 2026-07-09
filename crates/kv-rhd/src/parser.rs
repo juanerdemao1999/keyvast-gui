@@ -92,8 +92,8 @@ pub fn parse_rhythm_data_block(
         }
         data.extend_from_slice(&frame_samples);
 
-        // Skip filler word(s) that pad the active stream count up to a multiple
-        // of 4 (see `FrameLayout::filler_words`).
+        // Skip the per-stream filler word(s): one padding word per enabled
+        // stream (see `FrameLayout::filler_words`).
         offset = offset.saturating_add(layout.filler_words() * 2);
 
         // Parse 8 board ADC channels.

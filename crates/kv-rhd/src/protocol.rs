@@ -239,7 +239,7 @@ pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
 ///
 /// Word order within a frame (each unit is one 16-bit word unless noted):
 /// `magic(4) | timestamp(2) | aux[aux_ch][stream] (3*streams) |
-///  amp[channel][stream] (32*streams) | filler | board_adc(8) | ttl_in(1) | ttl_out(1)`.
+///  amp[channel][stream] (32*streams) | filler(streams) | board_adc(8) | ttl_in(1) | ttl_out(1)`.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameLayout {
     enabled_streams: usize,
@@ -250,10 +250,21 @@ impl FrameLayout {
         Self { enabled_streams }
     }
 
-    /// 16-bit filler words that pad the active stream count up to a multiple of
-    /// 4: `(4 - streams % 4) % 4`, not `streams % 4`.
+    /// Per-stream filler: the Rhythm USB frame carries exactly one padding word
+    /// per enabled data stream. This mirrors the Open Ephys `Rhd2000DataBlock`
+    /// size model, where each stream block is `3 aux + 32 amplifier + 1 filler =
+    /// 36` words, so a frame is `4 + 2 + streams*36 + 8 + 2`. The total filler
+    /// therefore equals the enabled-stream count -- it is NOT a pad-to-multiple-
+    /// of-4.
+    ///
+    /// Verified against a live XEM7310 + RHD2132 (single stream): the FPGA emits
+    /// 52-word frames (filler 1). The previous `(4 - streams % 4) % 4` model
+    /// expected 54 and made `wait_for_fifo_words` block for samples the FPGA
+    /// never sends ("not enough words in Rhythm FIFO: needed 13824, available
+    /// 13312"). The two formulas agree at streams=2 (both 2), which is why this
+    /// stayed latent until a 1-stream headstage was attached.
     pub fn filler_words(&self) -> usize {
-        (4 - self.enabled_streams % 4) % 4
+        self.enabled_streams
     }
 
     /// Total number of 16-bit words in one frame.

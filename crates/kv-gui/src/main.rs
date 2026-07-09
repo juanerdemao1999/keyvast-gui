@@ -6,6 +6,9 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
+            // Floor wide enough for the single-row toolbar to lay out without
+            // clipping the right-aligned REC/LIVE status pill + clock (C6).
+            .with_min_inner_size([1100.0, 640.0])
             .with_title("Keyvast Acquisition"),
         ..Default::default()
     };

@@ -20,7 +20,11 @@ pub const BG_TOOLBAR: egui::Color32 = egui::Color32::from_rgb(22, 22, 28);
 
 pub const TEXT_PRIMARY: egui::Color32 = egui::Color32::from_rgb(210, 210, 220);
 pub const TEXT_SECONDARY: egui::Color32 = egui::Color32::from_rgb(140, 140, 155);
-pub const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(90, 90, 105);
+// Brightened so the most-used secondary/label color clears WCAG AA (~4.6:1 on
+// BG_PANEL) instead of the previous ~2.4:1 — it tints Disconnected/REC OFF and
+// every kv_label key, so at the old value the resting state was the least
+// readable text on screen (C13).
+pub const TEXT_DIM: egui::Color32 = egui::Color32::from_rgb(128, 128, 142);
 
 // ── Accent colors ───────────────────────────────────────────────────
 
@@ -63,8 +67,29 @@ pub const FONT_BODY: f32 = 10.0;
 pub const FONT_CAPTION: f32 = 9.0;
 /// Densest metrics / micro annotations.
 pub const FONT_MICRO: f32 = 9.0;
-/// Large numeric readouts (toolbar clock, transport button glyphs).
+/// Large numeric readouts (toolbar clock).
 pub const FONT_DISPLAY: f32 = 15.0;
+/// Product wordmark in the toolbar (the single largest text element).
+pub const FONT_BRAND: f32 = 16.0;
+/// Emphasized inline labels a step above body — at-a-glance status pill, error
+/// banners. Between BODY and DISPLAY so pills read as louder than a checkbox
+/// but quieter than the clock.
+pub const FONT_LABEL: f32 = 12.0;
+/// Transport button glyph text (Start / Stop / Record).
+pub const FONT_TRANSPORT: f32 = 14.0;
+
+// ── Corner radius scale ─────────────────────────────────────────────
+//
+// One named tier per widget class so the previous 3 / 4 / 5 px sprawl reads as
+// an intentional hierarchy: tight for inline widgets, rounder for buttons,
+// roundest for cards / toasts.
+
+/// Inline widgets (frames, recessed groups).
+pub const RADIUS_WIDGET: u8 = 3;
+/// Action buttons.
+pub const RADIUS_BUTTON: u8 = 4;
+/// Cards, toasts, transport buttons.
+pub const RADIUS_CARD: u8 = 5;
 
 /// Section heading `RichText`: bold, secondary color, heading size.
 pub fn heading(text: impl Into<String>) -> egui::RichText {
@@ -86,12 +111,25 @@ pub fn caption(text: impl Into<String>) -> egui::RichText {
         .color(TEXT_DIM)
 }
 
+// ── Error banner (single source) ────────────────────────────────────
+//
+// One fill/text pair shared by every error banner (device-open failure,
+// recorder failure) so "an error" reads as one consistent visual signal
+// instead of the previous two competing red treatments (C9).
+
+/// Error-banner background.
+pub const ERR_BANNER_BG: egui::Color32 = ACCENT_RED;
+/// Error-banner foreground text.
+pub const ERR_BANNER_TEXT: egui::Color32 = egui::Color32::WHITE;
+
 // ── Status indicator colors ─────────────────────────────────────────
 
 pub const STATUS_CONNECTED: egui::Color32 = ACCENT_GREEN;
 pub const STATUS_RECORDING: egui::Color32 = ACCENT_RED;
 pub const STATUS_ARMED: egui::Color32 = ACCENT_YELLOW;
-pub const STATUS_IDLE: egui::Color32 = egui::Color32::from_rgb(80, 80, 95);
+// Brightened to reach WCAG AA — this colors the default pre-acquisition state
+// (IDLE / Disconnected), which must stay legible in a dim recording room (C13).
+pub const STATUS_IDLE: egui::Color32 = egui::Color32::from_rgb(130, 130, 145);
 
 // ── Channel trace palette (32 distinct colors) ─────────────────────
 //
@@ -281,7 +319,7 @@ pub fn section_card<R>(
     let mut ret = None;
     egui::Frame::new()
         .fill(BG_DARK)
-        .corner_radius(egui::CornerRadius::same(5))
+        .corner_radius(egui::CornerRadius::same(RADIUS_CARD))
         .inner_margin(egui::Margin::symmetric(8, 6))
         .outer_margin(egui::Margin {
             bottom: 6,
@@ -364,7 +402,7 @@ pub fn tier_button(ui: &mut egui::Ui, label: &str, tier: BtnTier, enabled: bool)
     )
     .fill(bg)
     .stroke(egui::Stroke::new(1.0, stroke))
-    .corner_radius(egui::CornerRadius::same(4));
+    .corner_radius(egui::CornerRadius::same(RADIUS_BUTTON));
 
     ui.add(btn).clicked() && enabled
 }
@@ -407,16 +445,24 @@ pub fn transport_button(
 
     let btn = egui::Button::new(
         egui::RichText::new(label)
-            .size(14.0)
+            .size(FONT_TRANSPORT)
             .strong()
             .color(text_color),
     )
     .fill(bg)
     .stroke(egui::Stroke::new(1.0, bg))
     .min_size(egui::vec2(76.0, 30.0))
-    .corner_radius(egui::CornerRadius::same(5));
+    .corner_radius(egui::CornerRadius::same(RADIUS_CARD));
 
-    let clicked = ui.add(btn).clicked();
+    // A disabled transport button must not present as clickable: since we bypass
+    // `add_enabled`, egui still shows the pointing-hand cursor, so override it to
+    // NotAllowed so the affordance matches reality (C5).
+    let resp = ui.add(btn);
+    let clicked = if enabled {
+        resp.clicked()
+    } else {
+        resp.on_hover_cursor(egui::CursorIcon::NotAllowed).clicked()
+    };
     enabled && clicked
 }
 
@@ -461,16 +507,26 @@ pub fn transport_button_sized(
 
     let btn = egui::Button::new(
         egui::RichText::new(label)
-            .size(14.0)
+            .size(FONT_TRANSPORT)
             .strong()
             .color(text_color),
     )
     .fill(bg)
     .stroke(egui::Stroke::new(1.0, bg))
     .min_size(egui::vec2(min_width, 30.0))
-    .corner_radius(egui::CornerRadius::same(5));
+    .corner_radius(egui::CornerRadius::same(RADIUS_CARD));
 
-    let clicked = ui.add(btn).on_hover_text(tip).clicked();
+    // When enabled, surface the action + shortcut. When disabled, swap in a
+    // NotAllowed cursor and mark the tip as unavailable so the button no longer
+    // reads as a live action that simply does nothing on click (C5).
+    let resp = ui.add(btn);
+    let clicked = if enabled {
+        resp.on_hover_text(tip).clicked()
+    } else {
+        resp.on_hover_cursor(egui::CursorIcon::NotAllowed)
+            .on_hover_text(format!("{tip} \u{2014} unavailable"))
+            .clicked()
+    };
     enabled && clicked
 }
 

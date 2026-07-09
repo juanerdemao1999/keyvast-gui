@@ -136,7 +136,9 @@ impl Toasts {
         let mut dismissed: Option<usize> = None;
 
         egui::Area::new(egui::Id::new("kv_toast_area"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            // Offset below the ~44px top toolbar so a sticky error card never sits
+            // on top of the always-on REC/LIVE status pill and clock (C18).
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 48.0))
             .interactable(true)
             .show(ctx, |ui| {
                 ui.set_max_width(300.0);

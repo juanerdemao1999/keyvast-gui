@@ -624,7 +624,8 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
     const CHANNELS_PER_STREAM: usize = 32;
     const HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 
-    let filler = (4 - enabled_streams % 4) % 4;
+    // One filler word per enabled stream (matches FrameLayout::filler_words).
+    let filler = enabled_streams;
     let words_per_frame = 4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + filler + 8 + 2;
     let mut raw = Vec::with_capacity(block_count * SAMPLES_PER_BLOCK * words_per_frame * 2);
 
@@ -647,7 +648,7 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
                 }
             }
 
-            for _ in 0..((4 - enabled_streams % 4) % 4) {
+            for _ in 0..enabled_streams {
                 raw.extend_from_slice(&0_u16.to_le_bytes());
             }
             for _ in 0..8 {

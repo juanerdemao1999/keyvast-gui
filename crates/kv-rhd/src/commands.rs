@@ -190,7 +190,7 @@ impl Rhd2000Registers {
             weak_miso: 1,
             twos_comp: 0,
             abs_mode: 0,
-            dsp_en: 1,
+            dsp_en: 0,
             dsp_cutoff_freq: 0,
             zcheck_dac_power: 1,
             zcheck_load: 0,
@@ -216,10 +216,15 @@ impl Rhd2000Registers {
         };
         registers.define_sample_rate(sample_rate);
         registers.set_dsp_cutoff_freq(1.0);
-        // Match the Open Ephys RHD plugin reference (settings.xml HighCut=7500):
-        // a 10 kHz corner passes ~33% more wideband noise than OE's 7.5 kHz.
+        // Match the Open Ephys RHD plugin reference recording (Record Node settings.xml):
+        //   HighCut=7500 (nominal) -> ~7604 Hz actual, LowCut=0.0955 Hz, DSPOffset=0.
+        // The on-chip DSP high-pass (offset removal) is left OFF at configure time
+        // (enable_dsp(false) in rhythm_board), and the analog lower bandwidth is dropped
+        // to ~0.0955 Hz, so DC offset + <~4 Hz LFP are preserved exactly as OE records
+        // them. (set_dsp_cutoff_freq above is inert while DSP is disabled, mirroring OE
+        // which still carries a DSPCutoffFreq value with DSPOffset=0.)
         registers.set_upper_bandwidth(7_500.0);
-        registers.set_lower_bandwidth(1.0);
+        registers.set_lower_bandwidth(0.0955);
         registers
     }
 

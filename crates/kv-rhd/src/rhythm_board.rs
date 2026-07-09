@@ -394,7 +394,12 @@ impl RhythmFrontPanelBoard {
         self.select_aux_command_length(AuxCommandSlot::AuxCmd2, 0, temp_sensor.len() - 1)?;
         self.select_aux_command_bank_all_ports(AuxCommandSlot::AuxCmd2, 0)?;
 
-        registers.enable_dsp(true);
+        // Match the Open Ephys reference recording (settings.xml DSPOffset=0): leave the
+        // RHD on-chip DSP high-pass (offset removal) OFF so DC + <~4 Hz LFP pass through
+        // identically to OE. The residual amplifier DC offset stays within a few hundred
+        // counts of mid-scale (0x8000), well clear of the half-scale (0x4000) centering
+        // gate applied after the delay scan below, so that check is unaffected.
+        registers.enable_dsp(false);
         registers.enable_aux_inputs(true);
 
         let calibrating = registers

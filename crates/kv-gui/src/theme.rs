@@ -196,29 +196,29 @@ pub fn apply(ctx: &egui::Context) {
     v.extreme_bg_color = BG_DARKEST;
 
     v.widgets.noninteractive.bg_fill = BG_PANEL;
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_SECONDARY);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_SECONDARY);
     v.widgets.noninteractive.corner_radius = egui::CornerRadius::same(3);
 
     v.widgets.inactive.bg_fill = BG_WIDGET;
     v.widgets.inactive.weak_bg_fill = BG_WIDGET;
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, TEXT_PRIMARY);
     v.widgets.inactive.corner_radius = egui::CornerRadius::same(3);
 
     v.widgets.hovered.bg_fill = BG_HOVER;
     v.widgets.hovered.weak_bg_fill = BG_HOVER;
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     v.widgets.hovered.corner_radius = egui::CornerRadius::same(3);
 
     v.widgets.active.bg_fill = ACCENT_BLUE;
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
     v.widgets.active.corner_radius = egui::CornerRadius::same(3);
     // egui uses the `active` visuals for the keyboard-focused widget, so a
     // bright, slightly expanded border doubles as a visible focus ring (#16).
-    v.widgets.active.bg_stroke = egui::Stroke::new(2.0, ACCENT_CYAN);
+    v.widgets.active.bg_stroke = egui::Stroke::new(2.0_f32, ACCENT_CYAN);
     v.widgets.active.expansion = 1.0;
 
     v.selection.bg_fill = egui::Color32::from_rgba_premultiplied(70, 140, 255, 60);
-    v.selection.stroke = egui::Stroke::new(1.0, ACCENT_BLUE);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT_BLUE);
 
     // Spacing
     style.spacing.item_spacing = egui::vec2(6.0, 4.0);
@@ -363,7 +363,7 @@ pub fn tier_button(ui: &mut egui::Ui, label: &str, tier: BtnTier, enabled: bool)
             .color(text_color),
     )
     .fill(bg)
-    .stroke(egui::Stroke::new(1.0, stroke))
+    .stroke(egui::Stroke::new(1.0_f32, stroke))
     .corner_radius(egui::CornerRadius::same(4));
 
     ui.add(btn).clicked() && enabled
@@ -412,7 +412,7 @@ pub fn transport_button(
             .color(text_color),
     )
     .fill(bg)
-    .stroke(egui::Stroke::new(1.0, bg))
+    .stroke(egui::Stroke::new(1.0_f32, bg))
     .min_size(egui::vec2(76.0, 30.0))
     .corner_radius(egui::CornerRadius::same(5));
 
@@ -466,7 +466,7 @@ pub fn transport_button_sized(
             .color(text_color),
     )
     .fill(bg)
-    .stroke(egui::Stroke::new(1.0, bg))
+    .stroke(egui::Stroke::new(1.0_f32, bg))
     .min_size(egui::vec2(min_width, 30.0))
     .corner_radius(egui::CornerRadius::same(5));
 

@@ -286,7 +286,7 @@ pub fn draw_waveform_area(
                     [x_right, meta.thresh_y],
                 ]))
                 .color(theme::ACCENT_RED)
-                .width(0.8)
+                .width(0.8_f32)
                 .style(egui_plot::LineStyle::dashed_dense());
                 plot_ui.line(line);
             }
@@ -304,7 +304,7 @@ pub fn draw_waveform_area(
                 plot_ui.line(
                     Line::new(PlotPoints::from(vec![[x_left, y_off], [x_right, y_off]]))
                         .color(theme::GRID_ZERO_LINE)
-                        .width(0.5)
+                        .width(0.5_f32)
                         .name(""),
                 );
             }
@@ -321,7 +321,7 @@ pub fn draw_waveform_area(
                 plot_ui.line(
                     Line::new(PlotPoints::from(vec![[x, y_min], [x, y_max]]))
                         .color(egui::Color32::from_rgb(70, 70, 86))
-                        .width(1.0)
+                        .width(1.0_f32)
                         .name(""),
                 );
             }
@@ -357,7 +357,7 @@ pub fn draw_waveform_area(
                     [cursor_ms, y_max],
                 ]))
                 .color(egui::Color32::from_rgba_unmultiplied(220, 225, 235, 200))
-                .width(1.5)
+                .width(1.5_f32)
                 .name(""),
             );
         }
@@ -376,11 +376,11 @@ pub fn draw_waveform_area(
             // dimming to activate — matches professional tool conventions where
             // the waveform display is always fully lit until user requests focus.
             let (color, width) = if settings.hover_highlight && is_hovered {
-                (egui::Color32::WHITE, 2.0)
+                (egui::Color32::WHITE, 2.0_f32)
             } else if settings.hover_highlight && hovered_ch.is_some() {
-                (dim_color(base_color, 0.35), 1.0)
+                (dim_color(base_color, 0.35), 1.0_f32)
             } else {
-                (brighten_color(base_color, 1.3), 1.5)
+                (brighten_color(base_color, 1.3), 1.5_f32)
             };
             plot_ui.line(
                 Line::new(PlotPoints::from(trace.points))
@@ -479,7 +479,7 @@ pub fn draw_waveform_area(
         // Thin crosshair at the cursor (#8) — pairs with the readout pill so
         // the exact sample being inspected is unambiguous.
         let cross = egui::Stroke::new(
-            0.75,
+            0.75_f32,
             egui::Color32::from_rgba_unmultiplied(200, 200, 215, 90),
         );
         painter.line_segment(
@@ -560,7 +560,7 @@ fn draw_scale_bar(
 
     // Draw the vertical bar with small horizontal ticks at top and bottom
     let bar_color = theme::TEXT_PRIMARY;
-    let stroke = egui::Stroke::new(1.5, bar_color);
+    let stroke = egui::Stroke::new(1.5_f32, bar_color);
     let tick_w = 4.0;
 
     // Dark backing panel so the bar + label stay readable over busy waveforms.

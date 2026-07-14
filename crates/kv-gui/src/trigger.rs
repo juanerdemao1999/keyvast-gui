@@ -425,9 +425,9 @@ pub fn draw_ttl_monitor(ui: &mut egui::Ui, history: &TtlHistory, config: &Trigge
             plot_ui.line(
                 Line::new(PlotPoints::from(pts))
                     .color(line_color)
-                    .fill(0.0)
-                    .fill_alpha(0.18)
-                    .width(1.5),
+                    .fill(0.0_f32)
+                    .fill_alpha(0.18_f32)
+                    .width(1.5_f32),
             );
         });
 }

@@ -43,7 +43,7 @@ pub(crate) fn verify_chip_id_in_probe(raw: &[u8], enabled_streams: usize, sample
     }
 
     let layout = FrameLayout::new(enabled_streams);
-    let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
+    let pattern: [u8; 5] = *b"INTAN";
 
     for stream in 0..enabled_streams {
         let word_offset_in_frame = layout.auxcmd3_word_offset(stream);
@@ -201,7 +201,7 @@ pub(crate) fn probe_chip_id(
         }
         aux.push((u16::from_le_bytes([raw[off], raw[off + 1]]) & 0xff) as u8);
     }
-    let pattern: [u8; 5] = [b'I', b'N', b'T', b'A', b'N'];
+    let pattern: [u8; 5] = *b"INTAN";
     for k in 13..aux.len().saturating_sub(4) {
         if aux[k..k + 5] == pattern {
             return Some(aux[k - 13]);
@@ -296,7 +296,7 @@ mod tests {
         let streams = 1;
         let samples = 6;
         let mut block = blank_block(streams, samples);
-        for (s, b) in [b'I', b'N', b'T', b'A', b'N'].into_iter().enumerate() {
+        for (s, b) in (*b"INTAN").into_iter().enumerate() {
             // Low byte carries the AuxCmd3 result byte; high byte irrelevant.
             set_word(
                 &mut block,

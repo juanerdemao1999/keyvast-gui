@@ -217,7 +217,7 @@ fn draw_row_sparkline(
             egui::pos2(x, y)
         })
         .collect();
-    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, color)));
+    painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, color)));
 }
 
 // ── GUI drawing ─────────────────────────────────────────────────────

@@ -151,7 +151,7 @@ impl Toasts {
 
                     let frame_resp = egui::Frame::new()
                         .fill(theme::BG_PANEL)
-                        .stroke(egui::Stroke::new(1.0, accent))
+                        .stroke(egui::Stroke::new(1.0_f32, accent))
                         .corner_radius(egui::CornerRadius::same(5))
                         .inner_margin(egui::Margin::symmetric(8, 6))
                         .outer_margin(egui::Margin {

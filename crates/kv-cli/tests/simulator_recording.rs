@@ -11,6 +11,7 @@ use kv_cli::{
     run_directory_name_utc, run_rhd_smoke, run_simulator_pipeline, run_simulator_recording,
     run_simulator_stream,
 };
+use kv_rhd::FrameLayout;
 use kv_types::{DEFAULT_CHANNEL_COUNT, DEFAULT_SAMPLE_RATE, DEFAULT_SAMPLES_PER_PACKET};
 
 #[test]
@@ -624,8 +625,20 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
     const CHANNELS_PER_STREAM: usize = 32;
     const HEADER_MAGIC: u64 = 0xd7a2_2aaa_3813_2a53;
 
-    let filler = (4 - enabled_streams % 4) % 4;
-    let words_per_frame = 4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + filler + 8 + 2;
+    // Derive the frame layout from the library, NOT from a copy of the formula.
+    //
+    // This fixture used to hard-code `filler = (4 - streams % 4) % 4` — the same wrong
+    // formula the parser used — so it built frames of exactly the size the parser
+    // expected, and the test passed while a real headstage could not record. A fixture
+    // that re-derives the contract tests the code against itself. There must be exactly
+    // one definition of the frame layout, and the test must be a CONSUMER of it.
+    let layout = FrameLayout::new(enabled_streams);
+    let filler = layout.filler_words();
+    let words_per_frame = layout.words_per_frame();
+    debug_assert_eq!(
+        words_per_frame,
+        4 + 2 + enabled_streams * (CHANNELS_PER_STREAM + 3) + filler + 8 + 2
+    );
     let mut raw = Vec::with_capacity(block_count * SAMPLES_PER_BLOCK * words_per_frame * 2);
 
     for block in 0..block_count {
@@ -647,7 +660,7 @@ fn build_rhd_raw_blocks(block_count: usize, enabled_streams: usize) -> Vec<u8> {
                 }
             }
 
-            for _ in 0..((4 - enabled_streams % 4) % 4) {
+            for _ in 0..filler {
                 raw.extend_from_slice(&0_u16.to_le_bytes());
             }
             for _ in 0..8 {

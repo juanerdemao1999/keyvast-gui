@@ -402,9 +402,9 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         plot_ui.line(
             Line::new(PlotPoints::from(points))
                 .color(color)
-                .width(1.5)
+                .width(1.5_f32)
                 .fill(y_lo as f32)
-                .fill_alpha(0.12)
+                .fill_alpha(0.12_f32)
                 .name(format!("CH{ch} PSD")),
         );
 
@@ -414,7 +414,7 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
                 plot_ui.line(
                     Line::new(PlotPoints::from(vec![[freq, y_lo], [freq, y_hi]]))
                         .color(egui::Color32::from_rgba_unmultiplied(255, 100, 100, 40))
-                        .width(0.8)
+                        .width(0.8_f32)
                         .style(egui_plot::LineStyle::dashed_dense())
                         .name(format!("{freq} Hz")),
                 );
@@ -429,7 +429,7 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![[nyquist, y_lo], [nyquist, y_hi]]))
                     .color(egui::Color32::from_rgba_unmultiplied(200, 200, 0, 40))
-                    .width(0.8)
+                    .width(0.8_f32)
                     .style(egui_plot::LineStyle::dashed_dense())
                     .name("Nyquist"),
             );

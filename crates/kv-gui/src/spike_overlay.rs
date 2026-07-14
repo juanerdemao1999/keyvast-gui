@@ -478,7 +478,7 @@ pub fn draw_spike_overlay(
         plot_ui.line(
             Line::new(PlotPoints::from(vec![[0.0, y_min], [0.0, y_max]]))
                 .color(egui::Color32::from_rgba_unmultiplied(150, 150, 150, 60))
-                .width(1.0)
+                .width(1.0_f32)
                 .name(""),
         );
 
@@ -488,7 +488,7 @@ pub fn draw_spike_overlay(
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![[x_left, y_off], [x_right, y_off]]))
                     .color(theme::GRID_ZERO_LINE)
-                    .width(0.4)
+                    .width(0.4_f32)
                     .name(""),
             );
         }
@@ -502,7 +502,7 @@ pub fn draw_spike_overlay(
             plot_ui.line(
                 Line::new(PlotPoints::Borrowed(pts))
                     .color(color)
-                    .width(1.0)
+                    .width(1.0_f32)
                     .name(""),
             );
         }

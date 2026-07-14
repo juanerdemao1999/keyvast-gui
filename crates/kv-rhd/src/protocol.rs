@@ -239,7 +239,7 @@ pub fn stream_enable_mask(enabled_streams: usize) -> u32 {
 ///
 /// Word order within a frame (each unit is one 16-bit word unless noted):
 /// `magic(4) | timestamp(2) | aux[aux_ch][stream] (3*streams) |
-///  amp[channel][stream] (32*streams) | filler | board_adc(8) | ttl_in(1) | ttl_out(1)`.
+///  amp[channel][stream] (32*streams) | filler(streams) | board_adc(8) | ttl_in(1) | ttl_out(1)`.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameLayout {
     enabled_streams: usize,
@@ -250,10 +250,33 @@ impl FrameLayout {
         Self { enabled_streams }
     }
 
-    /// 16-bit filler words that pad the active stream count up to a multiple of
-    /// 4: `(4 - streams % 4) % 4`, not `streams % 4`.
+    /// Filler words padding the body to a multiple of 4: **`streams % 4`**.
+    ///
+    /// This is the gateware's contract, and it is Intan's:
+    /// `rhd2000datablockusb3.cpp:118` computes the frame as
+    /// `4 + 2 + streams*(32+3) + (streams % 4) + 8 + 2`, and our FPGA emits
+    /// `fillN = CountOne(streamEn)(1 downto 0)` (`RhdOkShim.scala:207`) — the low
+    /// two bits, i.e. `streams % 4`. Measured on a live XEM7310 + RHD2132: the
+    /// frame stride is exactly 52 words at 1 stream.
+    ///
+    /// Three formulas have shipped, and each is wrong somewhere. Pinned by
+    /// `filler_matches_gateway_contract` below so this cannot drift again:
+    ///
+    /// | streams | `% 4` (correct) | `(4 - s%4) % 4` | `s` (per-stream) |
+    /// |---------|-----------------|-----------------|------------------|
+    /// | 1       | **1**           | 3  ✗            | 1                |
+    /// | 2       | **2**           | 2               | 2                |
+    /// | 3       | **3**           | 1  ✗            | 3                |
+    /// | 4       | **0**           | 0               | 4  ✗             |
+    /// | 8       | **0**           | 0               | 8  ✗             |
+    ///
+    /// They all agree at 2 streams, which is why both wrong versions stayed
+    /// latent: `(4 - s%4) % 4` broke the single-headstage case (expected 54-word
+    /// frames, FPGA sends 52 -> "needed 13824, available 13312"), and the
+    /// per-stream model is correct at 1-3 streams but diverges at every multiple
+    /// of 4 (at 4 streams it expects 4 filler words where the FPGA emits none).
     pub fn filler_words(&self) -> usize {
-        (4 - self.enabled_streams % 4) % 4
+        self.enabled_streams % 4
     }
 
     /// Total number of 16-bit words in one frame.
@@ -319,4 +342,64 @@ pub fn raw_word_to_signed_count(word: u16) -> i16 {
 
 pub fn signed_count_to_microvolts(count: i16) -> f32 {
     count as f32 * RHD_AMPLIFIER_MICROVOLTS_PER_COUNT
+}
+
+#[cfg(test)]
+mod frame_contract_tests {
+    use super::*;
+
+    /// The canonical Rhythm frame size, from the two authorities that agree:
+    ///   * Intan  `rhd2000datablockusb3.cpp:118`
+    ///     `4 + 2 + streams*(CHANNELS_PER_STREAM + 3) + (streams % 4) + 8 + 2`
+    ///   * KeyVast gateware `RhdOkShim.scala:207,293`
+    ///     `fillN = CountOne(streamEn)(1 downto 0)`  (= streams % 4)
+    ///
+    /// Hardware-measured: 52-word frames at 1 stream (XEM7310 + RHD2132).
+    fn canonical_words_per_frame(streams: usize) -> usize {
+        4 + 2
+            + streams * (CHANNELS_PER_STREAM + AUX_CHANNELS_PER_STREAM)
+            + (streams % 4)
+            + BOARD_ADC_CHANNELS
+            + 2
+    }
+
+    /// The host's frame arithmetic MUST equal the gateware's, at every stream
+    /// count the gateware can emit — not just the ones we ship today.
+    ///
+    /// This is the regression that three separate implementations failed. The
+    /// parser demands the magic and a monotonic timestamp on EVERY sample, so a
+    /// frame-size mismatch is not graceful degradation: it hard-fails on the
+    /// first frame. Do not relax this test to the supported range; the whole
+    /// point is that it catches drift BEFORE a wider headstage config is enabled.
+    #[test]
+    fn filler_matches_gateware_contract() {
+        for streams in 1..=32 {
+            let layout = FrameLayout::new(streams);
+            assert_eq!(
+                layout.filler_words(),
+                streams % 4,
+                "filler at {streams} stream(s) must be `streams % 4` (gateware: fillN)"
+            );
+            assert_eq!(
+                layout.words_per_frame(),
+                canonical_words_per_frame(streams),
+                "words/frame at {streams} stream(s) disagrees with the gateware contract"
+            );
+        }
+    }
+
+    /// Spot-check the values that actually burned us, so a future refactor that
+    /// "simplifies" the formula has to confront them explicitly.
+    #[test]
+    fn known_frame_sizes() {
+        // 1 stream = one RHD2132 = the single-headstage case, measured on hardware.
+        assert_eq!(FrameLayout::new(1).words_per_frame(), 52);
+        // 2 streams: where all three wrong formulas coincidentally agree.
+        assert_eq!(FrameLayout::new(2).words_per_frame(), 88);
+        // 4 streams: filler is 0, NOT 4 — where the per-stream model breaks.
+        assert_eq!(FrameLayout::new(4).filler_words(), 0);
+        assert_eq!(FrameLayout::new(4).words_per_frame(), 156);
+        // 8 streams: filler 0 again.
+        assert_eq!(FrameLayout::new(8).words_per_frame(), 296);
+    }
 }

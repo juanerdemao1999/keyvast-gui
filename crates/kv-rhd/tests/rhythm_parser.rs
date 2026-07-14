@@ -1,5 +1,5 @@
 use kv_rhd::{
-    DEFAULT_RHD_SAMPLE_RATE, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT, RhythmDataConfig,
+    DEFAULT_RHD_SAMPLE_RATE, FrameLayout, RHD_AMPLIFIER_MICROVOLTS_PER_COUNT, RhythmDataConfig,
     RhythmParseError, bytes_per_block, parse_rhythm_data_block, raw_word_to_signed_count,
     signed_count_to_microvolts, words_per_frame,
 };
@@ -110,10 +110,14 @@ fn rejects_in_frame_timestamp_gap() {
 }
 
 #[test]
-fn single_stream_round_trips_through_the_4_stream_filler_padding() {
-    // streams=1 exercises the `(4 - streams % 4) % 4 == 3` filler branch that a
-    // multiple-of-4 stream count never hits.
-    assert_eq!(words_per_frame(1).expect("valid stream count"), 54);
+fn single_stream_round_trips_through_the_filler_padding() {
+    // A single stream is the single-headstage case (one RHD2132), and its filler is
+    // `1 % 4 == 1` -> a 52-word frame. This assertion previously read 54, locking in
+    // the wrong `(4 - streams % 4) % 4` formula: the test asserted the bug, so the bug
+    // could not be caught by the test. The FPGA emits 52 (measured on hardware; Intan
+    // `rhd2000datablockusb3.cpp:118` and gateware `RhdOkShim.scala:207` both say
+    // `streams % 4`).
+    assert_eq!(words_per_frame(1).expect("valid stream count"), 52);
 
     let config = test_config(1, 2);
     let raw = build_raw_block(&config, 10, 0x0003);
@@ -195,7 +199,10 @@ fn build_raw_block(config: &RhythmDataConfig, timestamp_start: u32, ttl_bits: u1
             }
         }
 
-        for _ in 0..((4 - config.enabled_streams % 4) % 4) {
+        // Derive the filler from the library. Re-deriving it here is what let the
+        // wrong formula survive: the fixture built frames the parser's own (wrong)
+        // arithmetic expected, so the round-trip passed while hardware could not.
+        for _ in 0..FrameLayout::new(config.enabled_streams).filler_words() {
             raw.extend_from_slice(&0_u16.to_le_bytes());
         }
 

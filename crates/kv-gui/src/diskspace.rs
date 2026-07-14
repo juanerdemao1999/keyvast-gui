@@ -3,8 +3,6 @@
 //! Windows-only via `GetDiskFreeSpaceExW`; other platforms return `None` so
 //! the UI simply omits the headroom line.
 
-use std::path::PathBuf;
-
 /// Bytes available to the caller on the volume that holds `path`.
 ///
 /// `path` may be relative or point at a directory that doesn't exist yet (the
@@ -14,6 +12,7 @@ use std::path::PathBuf;
 pub fn free_bytes(path: &str) -> Option<u64> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+    use std::path::PathBuf;
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
     let mut p = PathBuf::from(path);

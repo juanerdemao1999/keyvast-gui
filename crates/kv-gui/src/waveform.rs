@@ -411,7 +411,7 @@ pub fn draw_waveform_area(
             let core_a: u8 = if is_hovered { 235 } else { 200 };
             let core = egui::Color32::from_rgba_unmultiplied(r, g, b, core_a);
             let edge = egui::Color32::from_rgba_unmultiplied(r, g, b, 14);
-            let mean_stroke = egui::Stroke::new(if is_hovered { 1.3 } else { 1.0 }, core);
+            let mean_stroke = egui::Stroke::new(if is_hovered { 1.3_f32 } else { 1.0_f32 }, core);
 
             let pt =
                 |t: f64, y: f64| transform.position_from_point(&egui_plot::PlotPoint::new(t, y));

@@ -35,6 +35,11 @@ First hardware protocol: Opal Kelly FrontPanel / Intan Rhythm USB3-style endpoin
 First hardware bit file: keyvast_260607_with_UART.bit (provide the path at runtime via --bitfile / the GUI picker)
   Canonical candidate order lives in code: kv_rhd::RHD_BITFILE_CANDIDATES
   [keyvast_combined_download.bit, keyvast_260607_with_UART.bit, intan_rec_controller_7310.bit]
+Verified bring-up bit file: keyvast_260714_fifo.bit (2026-07-14, XEM7310-A75 serial 2417001BAU + RHD2132)
+  This build exposes its FIFO count at WireOut 0x20 and repurposes 0x26;
+  treating 0x26 as the stock Rhythm FIFO MSW produces a false ~4.19M-word fill level.
+  Continuous BTPipe validity is not yet confirmed: intermittent corrupt 1024-byte regions
+  still cause strict frame-magic failures and require an FPGA FIFO/EP_READY fix.
 Host program should bundle the required FrontPanel runtime DLL for convenience
 First live hardware channel target: up to two 32-channel RHD headstages
 Register map: use Rhythm USB3 / FrontPanel endpoints unless the Keyvast bitfile changes them

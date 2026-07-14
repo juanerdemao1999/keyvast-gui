@@ -125,6 +125,9 @@ impl RhythmFrontPanelBoard {
         let detected_streams = board.initialize_rhd_chips(enabled_streams)?;
         board.set_max_time_step(u32::MAX)?;
         board.set_continuous_run_mode(true)?;
+        log::info!(
+            "arming: draining FIFO before continuous acquisition ({detected_streams} stream(s))..."
+        );
         board.flush_fifo()?;
         log::info!("board configured and armed for continuous acquisition");
 
@@ -261,6 +264,10 @@ impl RhythmFrontPanelBoard {
             return Ok(false);
         };
 
+        log::info!(
+            "set_sample_rate {sample_rate:.0} Hz -> PLL M={m} D={d} (WireIn 0x03={:#06x})",
+            256 * m + d
+        );
         self.wait_for_dcm_done()?;
         self.device
             .set_wire_in_value(WIRE_IN_DATA_FREQ_PLL, 256 * m + d, u32::MAX)
@@ -296,6 +303,7 @@ impl RhythmFrontPanelBoard {
 
     pub(crate) fn enable_streams(&self, enabled_streams: usize) -> Result<(), RhdReadError> {
         let mask = crate::protocol::stream_enable_mask(enabled_streams);
+        log::info!("enable_streams: {enabled_streams} stream(s), mask={mask:#010x} (WireIn 0x14)");
         self.device
             .set_wire_in_value(WIRE_IN_DATA_STREAM_EN, mask, u32::MAX)
             .map_err(RhdReadError::FrontPanel)?;
@@ -542,6 +550,12 @@ impl RhythmFrontPanelBoard {
                 .activate_trigger_in(TRIG_IN_CONFIG, aux_command_trigger_bit(slot))
                 .map_err(RhdReadError::FrontPanel)?;
         }
+        // debug, not info: this helper is also called per-channel inside the
+        // impedance sweep (up to ~130 uploads), which would flood an info log.
+        log::debug!(
+            "aux command list uploaded: slot={slot:?} bank={bank} len={} word(s)",
+            commands.len()
+        );
         Ok(())
     }
 
@@ -637,6 +651,10 @@ impl RhythmFrontPanelBoard {
             return Err(RhdReadError::InvalidPort { port_index });
         }
 
+        log::info!(
+            "set_cable_length {length_meters:.4} m -> port {port_index} MISO delay {delay} \
+             (WireIn 0x04)"
+        );
         self.device
             .set_wire_in_value(WIRE_IN_MISO_DELAY, delay << bit_shift, 0x0f << bit_shift)
             .map_err(RhdReadError::FrontPanel)?;

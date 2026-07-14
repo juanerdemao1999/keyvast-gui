@@ -20,7 +20,78 @@ Before ending a session after meaningful work:
 
 ## Current State
 
-Last updated: 2026-06-12 (probe map and per-channel stats removed; focus shifts to GUI visual/UX polish)
+Last updated: 2026-07-14 (RHD reads waveforms; intermittent FPGA BTPipe corruption isolated)
+
+### Session 29: Waveform confirmed; continuous BTPipe corruption remains
+
+The rebuilt GUI successfully displayed live 32-channel RHD2132 waveforms, confirming
+the full FPGA -> FrontPanel -> parser -> GUI path. After several seconds it correctly
+failed closed with `bad Rhythm frame magic` and returned to Disconnected/IDLE while
+retaining the last waveform.
+
+Evidence and A/B tests:
+
+1. With 256 frames/block (26,624 B = 26 x 1,024 B), failures repeatedly occurred at
+   exact parser frame boundaries after otherwise valid frames: sample 237 / byte 24,648
+   and sample 217 / byte 22,568. Observed headers included six zero bytes before the
+   next magic, completely zero headers, and random words.
+2. A 2 KiB FIFO safety margin did not fix it.
+3. Splitting host reads into 24 KiB + 2 KiB did not fix it; 8 KiB chunks also failed.
+4. Halving the logical block to 128 frames (13,312 B) still failed at sample 109 /
+   byte 11,336. The 256-frame constant and original single-read path were restored.
+5. These results exclude GUI rendering, fixed frame stride, host request length, and
+   simple FIFO-wait headroom. The corrupt 1,024-byte region is already present in the
+   FPGA/BTPipe stream. The FPGA FIFO write/read CDC, circular wrap, `EP_READY`, and
+   overflow/underflow behavior need instrumentation and correction.
+6. The host parser remains strict and disconnects instead of silently resynchronizing;
+   continuing would risk recording channel-shifted data. `flush_fifo()` now propagates
+   throttle-override WireIn failures rather than ignoring them.
+
+Hardware runs this session:
+
+- 2,500 blocks / 20,480,000 samples passed once.
+- 10,000-block stress reproduced failure at sample 237.
+- 24 KiB split passed 10,000 blocks once, then failed at sample 217 on immediate repeat.
+- 8 KiB split failed at sample 217.
+- 128-frame blocks failed at sample 109.
+
+Next: add FPGA-side counters/ILA for FIFO overflow, underflow, write/read pointers and
+`EP_READY`; capture the failing 1,024-byte region together with WireOut `0x20`. Do not
+weaken the Rust parser or record across this error.
+
+### Session 28: RHD `LIVE / No Data` diagnosis and hardware verification
+
+The reported GUI showed `Connected/LIVE` with Start disabled and no waveform. The RHD
+log stopped immediately after `post-delay centering check`.
+
+1. **Root cause confirmed**: the previously launched `target/release/kv-gui.exe` was
+   older than the RHD source changes. Its FIFO counter combined WireOut `0x20` with
+   `0x26` as stock Rhythm LSW/MSW. On `keyvast_260714_fifo.bit`, `0x26=0x800040` is a
+   repurposed status endpoint, so the old calculation produced a false ~4.19M-word
+   FIFO level and left `flush_fifo()` doing thousands of large pipe reads.
+2. **Current RHD worktree verified**: it reads the FIFO count from `0x20` for this
+   KeyVast data plane, adds frame/MISO diagnostics, and logs the arming/flush boundary.
+3. **Stale launcher fixed**: `run-gui.bat` now performs an incremental release build
+   before every launch; `run-gui-debug.bat` enables `kv_rhd=debug` through it.
+4. **Real hardware smoke passed**: XEM7310-A75 serial `2417001BAU`, RHD2132 on port A,
+   chip-ID-valid delays 4..7, chosen delay 5. Ten blocks completed with 32 channels x
+   256 samples, 81,920 samples written, zero missing packets. Artifact:
+   `run-20260714-063622/` (ignored runtime output).
+5. **Known follow-ups**: GUI currently treats pipeline-handle existence as LIVE before
+   backend readiness; FIFO layout should become an explicit backend capability to retain
+   stock Intan compatibility; flush must gain fail-closed/no-progress/timeout behavior.
+
+Verification:
+
+- `cargo test -p kv-rhd` (38 passed)
+- `cargo build --release -p kv-gui` (passed)
+- `cargo run --release -p kv-cli --bin kv-acq -- rhd-smoke --bitfile
+  keyvast_260714_fifo.bit --frontpanel-dll
+  third_party\opalkelly\windows-x64\okFrontPanel.dll --streams 1 --blocks 10` (passed)
+
+Next: launch the rebuilt GUI and confirm the waveform path visually; then implement the
+explicit Device startup state and hardened FIFO capability/timeout handling as separate,
+tested changes.
 
 ### Session 27: Feature triage — remove probe map + per-channel stats
 

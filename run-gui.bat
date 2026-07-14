@@ -1,29 +1,34 @@
 @echo off
 REM ============================================================
-REM  Keyvast GUI - one-click launcher (runs the prebuilt binary)
+REM  Keyvast GUI - one-click launcher (incrementally builds, then runs)
 REM  Double-click this file to open the GUI for testing.
 REM  - Working dir is forced to the repo root so the GUI finds
 REM    third_party\opalkelly\windows-x64\okFrontPanel.dll,
 REM    config, and recordings.
-REM  - Uses the already-built release exe = instant start, no cargo.
-REM  - If the exe is missing, it builds once, then launches.
-REM  Tip: to always run the LATEST source, use gui.bat instead
-REM  (it does an incremental rebuild before launching).
+REM  - Runs an incremental release build before launch so hardware fixes in
+REM    the source tree can never be hidden by a stale prebuilt executable.
 REM ============================================================
 title Keyvast GUI
 cd /d "%~dp0"
-set RUST_LOG=info
+REM  Logging: default is a concise info-level console log. Run
+REM     run-gui.bat debug
+REM  for verbose RHD bring-up logs -- the full per-port x per-delay MISO scan
+REM  plus raw AuxCmd3/INTAN and amplifier hex dumps. Scoped to kv_rhd so the
+REM  egui/wgpu internals stay quiet.
+set "RUST_LOG=info"
+if /I "%~1"=="debug" (
+    set "RUST_LOG=info,kv_rhd=debug"
+    echo [Keyvast] DEBUG logging enabled: RUST_LOG=info,kv_rhd=debug
+)
 set "EXE=target\release\kv-gui.exe"
 
-if not exist "%EXE%" (
-    echo [Keyvast] Release binary not found - building once ^(first run^)...
-    cargo build --release -p kv-gui
-    if errorlevel 1 (
-        echo.
-        echo [Keyvast] Build failed. Press any key to exit.
-        pause >nul
-        exit /b 1
-    )
+echo [Keyvast] Checking for source updates...
+cargo build --release -p kv-gui
+if errorlevel 1 (
+    echo.
+    echo [Keyvast] Build failed. Press any key to exit.
+    pause >nul
+    exit /b 1
 )
 
 echo [Keyvast] Launching GUI: %EXE%

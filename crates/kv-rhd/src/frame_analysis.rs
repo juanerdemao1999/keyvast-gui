@@ -210,6 +210,225 @@ pub(crate) fn probe_chip_id(
     None
 }
 
+/// Extract the AuxCmd3 result low-bytes (the RHD register-readback stream) for
+/// `stream` across `samples` probe frames. These are the raw MISO bytes the chip
+/// returned for the register-config command list: a responding chip shows the
+/// ASCII "INTAN" (`49 4e 54 41 4e`) with the reg-63 chip-ID byte 13 words
+/// earlier, an idle/unpowered line shows all `ff` (or `00`), and a wrong MISO
+/// phase shows shifted garbage. Used for the debug-level bring-up hex dump.
+pub(crate) fn auxcmd3_bytes(
+    raw: &[u8],
+    enabled_streams: usize,
+    samples: usize,
+    stream: usize,
+) -> Vec<u8> {
+    if enabled_streams == 0 || stream >= enabled_streams {
+        return Vec::new();
+    }
+    let layout = FrameLayout::new(enabled_streams);
+    let word_offset = layout.auxcmd3_word_offset(stream);
+    let mut out = Vec::with_capacity(samples);
+    for s in 0..samples {
+        let off = layout.word_byte_offset(s, word_offset);
+        if off + 2 > raw.len() {
+            break;
+        }
+        out.push((u16::from_le_bytes([raw[off], raw[off + 1]]) & 0xff) as u8);
+    }
+    out
+}
+
+/// First `count` raw amplifier words (u16) of `stream`, from sample 0 onward,
+/// for a debug hex peek at what the MISO line actually deserialised.
+pub(crate) fn first_amp_words(
+    raw: &[u8],
+    enabled_streams: usize,
+    samples: usize,
+    stream: usize,
+    count: usize,
+) -> Vec<u16> {
+    if enabled_streams == 0 || stream >= enabled_streams {
+        return Vec::new();
+    }
+    let layout = FrameLayout::new(enabled_streams);
+    let mut out = Vec::with_capacity(count);
+    'outer: for s in 0..samples {
+        for intra in 0..CHANNELS_PER_STREAM {
+            if out.len() >= count {
+                break 'outer;
+            }
+            let off = layout.word_byte_offset(s, layout.amp_word_offset(intra, stream));
+            if off + 2 > raw.len() {
+                break 'outer;
+            }
+            out.push(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        }
+    }
+    out
+}
+
+/// One-line integrity summary of a probe block, independent of the MISO/SPI
+/// amplifier data: checks the Rhythm frame magic sits at every frame boundary
+/// and that the per-frame 32-bit timestamps increment by 1. Magic + timestamp
+/// come from the FPGA framer, not the amplifier readback, so this isolates a
+/// data-plane bitstream that is not producing valid frames at all (bad/absent
+/// magic, or a timestamp that never advances) from one whose frames are fine but
+/// whose amplifier MISO phase is wrong (magic OK, amplifier words railed).
+/// Returns `(frames_ok, human_summary)`.
+pub(crate) fn probe_frame_integrity(
+    raw: &[u8],
+    enabled_streams: usize,
+    samples: usize,
+) -> (bool, String) {
+    use crate::protocol::RHYTHM_HEADER_MAGIC;
+
+    if enabled_streams == 0 || samples == 0 {
+        return (false, "no samples".to_string());
+    }
+    let layout = FrameLayout::new(enabled_streams);
+    let bytes_per_frame = layout.bytes_per_frame();
+    let mut checked = 0_usize;
+    let mut magic_ok = 0_usize;
+    let mut ts_ok = true;
+    let mut first_ts: Option<u32> = None;
+
+    for s in 0..samples {
+        let base = s * bytes_per_frame;
+        if base + 12 > raw.len() {
+            break;
+        }
+        checked += 1;
+        let magic = u64::from_le_bytes([
+            raw[base],
+            raw[base + 1],
+            raw[base + 2],
+            raw[base + 3],
+            raw[base + 4],
+            raw[base + 5],
+            raw[base + 6],
+            raw[base + 7],
+        ]);
+        if magic == RHYTHM_HEADER_MAGIC {
+            magic_ok += 1;
+        }
+        let ts = u32::from_le_bytes([raw[base + 8], raw[base + 9], raw[base + 10], raw[base + 11]]);
+        let expected = first_ts.get_or_insert(ts).wrapping_add(s as u32);
+        if ts != expected {
+            ts_ok = false;
+        }
+    }
+
+    let nonzero = raw.iter().filter(|&&b| b != 0).count();
+    let frac = if raw.is_empty() {
+        0.0
+    } else {
+        nonzero as f64 / raw.len() as f64
+    };
+    let ok = checked > 0 && magic_ok == checked && ts_ok;
+
+    // When the magic is not sitting at the expected frame boundaries, search the
+    // whole block for the 8-byte magic and report (a) where it actually starts
+    // and (b) the stride between consecutive magics. This distinguishes three
+    // very different failures:
+    //   * a constant non-zero first offset with the EXPECTED stride  => the read
+    //     is merely frame-*misaligned* (e.g. stale FIFO bytes ahead of the run;
+    //     fixable by flushing/resyncing before the probe);
+    //   * a stride that differs from `bytes_per_frame`               => the FPGA
+    //     emits a different frame SIZE than assumed (stream-count / filler /
+    //     channel-order layout mismatch — the parser offsets are wrong);
+    //   * no magic anywhere                                          => the data
+    //     plane is not emitting Rhythm frames at all.
+    let alignment = if magic_ok == checked {
+        String::new()
+    } else {
+        let offs = magic_offsets(raw, 3);
+        match offs.first() {
+            None => {
+                ", magic pattern NOT FOUND anywhere in block => FPGA not emitting Rhythm frames"
+                    .to_string()
+            }
+            Some(&first) => {
+                let misaligned_by = first % bytes_per_frame;
+                match offs.get(1) {
+                    Some(&second) => {
+                        let stride = second - first;
+                        let verdict = if stride == bytes_per_frame {
+                            "MISALIGNED only (frame size matches)"
+                        } else {
+                            "FRAME-SIZE MISMATCH (parser offsets are wrong)"
+                        };
+                        format!(
+                            ", first magic at byte {first} (misaligned_by={misaligned_by}), \
+                             magic-to-magic stride={stride} B vs expected {bytes_per_frame} B => \
+                             {verdict}"
+                        )
+                    }
+                    None => format!(
+                        ", one magic at byte {first} (misaligned_by={misaligned_by}), \
+                         no second magic to measure stride"
+                    ),
+                }
+            }
+        }
+    };
+
+    let summary = format!(
+        "magic {}/{} frames OK, timestamps {}, nonzero_bytes={:.1}% (words/frame={}, bytes/frame={}){}",
+        magic_ok,
+        checked,
+        if ts_ok {
+            "monotonic +1"
+        } else {
+            "DISCONTINUOUS"
+        },
+        frac * 100.0,
+        layout.words_per_frame(),
+        bytes_per_frame,
+        alignment,
+    );
+    (ok, summary)
+}
+
+/// Byte offsets of up to `max` occurrences of the 8-byte Rhythm frame magic
+/// anywhere in the block (not just at frame boundaries). Consecutive offsets let
+/// callers measure the true magic-to-magic stride = the real frame size.
+pub(crate) fn magic_offsets(raw: &[u8], max: usize) -> Vec<usize> {
+    let magic = crate::protocol::RHYTHM_HEADER_MAGIC.to_le_bytes();
+    let mut out = Vec::new();
+    let mut i = 0_usize;
+    while i + 8 <= raw.len() && out.len() < max {
+        if raw[i..i + 8] == magic {
+            out.push(i);
+            i += 8; // skip the matched magic; the next frame's magic is >=1 frame away
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Format bytes as compact space-separated hex for a log line, e.g.
+/// `[49 4e 54 41 4e]`.
+pub(crate) fn hex_bytes(bytes: &[u8]) -> String {
+    let joined = bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("[{joined}]")
+}
+
+/// Format 16-bit words as compact space-separated hex for a log line, e.g.
+/// `[8000 7fff 4000]`.
+pub(crate) fn hex_words(words: &[u16]) -> String {
+    let joined = words
+        .iter()
+        .map(|w| format!("{w:04x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("[{joined}]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +572,106 @@ mod tests {
         // Too-short buffer must not panic and should report fully railed.
         let raw = vec![0u8; 8];
         assert_eq!(min_stream_railed_fraction(&raw, 2, 16), 1.0);
+    }
+
+    /// Build a block of `samples` frames with valid Rhythm magic and per-frame
+    /// timestamps 0,1,2,… (payload words left at 0x8000 mid-scale).
+    fn write_valid_frames(streams: usize, samples: usize) -> Vec<u16> {
+        use crate::protocol::RHYTHM_HEADER_MAGIC;
+        let mut block = blank_block(streams, samples);
+        let fw = frame_words(streams);
+        for s in 0..samples {
+            let base = s * fw;
+            for (i, slot) in block[base..base + 4].iter_mut().enumerate() {
+                *slot = ((RHYTHM_HEADER_MAGIC >> (16 * i)) & 0xffff) as u16;
+            }
+            let ts = s as u32;
+            block[base + 4] = (ts & 0xffff) as u16;
+            block[base + 5] = (ts >> 16) as u16;
+        }
+        block
+    }
+
+    #[test]
+    fn frame_integrity_ok_on_valid_block() {
+        let (streams, samples) = (1, 4);
+        let raw = to_bytes(&write_valid_frames(streams, samples));
+        let (ok, summary) = probe_frame_integrity(&raw, streams, samples);
+        assert!(ok, "summary: {summary}");
+        assert!(summary.contains("4/4 frames OK"), "summary: {summary}");
+    }
+
+    #[test]
+    fn frame_integrity_flags_bad_magic() {
+        let (streams, samples) = (1, 4);
+        let mut block = write_valid_frames(streams, samples);
+        let fw = frame_words(streams);
+        block[2 * fw] = 0x0000; // corrupt frame 2's magic
+        let raw = to_bytes(&block);
+        assert!(!probe_frame_integrity(&raw, streams, samples).0);
+    }
+
+    #[test]
+    fn frame_integrity_flags_timestamp_discontinuity() {
+        let (streams, samples) = (1, 4);
+        let mut block = write_valid_frames(streams, samples);
+        let fw = frame_words(streams);
+        block[3 * fw + 4] = 99; // frame 3 ts_lo jumps
+        let raw = to_bytes(&block);
+        assert!(!probe_frame_integrity(&raw, streams, samples).0);
+    }
+
+    #[test]
+    fn auxcmd3_bytes_reads_low_byte_per_sample() {
+        let (streams, samples) = (1, 3);
+        let mut block = blank_block(streams, samples);
+        for (s, b) in [0x11_u8, 0x22, 0x33].into_iter().enumerate() {
+            set_word(
+                &mut block,
+                streams,
+                s,
+                aux3_word(streams, 0),
+                0xAB00 | b as u16,
+            );
+        }
+        let raw = to_bytes(&block);
+        assert_eq!(
+            auxcmd3_bytes(&raw, streams, samples, 0),
+            vec![0x11, 0x22, 0x33]
+        );
+    }
+
+    #[test]
+    fn hex_helpers_format_compactly() {
+        assert_eq!(hex_bytes(&[0x49, 0x4e, 0x54]), "[49 4e 54]");
+        assert_eq!(hex_words(&[0x8000, 0x4000]), "[8000 4000]");
+        assert_eq!(hex_bytes(&[]), "[]");
+    }
+
+    #[test]
+    fn frame_integrity_reports_misalignment_offset() {
+        let (streams, samples) = (1, 4);
+        let aligned = to_bytes(&write_valid_frames(streams, samples));
+        // Prepend 6 stray bytes so the magic is no longer at a frame boundary.
+        let mut raw = vec![0xAA_u8; 6];
+        raw.extend_from_slice(&aligned);
+        let (ok, summary) = probe_frame_integrity(&raw, streams, samples);
+        assert!(!ok);
+        assert_eq!(magic_offsets(&raw, 1), vec![6]);
+        assert!(
+            summary.contains("first magic at byte 6"),
+            "summary: {summary}"
+        );
+        assert!(summary.contains("MISALIGNED only"), "summary: {summary}");
+    }
+
+    #[test]
+    fn frame_integrity_reports_no_magic_anywhere() {
+        let (streams, samples) = (1, 4);
+        let raw = to_bytes(&blank_block(streams, samples)); // 0x8000 fill, no magic
+        let (ok, summary) = probe_frame_integrity(&raw, streams, samples);
+        assert!(!ok);
+        assert!(magic_offsets(&raw, 1).is_empty());
+        assert!(summary.contains("NOT FOUND anywhere"), "summary: {summary}");
     }
 }

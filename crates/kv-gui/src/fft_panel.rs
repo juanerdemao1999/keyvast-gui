@@ -2,16 +2,29 @@
 //!
 //! Displays power spectral density (PSD) for a selected channel using an
 //! in-place radix-2 Cooley-Tukey FFT — no external dependency needed.
+//!
+//! ## Data source (scientific correctness)
+//! The spectrum is computed from **full-rate** raw (or user-filtered) samples
+//! assembled from block history, NOT from the display ring. The main display
+//! ring is peak-hold decimated — a nonlinear max-|value| envelope with no
+//! anti-alias filter — which would inject spurious harmonics and fold
+//! high-frequency energy back into the band, making an FFT of it invalid.
+//! Full-rate samples give a true one-sided PSD up to the hardware Nyquist.
+//!
+//! ## Normalization
+//! The PSD divides by the window **power** (Σw²) and the sample rate, so the
+//! result is a Parseval-correct one-sided estimate in µV²/Hz. The per-bin
+//! temporal smoothing averages **linear** power (averaging in dB would compute
+//! a geometric mean and bias the level downward).
 
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints};
 
-use crate::disp_ring::{DisplayRing, RING_DWNSP};
 use crate::theme;
 
 /// FFT analysis state.
 ///
-/// The spectrum is refreshed once per frame by [`FftState::update_from_ring`]
+/// The spectrum is refreshed once per frame by [`FftState::update_from_samples`]
 /// whenever an "FFT Spectrum" view is open, so the sidebar section is purely a
 /// set of display controls and the view is self-contained (#4a).
 #[derive(Debug, Clone)]
@@ -20,20 +33,28 @@ pub struct FftState {
     pub selected_channel: usize,
     /// FFT size (power of 2).
     pub fft_size: usize,
-    /// Cached PSD result: (frequency_hz, power_db) pairs (latest frame, raw).
+    /// Cached PSD result: (frequency_hz, linear_power_µV²/Hz) pairs (latest frame, raw).
     pub spectrum: Vec<[f64; 2]>,
-    /// Temporally smoothed PSD magnitudes (dB), aligned with `spectrum` bins.
-    pub smoothed_db: Vec<f64>,
+    /// Temporally smoothed **linear** PSD power, aligned with `spectrum` bins.
+    pub smoothed: Vec<f64>,
     /// Whether to apply temporal smoothing to the displayed curve (#4d).
     pub smoothing: bool,
-    /// Eased Y-axis bounds (dB), so the plot does not jitter frame-to-frame.
+    /// Eased Y-axis bounds in the current display domain (dB when `log_scale`,
+    /// linear power otherwise), so the plot does not jitter frame-to-frame.
     pub y_bounds: Option<(f64, f64)>,
-    /// Whether to use log scale on Y axis.
+    /// Whether to use log (dB) scale on the Y axis.
     pub log_scale: bool,
     /// Low frequency cutoff for display (Hz).
     pub freq_min: f64,
     /// High frequency cutoff for display (Hz).
     pub freq_max: f64,
+    /// `block_seq` value the cached spectrum was computed at (skip redundant
+    /// recomputes while data and params are unchanged).
+    pub computed_seq: u64,
+    /// Channel the cached spectrum was computed for.
+    pub computed_channel: usize,
+    /// FFT size the cached spectrum was computed with.
+    pub computed_fft_size: usize,
 }
 
 impl Default for FftState {
@@ -42,12 +63,15 @@ impl Default for FftState {
             selected_channel: 0,
             fft_size: 1024,
             spectrum: Vec::new(),
-            smoothed_db: Vec::new(),
+            smoothed: Vec::new(),
             smoothing: true,
             y_bounds: None,
             log_scale: true,
             freq_min: 1.0,
             freq_max: 5000.0,
+            computed_seq: 0,
+            computed_channel: usize::MAX,
+            computed_fft_size: 0,
         }
     }
 }
@@ -58,48 +82,53 @@ const SMOOTH_ALPHA: f64 = 0.3;
 const Y_BOUNDS_EASE: f64 = 0.05;
 
 impl FftState {
-    /// Recompute the PSD for the selected channel from the display ring,
-    /// updating the smoothed curve and eased Y bounds. Called once per frame
-    /// while an FFT view is open.
-    pub fn update_from_ring(&mut self, ring: &DisplayRing, sample_rate: f64) {
-        if !ring.ready {
-            return;
-        }
-        let raw = compute_spectrum(ring, self.selected_channel, self.fft_size, sample_rate);
+    /// Recompute the PSD for the selected channel from full-rate `samples`
+    /// (ADC counts) at `sample_rate`, updating the smoothed curve and eased Y
+    /// bounds. Called once per frame while an FFT view is open.
+    pub fn update_from_samples(&mut self, samples: &[f64], sample_rate: f64) {
+        let raw = compute_spectrum(samples, self.fft_size, sample_rate);
 
-        // Per-bin temporal EMA. Reset whenever the bin count changes (e.g. the
-        // user picked a different FFT size).
-        if self.smoothing && self.smoothed_db.len() == raw.len() && !raw.is_empty() {
-            for (s, p) in self.smoothed_db.iter_mut().zip(raw.iter()) {
+        // Per-bin temporal EMA in the LINEAR power domain. Reset whenever the
+        // bin count changes (e.g. the user picked a different FFT size).
+        if self.smoothing && self.smoothed.len() == raw.len() && !raw.is_empty() {
+            for (s, p) in self.smoothed.iter_mut().zip(raw.iter()) {
                 *s = *s * (1.0 - SMOOTH_ALPHA) + p[1] * SMOOTH_ALPHA;
             }
         } else {
-            self.smoothed_db = raw.iter().map(|p| p[1]).collect();
+            self.smoothed = raw.iter().map(|p| p[1]).collect();
         }
         self.spectrum = raw;
 
         self.update_y_bounds();
     }
 
-    /// The PSD magnitudes (dB) to plot, honoring the smoothing toggle.
-    fn display_db(&self) -> &[f64] {
-        &self.smoothed_db
+    /// Map a linear power value to the current display domain (dB or linear).
+    fn display_value(&self, power: f64) -> f64 {
+        if self.log_scale {
+            10.0 * power.max(1e-20).log10()
+        } else {
+            power
+        }
     }
 
-    /// Recompute eased Y bounds from the visible portion of the curve.
+    /// Recompute eased Y bounds from the visible portion of the curve, in the
+    /// current display domain.
     fn update_y_bounds(&mut self) {
         let mut lo = f64::INFINITY;
         let mut hi = f64::NEG_INFINITY;
-        for (p, &db) in self.spectrum.iter().zip(self.smoothed_db.iter()) {
+        for (p, &pw) in self.spectrum.iter().zip(self.smoothed.iter()) {
             if p[0] >= self.freq_min && p[0] <= self.freq_max {
-                lo = lo.min(db);
-                hi = hi.max(db);
+                let v = self.display_value(pw);
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
         }
         if !(lo.is_finite() && hi.is_finite() && hi > lo) {
             return;
         }
-        let pad = ((hi - lo) * 0.1).max(1.0);
+        // Relative padding so both dB (tens of units) and linear (tiny units)
+        // domains get a sensible margin.
+        let pad = ((hi - lo) * 0.1).max((hi - lo).abs() * 1e-6);
         let (target_lo, target_hi) = (lo - pad, hi + pad);
         self.y_bounds = Some(match self.y_bounds {
             // Expand instantly to keep peaks visible; contract slowly to avoid jitter.
@@ -124,71 +153,57 @@ impl FftState {
 /// Available FFT sizes.
 const FFT_SIZES: &[usize] = &[256, 512, 1024, 2048, 4096];
 
-/// Compute the PSD from the display ring for a given channel.
+/// Compute the one-sided PSD (linear µV²/Hz) from full-rate `samples` (ADC
+/// counts) at `sample_rate`.
 ///
-/// `hardware_sample_rate` is the raw device rate (e.g. 30 000 Hz). The
-/// effective ring sample rate is `hardware_sample_rate / RING_DWNSP`.
-pub fn compute_spectrum(
-    ring: &DisplayRing,
-    channel: usize,
-    fft_size: usize,
-    hardware_sample_rate: f64,
-) -> Vec<[f64; 2]> {
-    // The radix-2 FFT requires a power-of-two length; reject anything else
-    // here (in release builds `fft_radix2` only `debug_assert!`s this) so a
-    // bad caller gets an empty spectrum rather than a wrong/garbage one.
-    if !ring.ready || hardware_sample_rate <= 0.0 || fft_size == 0 || !fft_size.is_power_of_two() {
+/// Uses the most recent `fft_size` samples with a Hann window. The PSD is
+/// normalized by the window power (Σw²) and `sample_rate` so it is a
+/// Parseval-correct estimate, and one-sided bins (except DC/Nyquist) are
+/// doubled. Returns `(frequency_hz, linear_power)` pairs.
+pub fn compute_spectrum(samples: &[f64], fft_size: usize, sample_rate: f64) -> Vec<[f64; 2]> {
+    // The radix-2 FFT requires a power-of-two length; reject anything else here
+    // (in release builds `fft_radix2` only `debug_assert!`s this) so a bad
+    // caller gets an empty spectrum rather than a wrong/garbage one.
+    if sample_rate <= 0.0
+        || fft_size == 0
+        || !fft_size.is_power_of_two()
+        || samples.len() < fft_size
+    {
         return Vec::new();
     }
 
-    // The ring stores decimated data — use the decimated rate for frequency
-    // axis calculations.
-    let ring_sr = hardware_sample_rate / RING_DWNSP as f64;
-
-    // Extract the most recent `fft_size` samples for this channel from the ring.
-    let raw = ring.last_n_samples_f64(channel, fft_size);
-    if raw.len() < fft_size {
-        return Vec::new();
-    }
-
-    // Apply Hann window and convert to f64.
     let n = fft_size;
+    // Use the most recent `n` samples.
+    let seg = &samples[samples.len() - n..];
+
     let mut real = Vec::with_capacity(n);
     let mut imag = vec![0.0_f64; n];
     let pi2_over_n = 2.0 * std::f64::consts::PI / n as f64;
 
-    // Compute coherent gain of Hann window for amplitude correction.
-    let mut win_sum = 0.0_f64;
-    for i in 0..n {
-        win_sum += 0.5 * (1.0 - (pi2_over_n * i as f64).cos());
-    }
-    let win_norm = win_sum / n as f64;
-
-    for (i, &sample) in raw.iter().enumerate().take(n) {
+    // Apply the Hann window and accumulate its power Σw² for PSD normalization.
+    let mut win_pow = 0.0_f64;
+    for (i, &sample) in seg.iter().enumerate() {
         let w = 0.5 * (1.0 - (pi2_over_n * i as f64).cos()); // Hann window
+        win_pow += w * w;
         real.push(sample * kv_rhd::RHD_AMPLIFIER_MICROVOLTS_PER_COUNT as f64 * w);
     }
 
     // In-place radix-2 FFT.
     fft_radix2(&mut real, &mut imag);
 
-    // Compute one-sided PSD in dB (µV²/Hz).
-    let bin_width = ring_sr / n as f64;
+    // One-sided PSD in linear µV²/Hz: |X|² / (Fs · Σw²), doubling interior bins.
+    let bin_width = sample_rate / n as f64;
     let n_bins = n / 2 + 1;
+    let norm = sample_rate * win_pow;
     let mut spectrum = Vec::with_capacity(n_bins);
     for k in 0..n_bins {
         let freq = k as f64 * bin_width;
-        // Normalise by window power (win_norm²) so PSD amplitude is correct.
-        let power =
-            (real[k] * real[k] + imag[k] * imag[k]) / (n as f64 * ring_sr * win_norm * win_norm);
+        let mut power = (real[k] * real[k] + imag[k] * imag[k]) / norm;
         // Double one-sided bins (except DC and Nyquist).
-        let power = if k > 0 && k < n / 2 {
-            power * 2.0
-        } else {
-            power
-        };
-        let db = 10.0 * (power.max(1e-20)).log10();
-        spectrum.push([freq, db]);
+        if k > 0 && k < n / 2 {
+            power *= 2.0;
+        }
+        spectrum.push([freq, power]);
     }
 
     spectrum
@@ -285,6 +300,10 @@ pub fn draw_fft_section(
                 .changed()
             {
                 state.selected_channel = ch.max(0) as usize;
+                // Different channel → drop the smoothing history so the EMA does
+                // not blend two channels' spectra.
+                state.smoothed.clear();
+                state.y_bounds = None;
             }
         });
 
@@ -319,19 +338,28 @@ pub fn draw_fft_section(
                     .suffix(" Hz"),
             );
             ui.label(egui::RichText::new("–").size(10.0));
-            let ring_nyquist = sample_rate / RING_DWNSP as f64 / 2.0;
+            let nyquist = sample_rate / 2.0;
             ui.add(
                 egui::DragValue::new(&mut state.freq_max)
-                    .range(state.freq_min + 1.0..=ring_nyquist)
+                    .range(state.freq_min + 1.0..=nyquist)
                     .speed(10.0)
                     .suffix(" Hz"),
             );
         });
 
-        ui.checkbox(
-            &mut state.log_scale,
-            egui::RichText::new("Log scale (dB)").size(10.0),
-        );
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(
+                    &mut state.log_scale,
+                    egui::RichText::new("Log scale (dB)").size(10.0),
+                )
+                .changed()
+            {
+                // The Y bounds are cached in the old display domain; drop them so
+                // they re-ease in the new (dB ↔ linear) domain.
+                state.y_bounds = None;
+            }
+        });
         ui.checkbox(
             &mut state.smoothing,
             egui::RichText::new("Smoothing").size(10.0),
@@ -342,7 +370,7 @@ pub fn draw_fft_section(
 
 /// Draw the FFT spectrum plot in the central area.
 pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
-    if state.spectrum.is_empty() {
+    if state.spectrum.is_empty() || state.smoothed.len() != state.spectrum.len() {
         ui.centered_and_justified(|ui| {
             ui.label(
                 egui::RichText::new("Waiting for data…")
@@ -353,14 +381,14 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
         return;
     }
 
-    // Filter to display range, using the (optionally smoothed) magnitudes.
-    let db = state.display_db();
+    // Filter to display range, mapping smoothed linear power into the current
+    // display domain (dB or linear).
     let points: Vec<[f64; 2]> = state
         .spectrum
         .iter()
-        .zip(db.iter())
+        .zip(state.smoothed.iter())
         .filter(|(p, _)| p[0] >= state.freq_min && p[0] <= state.freq_max)
-        .map(|(p, &y)| [p[0], y])
+        .map(|(p, &pw)| [p[0], state.display_value(pw)])
         .collect();
 
     if points.is_empty() {
@@ -421,10 +449,9 @@ pub fn draw_fft_plot(ui: &mut egui::Ui, state: &FftState, sample_rate: f64) {
             }
         }
 
-        // Nyquist marker — the displayed spectrum spans up to the effective
-        // ring Nyquist (hardware rate decimated by RING_DWNSP), not the full
-        // hardware Nyquist.
-        let nyquist = sample_rate / RING_DWNSP as f64 / 2.0;
+        // Nyquist marker — the displayed spectrum now spans up to the full
+        // hardware Nyquist (sample_rate / 2), since the FFT reads full-rate data.
+        let nyquist = sample_rate / 2.0;
         if nyquist >= state.freq_min && nyquist <= state.freq_max {
             plot_ui.line(
                 Line::new(PlotPoints::from(vec![[nyquist, y_lo], [nyquist, y_hi]]))
@@ -480,5 +507,38 @@ mod tests {
             let power = real[k] * real[k] + imag[k] * imag[k];
             assert!(power < 1e-20, "non-DC bin {k} should be zero");
         }
+    }
+
+    #[test]
+    fn compute_spectrum_rejects_short_input() {
+        // Fewer samples than fft_size → empty (no wrong/garbage spectrum).
+        let samples = vec![0.0_f64; 100];
+        assert!(compute_spectrum(&samples, 256, 30_000.0).is_empty());
+    }
+
+    #[test]
+    fn compute_spectrum_peaks_at_input_frequency() {
+        let n = 1024;
+        let sr = 30_000.0;
+        let freq = 1000.0;
+        // 2 * fft_size samples so the "most recent n" slice is exercised.
+        let samples: Vec<f64> = (0..2 * n)
+            .map(|i| 100.0 * (2.0 * std::f64::consts::PI * freq * i as f64 / sr).sin())
+            .collect();
+        let spec = compute_spectrum(&samples, n, sr);
+        assert_eq!(spec.len(), n / 2 + 1);
+        // Peak bin should sit at the input frequency.
+        let (mut max_k, mut max_p) = (0usize, 0.0_f64);
+        for (k, s) in spec.iter().enumerate() {
+            if s[1] > max_p {
+                max_p = s[1];
+                max_k = k;
+            }
+        }
+        let peak_freq = max_k as f64 * sr / n as f64;
+        assert!(
+            (peak_freq - freq).abs() <= sr / n as f64,
+            "peak at {peak_freq} Hz, expected ~{freq} Hz"
+        );
     }
 }

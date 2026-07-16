@@ -45,6 +45,12 @@ const FADE_FRAMES: u32 = 180; // ~3 s at 60 fps
 /// Default per-channel vertical scale (gain multiplier) for the overlay.
 pub const DEFAULT_Y_SCALE: f32 = 1.0;
 
+/// Convert a mean-absolute-value estimate to an equivalent RMS / standard
+/// deviation for zero-mean noise: `RMS = mean(|s|) / sqrt(2/π)`. Applied so the
+/// user-facing `sigma` control means true multiples of the noise standard
+/// deviation, matching the waveform-view detector, instead of ~21% shallower.
+const MEAN_ABS_TO_RMS: f32 = 1.253_314; // 1 / 0.797_884_6
+
 // ── Selected channel ─────────────────────────────────────────────────
 
 /// One channel selected for the Spike Overlay, with its own display scale.
@@ -160,6 +166,10 @@ struct ChannelBuf {
     prev: f32,
     /// Exponential moving average of absolute amplitude for RMS estimate.
     rms_ema: f32,
+    /// Whether `rms_ema` has been seeded from real data. Until then the first
+    /// sample seeds it directly, so the threshold is valid immediately instead
+    /// of decaying from the initial guess for ~150 ms after start/reconfigure (L6).
+    seeded: bool,
     /// Completed snippets.
     pub snippets: VecDeque<SpikeSnippet>,
 }
@@ -173,7 +183,8 @@ impl ChannelBuf {
             pending: None,
             refractory: 0,
             prev: 0.0,
-            rms_ema: 0.01, // small positive to avoid zero threshold on first block
+            rms_ema: 0.01, // provisional until seeded from the first real sample
+            seeded: false,
             snippets: VecDeque::new(),
         }
     }
@@ -188,8 +199,15 @@ impl ChannelBuf {
         refractory_samples: usize,
         max_snippets: usize,
     ) {
-        // Update RMS estimate (EMA of |s|, approximates RMS for zero-mean signal)
-        self.rms_ema = self.rms_ema * 0.9995 + s.abs() * 0.0005;
+        // Track an EMA of |s| (mean absolute value). Converted to a true RMS
+        // sigma at threshold time via MEAN_ABS_TO_RMS. Seed from the first real
+        // sample so the threshold is usable immediately (L6).
+        if self.seeded {
+            self.rms_ema = self.rms_ema * 0.9995 + s.abs() * 0.0005;
+        } else {
+            self.rms_ema = s.abs().max(1e-6);
+            self.seeded = true;
+        }
 
         // Keep pre-ring correctly sized
         while self.pre_ring.len() >= pre_samples.max(1) {
@@ -221,8 +239,10 @@ impl ChannelBuf {
             return;
         }
 
-        // Detect negative-going threshold crossing
-        let thresh = -sigma * self.rms_ema;
+        // Detect negative-going threshold crossing. Convert the mean-abs EMA to
+        // a true RMS sigma so `sigma` counts noise standard deviations.
+        let noise_sigma = self.rms_ema * MEAN_ABS_TO_RMS;
+        let thresh = -sigma * noise_sigma;
         if self.prev >= thresh && s < thresh {
             // Snapshot the pre-window now
             let pre_snapshot: Vec<f32> = self.pre_ring.iter().copied().collect();
@@ -329,6 +349,11 @@ impl SpikeSnippetStore {
     pub fn process_block(&mut self, block: &SampleBlock) {
         let ch = block.channel_count;
         let spc = block.samples_per_channel;
+        // Guard the interleaved-index arithmetic below against a short/malformed
+        // block rather than panicking on out-of-bounds (I2).
+        if block.data.len() < ch * spc {
+            return;
+        }
         if self.bufs.len() != ch {
             self.reconfigure(ch, block.sample_rate);
         }
@@ -354,20 +379,24 @@ impl SpikeSnippetStore {
         }
     }
 
-    /// Return reference to snippets for a specific physical channel.
+    /// Return reference to snippets for a specific physical channel. An
+    /// out-of-range channel yields an empty deque — never another channel's
+    /// snippets (previously it clamped to the last buffer, so a stale high
+    /// channel would silently render the last channel's data under a wrong
+    /// label after the channel count dropped).
     pub fn snippets_for(&self, ch: usize) -> &VecDeque<SpikeSnippet> {
         static EMPTY: VecDeque<SpikeSnippet> = VecDeque::new();
-        if self.bufs.is_empty() {
-            return &EMPTY;
+        match self.bufs.get(ch) {
+            Some(buf) => &buf.snippets,
+            None => &EMPTY,
         }
-        &self.bufs[ch.min(self.bufs.len() - 1)].snippets
     }
 
     /// Mutable snippets for a channel — lets the renderer refresh each
-    /// snippet's cached geometry in place.
-    pub fn snippets_for_mut(&mut self, ch: usize) -> &mut VecDeque<SpikeSnippet> {
-        let idx = ch.min(self.bufs.len().saturating_sub(1));
-        &mut self.bufs[idx].snippets
+    /// snippet's cached geometry in place. Returns `None` for an out-of-range
+    /// channel (rather than clamping to the last buffer).
+    pub fn snippets_for_mut(&mut self, ch: usize) -> Option<&mut VecDeque<SpikeSnippet>> {
+        self.bufs.get_mut(ch).map(|b| &mut b.snippets)
     }
 
     pub fn channel_count(&self) -> usize {
@@ -419,7 +448,10 @@ pub fn draw_spike_overlay(
     // state (only the fade alpha changing) nothing is rebuilt or reallocated.
     for (disp_pos, sc) in channels.iter().enumerate() {
         let y_scale = sc.y_scale;
-        for snippet in store.snippets_for_mut(sc.ch) {
+        let Some(snips) = store.snippets_for_mut(sc.ch) else {
+            continue;
+        };
+        for snippet in snips {
             if snippet.alpha() < 0.02 {
                 continue;
             }

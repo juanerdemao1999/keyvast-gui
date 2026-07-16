@@ -56,6 +56,18 @@ use crate::trigger::{self, TriggerAction, TriggerConfig, TtlHistory};
 /// is re-filtered (lets slider drags settle first).
 const REFILTER_DEBOUNCE_MS: u64 = 150;
 
+/// Sliding window (seconds) over which recent dropped blocks are summed to drive
+/// the status-bar "dropping now vs recovered" health color (C12).
+const DROP_ACTIVITY_WINDOW_SECS: f64 = 3.0;
+
+/// Lower bound on the raw/filtered block history depth (a few seconds floor for
+/// tiny sample rates or large blocks).
+const MIN_HISTORY_BLOCKS: usize = 2_000;
+/// Upper bound on the block history depth, so an extreme sample-rate / tiny
+/// block geometry cannot balloon RAM. At 16ch/64-sample blocks this is ~120 MB
+/// of raw history.
+const MAX_HISTORY_BLOCKS: usize = 60_000;
+
 // ── Acquisition mode ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +94,21 @@ pub enum DataSource {
     Demo,
     Device,
     Playback,
+}
+
+// ── Pending destructive-stop confirmation (C1) ──────────────────────
+
+/// A stop the operator requested interactively that would finalize an active
+/// recording. Held pending a confirmation modal so a stray `Space`/`R`/Stop
+/// click can't silently end a recording; automated paths (triggers, remote API)
+/// bypass this and stop immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingStop {
+    /// Stop just the recording (from `R` or the Stop-Rec button).
+    Recording,
+    /// Stop acquisition entirely (from `Space` or the Stop button), which also
+    /// finalizes any active recording.
+    Acquisition,
 }
 
 // ── Application state ───────────────────────────────────────────────
@@ -121,6 +148,14 @@ pub struct KvApp {
     /// Surfaced as a dismissible banner; does not interrupt the GUI.
     device_error: Option<String>,
     // Shared view state
+    /// Monotonic counter bumped whenever the block history changes (each ingest
+    /// and each re-filter). Lets the FFT skip recomputing when nothing changed.
+    block_seq: u64,
+    /// Whether an LFP / AP band tile was consuming its ring on the previous
+    /// ingest. Used to detect a tile just opening so its ring can be back-filled
+    /// from history instead of showing a blank left gap for a full window (L10).
+    lfp_was_open: bool,
+    ap_was_needed: bool,
     block_history: VecDeque<SampleBlock>,
     /// Pre-filtered version of block_history. Only populated while a user
     /// filter (or CAR) is active — empty otherwise to avoid duplicating
@@ -218,6 +253,33 @@ pub struct KvApp {
     /// Window size persisted at startup, reused on the first frame so the
     /// config file is read once (in `new`) rather than again in `update`.
     restore_window_size: (f32, f32),
+    /// True while a "recording in progress — quit?" confirmation modal is open.
+    /// Guards the window-close path so an in-flight recording is finalized on a
+    /// deliberate confirm instead of being torn down by an accidental close (C1).
+    pending_quit: bool,
+    /// A stop the operator requested that would end an active recording, held
+    /// until they confirm it in a modal (C1). `None` when no confirmation is
+    /// pending.
+    pending_stop: Option<PendingStop>,
+    /// True while a "Load config replaces current settings?" modal is open (C22).
+    pending_load: bool,
+    /// Throttle timestamp for the "dropped blocks — data lost" toast, so a burst
+    /// of drops raises one alert every few seconds rather than one per block (C11).
+    drop_alert_time: Option<Instant>,
+    /// Recent (time, count) drop events, kept only for the activity window so the
+    /// status bar can show whether data is being lost *now* rather than a sticky
+    /// lifetime ratio (C12).
+    drop_events: VecDeque<(Instant, u64)>,
+    /// Cached free bytes on the recording volume, polled ~1/s so the persistent
+    /// status bar can show disk headroom without a syscall every frame (C10).
+    disk_free_bytes: Option<u64>,
+    /// Last time `disk_free_bytes` was refreshed.
+    disk_poll_time: Option<Instant>,
+    /// Highest buffer-occupancy severity already toasted this recording
+    /// (0 ok / 1 amber / 2 red), so each threshold alerts once, not every frame (C10).
+    buf_alert_level: u8,
+    /// Highest disk-headroom severity already toasted this recording (C10).
+    disk_alert_level: u8,
 }
 
 impl KvApp {
@@ -252,6 +314,9 @@ impl KvApp {
             live_pipeline: None,
             device: DeviceSettings::default(),
             device_error: None,
+            block_seq: 0,
+            lfp_was_open: false,
+            ap_was_needed: false,
             // 20s at 30kHz / 64spc ≈ 9375 blocks; round up with margin
             block_history: VecDeque::with_capacity(10_000),
             filtered_history: VecDeque::with_capacity(10_000),
@@ -262,12 +327,16 @@ impl KvApp {
             filter_settings_snapshot: filters,
             filter_change_pending_since: None,
             filters_last_frame: filters,
+            // Every ring stores per-slot (min, max), so render draws a min/max
+            // envelope (SpikeGLX / Open Ephys / Intan RHX style). Narrow spikes —
+            // a ~0.3 ms negative trough — survive decimation via the slot minimum,
+            // and both signal phases are shown instead of a jagged extremes line.
             disp_ring: DisplayRing::new(16, 30_000.0),
             disp_ring_lfp: DisplayRing::new(16, 30_000.0),
-            disp_ring_ap: DisplayRing::new(16, 30_000.0).with_peak_hold(),
+            disp_ring_ap: DisplayRing::new(16, 30_000.0),
             filter_chains_lfp: Vec::new(),
             filter_chains_ap: Vec::new(),
-            tile_tree: Some(multiview::make_initial_tree(16)),
+            tile_tree: Some(multiview::make_initial_tree()),
             snippet_store: SpikeSnippetStore::new(16, 30_000.0),
             display: DisplaySettings::default(),
             filters,
@@ -302,6 +371,15 @@ impl KvApp {
             ui_scale,
             window_restored: false,
             restore_window_size: (saved.window_width, saved.window_height),
+            pending_quit: false,
+            pending_stop: None,
+            pending_load: false,
+            drop_alert_time: None,
+            drop_events: VecDeque::new(),
+            disk_free_bytes: None,
+            disk_poll_time: None,
+            buf_alert_level: 0,
+            disk_alert_level: 0,
         };
 
         // Apply the persisted display/filter/recording settings to live state.
@@ -445,6 +523,7 @@ impl KvApp {
                 }
             }
             self.recording.state = RecordingState::Idle;
+            self.recording.active_dir = None;
         }
         self.demo_started = false;
         // Dropping the handle stops both producer and recorder threads cleanly.
@@ -479,6 +558,29 @@ impl KvApp {
             .collect()
     }
 
+    /// Back-fill a band ring from block history when its tile has just opened,
+    /// so the band view is not blank for a full window before live data catches
+    /// up (L10). Rebuilds the band's chains fresh, resets the ring, and replays
+    /// the retained raw history through the band filter.
+    fn warm_band_ring(
+        ring: &mut DisplayRing,
+        chains: &mut Vec<FilterChain>,
+        history: &VecDeque<SampleBlock>,
+        build: fn(usize, f64) -> Vec<FilterChain>,
+        ch_count: usize,
+        sample_rate: f64,
+    ) {
+        *chains = build(ch_count, sample_rate);
+        ring.reset();
+        for block in history.iter() {
+            if block.channel_count != ch_count {
+                continue;
+            }
+            let filtered = Self::filter_block_with_chains(block, chains, false);
+            ring.push_block(&filtered);
+        }
+    }
+
     /// Build a fresh Vec of filter chains from the current FilterSettings.
     fn build_filter_chains(
         filters: &FilterSettings,
@@ -488,7 +590,10 @@ impl KvApp {
         (0..channel_count)
             .map(|_| {
                 let mut chain = FilterChain::passthrough();
-                if filters.hp_enabled && filters.hp_cutoff_hz > 0.0 {
+                if filters.hp_enabled
+                    && filters.hp_cutoff_hz > 0.0
+                    && filters.hp_cutoff_hz < sample_rate / 2.0
+                {
                     chain.hp = Biquad::highpass(filters.hp_cutoff_hz, sample_rate, Q_BUTTERWORTH);
                     chain.hp_enabled = true;
                 }
@@ -555,9 +660,18 @@ impl KvApp {
         for block in source.iter() {
             self.disp_ring.push_block(block);
         }
+        // History content changed → let the FFT recompute (it reads history).
+        self.block_seq = self.block_seq.wrapping_add(1);
     }
 
     /// Apply filter chains to a single block, producing a new filtered block.
+    ///
+    /// CAR (common-average reference) is subtracted in the f64 domain and fed
+    /// straight into the biquad, so the result is quantized to i16 exactly once
+    /// (the old two-pass version stored the CAR result as i16 first, which could
+    /// hard-clip a large common-mode transient before filtering — L2). The block
+    /// is cloned once and its data mutated in place (the old `..block.clone()`
+    /// struct-update cloned the sample buffer a second time only to drop it — L11).
     fn filter_block_with_chains(
         block: &SampleBlock,
         chains: &mut [FilterChain],
@@ -565,34 +679,36 @@ impl KvApp {
     ) -> SampleBlock {
         let ch_count = block.channel_count;
         let spc = block.samples_per_channel;
-        let mut data = block.data.clone();
+        let mut out = block.clone();
+        let data = &mut out.data;
 
         for s in 0..spc {
-            // CAR: subtract mean across channels at this time step
-            if car_enabled && ch_count > 0 {
-                let base = s * ch_count;
-                let mut sum: f64 = 0.0;
+            let base = s * ch_count;
+            // CAR: mean across channels at this time step (from the raw values,
+            // computed before any channel is overwritten).
+            let mean = if car_enabled && ch_count > 0 {
+                let mut sum = 0.0_f64;
                 for ch in 0..ch_count {
                     sum += data[base + ch] as f64;
                 }
-                let mean = sum / ch_count as f64;
-                for ch in 0..ch_count {
-                    data[base + ch] = (data[base + ch] as f64 - mean) as i16;
-                }
-            }
-            // Per-channel biquad filter
-            for ch in 0..ch_count.min(chains.len()) {
-                let idx = s * ch_count + ch;
-                let x = data[idx] as f64 / i16::MAX as f64;
-                let y = chains[ch].process(x);
+                sum / ch_count as f64
+            } else {
+                0.0
+            };
+            // CAR (in f64) → biquad (identity when no chain) → single quantize.
+            for ch in 0..ch_count {
+                let idx = base + ch;
+                let x = (data[idx] as f64 - mean) / i16::MAX as f64;
+                let y = if ch < chains.len() {
+                    chains[ch].process(x)
+                } else {
+                    x
+                };
                 data[idx] = (y * i16::MAX as f64).clamp(i16::MIN as f64, i16::MAX as f64) as i16;
             }
         }
 
-        SampleBlock {
-            data,
-            ..block.clone()
-        }
+        out
     }
 
     /// Process a new incoming block: store raw, filter incrementally, store filtered,
@@ -600,26 +716,33 @@ impl KvApp {
     fn ingest_block(&mut self, block: SampleBlock) {
         let ch_count = block.channel_count;
         let sample_rate = block.sample_rate;
+        self.block_seq = self.block_seq.wrapping_add(1);
 
-        // Rebuild chains on channel-count change. Filter-settings changes are
-        // handled (debounced) in update() so slider drags don't re-filter the
-        // full history every frame.
-        if self.filter_chains.len() != ch_count {
-            self.rebuild_filter_chains(sample_rate, ch_count);
-        }
-
-        // Reconfigure all display rings if channel count or sample rate changed.
+        // Reconfigure all display rings if channel count OR sample rate changed.
         let ring_needs_reconfigure = self.disp_ring.channel_count != ch_count
             || (self.disp_ring.sample_rate - sample_rate).abs() > 1.0;
         if ring_needs_reconfigure {
             self.disp_ring.reconfigure(ch_count, sample_rate);
             self.disp_ring_lfp.reconfigure(ch_count, sample_rate);
             self.disp_ring_ap.reconfigure(ch_count, sample_rate);
-            // Rebuild fixed chains to match new channel count / sample rate.
+            // Rebuild ALL filter chains to match the new channel count / sample
+            // rate. Biquad coefficients are a function of sample_rate, so a rate
+            // change (even with unchanged channel count) must recompute the user
+            // chains too — not just the fixed LFP/AP chains. The rings were just
+            // cleared, so we build fresh chains directly rather than going
+            // through refilter_history (old-rate history is incompatible anyway).
+            self.filter_chains = Self::build_filter_chains(&self.filters, sample_rate, ch_count);
+            self.filter_settings_snapshot = self.filters;
             self.filter_chains_lfp = Self::build_lfp_chains(ch_count, sample_rate);
             self.filter_chains_ap = Self::build_ap_chains(ch_count, sample_rate);
         } else {
-            // Lazy-initialise fixed chains on first block.
+            // Same geometry: lazy-initialise chains on first block after a reset
+            // (start/stop) where lengths were cleared. Filter-settings changes are
+            // handled (debounced) in update() so slider drags don't re-filter the
+            // full history every frame.
+            if self.filter_chains.len() != ch_count {
+                self.rebuild_filter_chains(sample_rate, ch_count);
+            }
             if self.filter_chains_lfp.len() != ch_count {
                 self.filter_chains_lfp = Self::build_lfp_chains(ch_count, sample_rate);
             }
@@ -627,6 +750,17 @@ impl KvApp {
                 self.filter_chains_ap = Self::build_ap_chains(ch_count, sample_rate);
             }
         }
+
+        // Keep the raw/filtered history at least as deep as the display ring's
+        // time span. refilter_history() rebuilds the ring from block_history on
+        // any filter/CAR toggle, so if history were shallower than the ring the
+        // browsable window would collapse to the history depth after any filter
+        // interaction (M1). Sizing history to the ring's span keeps the full
+        // RING_SECS browse window available. Bounded to cap RAM at extremes.
+        let spc = block.samples_per_channel.max(1);
+        self.history_capacity = (self.disp_ring.capacity * self.disp_ring.dwnsp)
+            .div_ceil(spc)
+            .clamp(MIN_HISTORY_BLOCKS, MAX_HISTORY_BLOCKS);
 
         // Produce filtered version using persistent chains
         let needs_filter = self.filters.any_filter_enabled() || self.filters.car_enabled;
@@ -647,14 +781,39 @@ impl KvApp {
         // Feed fixed-filter rings (always incremental, never CAR) — but only
         // when a tile actually consumes them, so the default single-tile
         // layout pays for one filter pass instead of three.
-        if self.lfp_tile_open() {
+        let lfp_open = self.lfp_tile_open();
+        if lfp_open {
+            // Tile just opened: back-fill from history so it isn't blank for a
+            // full window before live data catches up (L10).
+            if !self.lfp_was_open {
+                Self::warm_band_ring(
+                    &mut self.disp_ring_lfp,
+                    &mut self.filter_chains_lfp,
+                    &self.block_history,
+                    Self::build_lfp_chains,
+                    ch_count,
+                    sample_rate,
+                );
+            }
             let lfp_block =
                 Self::filter_block_with_chains(&block, &mut self.filter_chains_lfp, false);
             self.disp_ring_lfp.push_block(&lfp_block);
         }
+        self.lfp_was_open = lfp_open;
 
         // The AP band feeds both the AP tile and the spike snippet detector.
-        if self.ap_band_needed() {
+        let ap_needed = self.ap_band_needed();
+        if ap_needed {
+            if !self.ap_was_needed {
+                Self::warm_band_ring(
+                    &mut self.disp_ring_ap,
+                    &mut self.filter_chains_ap,
+                    &self.block_history,
+                    Self::build_ap_chains,
+                    ch_count,
+                    sample_rate,
+                );
+            }
             let ap_block =
                 Self::filter_block_with_chains(&block, &mut self.filter_chains_ap, false);
             self.disp_ring_ap.push_block(&ap_block);
@@ -664,6 +823,7 @@ impl KvApp {
             }
             self.snippet_store.process_block(&ap_block);
         }
+        self.ap_was_needed = ap_needed;
 
         // Phase 3: feed the TTL monitor and process the recording gate.
         self.ttl_history.push_block(&block);
@@ -738,6 +898,43 @@ impl KvApp {
         }
     }
 
+    /// Assemble the most recent `n` full-rate samples for channel `ch` from
+    /// block history, in time order (newest last). Uses the user-filtered
+    /// history when a filter/CAR is active (so the spectrum matches the
+    /// displayed signal), otherwise the raw history. Feeding the FFT from
+    /// full-rate history — rather than the peak-hold display ring, which is a
+    /// nonlinear, non-anti-aliased envelope — keeps the spectrum a valid PSD.
+    /// Returns fewer than `n` samples if history is short; the FFT treats a
+    /// short buffer as "not ready".
+    fn fft_samples(&self, ch: usize, n: usize) -> Vec<f64> {
+        let source = if self.filtered_history.is_empty() {
+            &self.block_history
+        } else {
+            &self.filtered_history
+        };
+        let mut out: Vec<f64> = Vec::with_capacity(n);
+        // Walk blocks newest→oldest, collecting channel `ch` in reverse until we
+        // have `n` (or history is exhausted), then restore chronological order.
+        'outer: for block in source.iter().rev() {
+            let cc = block.channel_count;
+            if ch >= cc {
+                break;
+            }
+            let spc = block.samples_per_channel;
+            for s in (0..spc).rev() {
+                let idx = s * cc + ch;
+                if idx < block.data.len() {
+                    out.push(block.data[idx] as f64);
+                    if out.len() == n {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        out.reverse();
+        out
+    }
+
     /// True when an LFP tile exists in the layout.
     fn lfp_tile_open(&self) -> bool {
         self.tile_has_pane(|kind| matches!(kind, TileKind::LfpView { .. }))
@@ -777,7 +974,14 @@ impl KvApp {
 
     fn toggle_acquisition(&mut self) {
         if self.is_running() {
-            self.stop_all();
+            // Stopping acquisition mid-recording finalizes the recording, so
+            // confirm first; with nothing recording there's no data to lose and
+            // it stops immediately (C1).
+            if self.recording.state == RecordingState::Recording {
+                self.pending_stop = Some(PendingStop::Acquisition);
+            } else {
+                self.stop_all();
+            }
         } else {
             match self.mode {
                 AcqMode::Demo => self.start_demo(),
@@ -858,7 +1062,9 @@ impl KvApp {
                 }
             }
             RecordingState::Armed => self.begin_recording(),
-            RecordingState::Recording => self.stop_recording(),
+            // Confirm before ending an active recording (C1) — a bare `R` is
+            // easy to hit by accident.
+            RecordingState::Recording => self.pending_stop = Some(PendingStop::Recording),
         }
     }
 
@@ -867,31 +1073,44 @@ impl KvApp {
     /// mid-recording selection change cannot change the file's layout.
     fn begin_recording(&mut self) {
         let channels = self.channel_select.recording_selection();
+        // Each recording writes into its own unique session folder so a new
+        // recording can never silently overwrite a previous one — the recorder
+        // otherwise always writes a fixed `recording.kvraw` into the given dir (C2).
+        let session_dir =
+            resolve_session_dir(&self.recording.output_dir, &self.recording.file_prefix);
+        let session_label = session_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("recording")
+            .to_string();
+        let session_display = session_dir.display().to_string();
         match self.mode {
             AcqMode::Device => {
                 if let Some(ref pipeline) = self.live_pipeline {
-                    let path: std::path::PathBuf = self.recording.output_dir.clone().into();
-                    let _ = pipeline
-                        .recorder_cmd_tx
-                        .send(RecorderCmd::Start { path, channels });
+                    let _ = pipeline.recorder_cmd_tx.send(RecorderCmd::Start {
+                        path: session_dir,
+                        channels,
+                    });
                     self.recording.state = RecordingState::Recording;
                     self.recording.recorded_blocks = 0;
                     self.recording.recorded_bytes = 0;
+                    self.recording.active_dir = Some(session_display);
                     self.recording_start_time = Some(Instant::now());
                     self.recording_error = None;
-                    self.toasts.info("Recording started");
+                    self.toasts.info(format!("Recording to {session_label}"));
                 }
             }
-            AcqMode::Demo => match StreamingRecorder::new(&self.recording.output_dir) {
+            AcqMode::Demo => match StreamingRecorder::new(&session_dir) {
                 Ok(rec) => {
                     self.active_recorder = Some(rec);
                     self.record_channels = channels;
                     self.recording.state = RecordingState::Recording;
                     self.recording.recorded_blocks = 0;
                     self.recording.recorded_bytes = 0;
+                    self.recording.active_dir = Some(session_display);
                     self.recording_start_time = Some(Instant::now());
                     self.recording_error = None;
-                    self.toasts.info("Recording started");
+                    self.toasts.info(format!("Recording to {session_label}"));
                 }
                 Err(e) => {
                     let msg = format!("Failed to open output: {e}");
@@ -916,6 +1135,7 @@ impl KvApp {
                     // no recorder thread to emit RecorderEvent::Stopped, so reset
                     // the recording state here instead of leaving it stuck.
                     self.recording.state = RecordingState::Idle;
+                    self.recording.active_dir = None;
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                 }
@@ -945,8 +1165,76 @@ impl KvApp {
                 }
                 self.record_channels = None;
                 self.recording.state = RecordingState::Idle;
+                self.recording.active_dir = None;
                 self.recording_start_time = None;
                 self.recorder_buffer_occupancy = 0.0;
+            }
+        }
+    }
+
+    /// Prune the drop-activity window to the last [`DROP_ACTIVITY_WINDOW_SECS`]
+    /// and return how many blocks were dropped within it — 0 means "not dropping
+    /// right now" even if the lifetime total is large (C12).
+    fn recent_drops(&mut self) -> u64 {
+        let now = Instant::now();
+        while let Some(&(t, _)) = self.drop_events.front() {
+            if now.duration_since(t).as_secs_f64() > DROP_ACTIVITY_WINDOW_SECS {
+                self.drop_events.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.drop_events.iter().map(|&(_, n)| n).sum()
+    }
+
+    /// Raise a one-shot toast the first time buffer occupancy or disk headroom
+    /// crosses into a warning/critical tier during a recording, so the alert
+    /// does not depend on the operator being on the ACQUIRE tab (C10). The
+    /// high-water marks reset when recording stops, so the next recording warns
+    /// afresh.
+    fn update_health_alerts(&mut self) {
+        if self.recording.state != RecordingState::Recording {
+            self.buf_alert_level = 0;
+            self.disk_alert_level = 0;
+            return;
+        }
+
+        let buf_level = if self.recorder_buffer_occupancy > 0.75 {
+            2
+        } else if self.recorder_buffer_occupancy > 0.40 {
+            1
+        } else {
+            0
+        };
+        if buf_level > self.buf_alert_level {
+            if buf_level == 2 {
+                self.toasts
+                    .error("Recorder buffer critical \u{2014} disk may be too slow");
+            } else {
+                self.toasts
+                    .warning("Recorder buffer filling \u{2014} disk under pressure");
+            }
+            self.buf_alert_level = buf_level;
+        }
+
+        if let Some(free) = self.disk_free_bytes {
+            let free_gb = free as f64 / 1_000_000_000.0;
+            let disk_level = if free_gb < 2.0 {
+                2
+            } else if free_gb < 10.0 {
+                1
+            } else {
+                0
+            };
+            if disk_level > self.disk_alert_level {
+                if disk_level == 2 {
+                    self.toasts
+                        .error(format!("Disk critically low \u{2014} {free_gb:.1} GB left"));
+                } else {
+                    self.toasts
+                        .warning(format!("Disk space low \u{2014} {free_gb:.1} GB left"));
+                }
+                self.disk_alert_level = disk_level;
             }
         }
     }
@@ -1235,6 +1523,7 @@ impl KvApp {
 
         let mut recorder_events: Vec<RecorderEvent> = Vec::new();
         let mut preview_blocks: Vec<Arc<SampleBlock>> = Vec::new();
+        let mut newly_dropped: u64 = 0;
 
         {
             let Some(pipeline) = self.live_pipeline.as_mut() else {
@@ -1251,12 +1540,33 @@ impl KvApp {
                 if let Some(expected) = pipeline.expected_next_packet_id
                     && block.packet_id > expected
                 {
-                    pipeline.dropped_blocks += block.packet_id - expected;
+                    let gap = block.packet_id - expected;
+                    pipeline.dropped_blocks += gap;
+                    newly_dropped += gap;
                 }
                 pipeline.expected_next_packet_id = Some(block.packet_id + 1);
                 preview_blocks.push(block);
             }
         } // borrow released here
+
+        if newly_dropped > 0 {
+            let now = Instant::now();
+            // Feed the sliding-window health indicator (C12).
+            self.drop_events.push_back((now, newly_dropped));
+            // Actively alert on data loss during a recording: dropped blocks are
+            // unrecoverable, so raise a throttled toast (≤1 per 3 s) instead of
+            // relying on the operator noticing the status-bar drop counter (C11).
+            if self.recording.state == RecordingState::Recording {
+                let fire = self
+                    .drop_alert_time
+                    .is_none_or(|t| now.duration_since(t).as_secs_f64() >= 3.0);
+                if fire {
+                    self.drop_alert_time = Some(now);
+                    self.toasts
+                        .warning(format!("Dropped {newly_dropped} blocks \u{2014} data lost"));
+                }
+            }
+        }
 
         // ── Process recorder events ──────────────────────────────────────────
         for event in recorder_events {
@@ -1266,6 +1576,7 @@ impl KvApp {
                     self.recording.recorded_blocks = blocks;
                     self.recording.recorded_bytes = bytes;
                     self.recording.state = RecordingState::Idle;
+                    self.recording.active_dir = None;
                     self.recording_start_time = None;
                     self.recorder_buffer_occupancy = 0.0;
                     self.toasts.success(format!(
@@ -1345,8 +1656,11 @@ impl KvApp {
 
     /// Handle keyboard shortcuts.
     fn handle_keys(&mut self, ctx: &egui::Context) {
-        // Only when no text field is focused
-        if ctx.memory(|m| m.focused().is_some()) {
+        // Suppress single-key shortcuts only while a text field is actively
+        // consuming keyboard input. The previous blanket "any widget focused"
+        // check silently killed Space/R/G/P/F/[ ] whenever a slider or DragValue
+        // merely held focus after a click (C21).
+        if ctx.wants_keyboard_input() {
             return;
         }
 
@@ -1491,6 +1805,219 @@ impl KvApp {
             self.show_help = false;
         }
     }
+
+    /// Confirmation modal shown when the operator tries to close the window while
+    /// a recording is active (C1). Confirming finalizes the recording before the
+    /// app quits; cancelling keeps recording.
+    fn draw_quit_confirm(&mut self, ctx: &egui::Context) {
+        if !self.pending_quit {
+            return;
+        }
+        let mut stop_and_quit = false;
+        let mut keep_recording = false;
+        let modal = egui::Modal::new(egui::Id::new("kv_quit_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(180))
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                ui.label(
+                    egui::RichText::new("\u{26A0} Recording in progress")
+                        .size(theme::FONT_LABEL)
+                        .strong()
+                        .color(theme::ACCENT_RED),
+                );
+                ui.add_space(4.0);
+                ui.label(theme::body(
+                    "Closing now stops and finalizes the current recording. \
+                     Un-flushed data is written before the app exits.",
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::danger_button(ui, "Stop & Quit", true) {
+                        stop_and_quit = true;
+                    }
+                    if theme::secondary_button(ui, "Keep recording", true) {
+                        keep_recording = true;
+                    }
+                });
+            });
+        // Backdrop click / Esc is treated as "keep recording" — the safe default.
+        if modal.should_close() {
+            keep_recording = true;
+        }
+        if stop_and_quit {
+            self.stop_recording();
+            if self.config_persist.auto_save {
+                let cfg = self.capture_persistent(ctx);
+                let _ = config_persist::save_config(&self.config_persist.config_path, &cfg);
+            }
+            self.pending_quit = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if keep_recording {
+            self.pending_quit = false;
+        }
+    }
+
+    /// Confirmation modal for an interactive stop that would finalize an active
+    /// recording (C1). Guards a stray `Space`/`R`/Stop from silently ending a
+    /// recording; automated (trigger/remote) stops never reach here.
+    fn draw_stop_confirm(&mut self, ctx: &egui::Context) {
+        let Some(kind) = self.pending_stop else {
+            return;
+        };
+        // If the recording already ended by another path, drop the prompt.
+        if self.recording.state != RecordingState::Recording {
+            self.pending_stop = None;
+            return;
+        }
+        let (title, detail, confirm_label) = match kind {
+            PendingStop::Recording => (
+                "Stop recording?",
+                "The recording will be finalized and closed. Acquisition keeps running.",
+                "Stop recording",
+            ),
+            PendingStop::Acquisition => (
+                "Stop acquisition?",
+                "Acquisition will stop and the active recording will be finalized and closed.",
+                "Stop",
+            ),
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("kv_stop_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                ui.label(
+                    egui::RichText::new(format!("\u{26A0} {title}"))
+                        .size(theme::FONT_LABEL)
+                        .strong()
+                        .color(theme::ACCENT_RED),
+                );
+                ui.add_space(4.0);
+                ui.label(theme::body(detail));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::danger_button(ui, confirm_label, true) {
+                        confirm = true;
+                    }
+                    if theme::secondary_button(ui, "Keep recording", true) {
+                        cancel = true;
+                    }
+                });
+            });
+        // Backdrop click / Esc keeps recording — the safe default.
+        if modal.should_close() {
+            cancel = true;
+        }
+        if confirm {
+            self.pending_stop = None;
+            match kind {
+                PendingStop::Recording => self.stop_recording(),
+                PendingStop::Acquisition => self.stop_all(),
+            }
+        } else if cancel {
+            self.pending_stop = None;
+        }
+    }
+
+    /// Read the config file and apply it over the live settings. Split from the
+    /// button handler so the Load confirmation modal can invoke it (C22).
+    fn apply_loaded_config(&mut self) {
+        match config_persist::load_config(&self.config_persist.config_path) {
+            Ok(cfg) => {
+                cfg.apply_to(
+                    &mut self.display,
+                    &mut self.filters,
+                    &mut self.recording.output_dir,
+                    &mut self.recording.file_prefix,
+                    &mut self.remote_api_state.port,
+                );
+                self.ui_scale = cfg
+                    .ui_scale
+                    .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
+                self.config_persist.status_message = Some("Loaded".to_string());
+                self.config_persist.loaded = true;
+                self.toasts.success("Configuration loaded");
+            }
+            Err(e) => {
+                self.toasts.error(format!("Load failed: {e}"));
+                self.config_persist.status_message = Some(e);
+            }
+        }
+    }
+
+    /// Render a dismissible top error banner with the shared error styling, used
+    /// for both device and recorder faults so an error always looks the same and
+    /// is never buried in a sidebar section (C9/C17). Returns true if Dismiss was
+    /// clicked this frame.
+    fn draw_error_banner(ctx: &egui::Context, id: &str, prefix: &str, msg: &str) -> bool {
+        let mut dismissed = false;
+        egui::TopBottomPanel::top(egui::Id::new(id))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::ERR_BANNER_BG)
+                    .inner_margin(egui::Margin::symmetric(8, 4)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("\u{26A0} {prefix}: {msg}"))
+                            .size(theme::FONT_LABEL)
+                            .strong()
+                            .color(theme::ERR_BANNER_TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Dismiss").clicked() {
+                            dismissed = true;
+                        }
+                    });
+                });
+            });
+        dismissed
+    }
+
+    /// Confirmation modal for loading a config over the current live settings —
+    /// the action is not undoable, so it asks first (C22).
+    fn draw_load_confirm(&mut self, ctx: &egui::Context) {
+        if !self.pending_load {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("kv_load_modal"))
+            .backdrop_color(egui::Color32::from_black_alpha(160))
+            .show(ctx, |ui| {
+                ui.set_max_width(340.0);
+                ui.label(
+                    egui::RichText::new("Load configuration?")
+                        .size(theme::FONT_LABEL)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(theme::body(
+                    "This replaces ALL current display, filter, recording and \
+                     UI-scale settings with the values from the saved config file.",
+                ));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, "Load", true) {
+                        confirm = true;
+                    }
+                    if theme::secondary_button(ui, "Cancel", true) {
+                        cancel = true;
+                    }
+                });
+            });
+        if modal.should_close() {
+            cancel = true;
+        }
+        if confirm {
+            self.pending_load = false;
+            self.apply_loaded_config();
+        } else if cancel {
+            self.pending_load = false;
+        }
+    }
 }
 
 impl eframe::App for KvApp {
@@ -1517,15 +2044,25 @@ impl eframe::App for KvApp {
         if !self.window_restored {
             self.window_restored = true;
             let (sw, sh) = self.restore_window_size;
-            let w = sw.clamp(640.0, 7680.0);
-            let h = sh.clamp(480.0, 4320.0);
+            // Floor matches main.rs `min_inner_size` so a persisted tiny size can't
+            // re-shrink the window below the width the toolbar needs (C6).
+            let w = sw.clamp(1100.0, 7680.0);
+            let h = sh.clamp(640.0, 4320.0);
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
         }
 
-        // Auto-save the full config when the window is closing (#15).
-        if ctx.input(|i| i.viewport().close_requested()) && self.config_persist.auto_save {
-            let cfg = self.capture_persistent(ctx);
-            let _ = config_persist::save_config(&self.config_persist.config_path, &cfg);
+        // Window-close handling. A close request while recording is intercepted
+        // and routed to a confirmation modal so an in-flight recording is not torn
+        // down (and, in Demo mode, left with an unfinalized header) by a stray
+        // click on the window's X (C1). Otherwise auto-save and let it close (#15).
+        if ctx.input(|i| i.viewport().close_requested()) {
+            if self.recording.state == RecordingState::Recording && !self.pending_quit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.pending_quit = true;
+            } else if self.config_persist.auto_save {
+                let cfg = self.capture_persistent(ctx);
+                let _ = config_persist::save_config(&self.config_persist.config_path, &cfg);
+            }
         }
 
         // Auto-start demo on first frame
@@ -1577,12 +2114,26 @@ impl eframe::App for KvApp {
         // the view is self-contained and no longer depends on the sidebar
         // section being expanded/enabled (#4a).
         if self.fft_tile_open() {
-            let sr = self
-                .latest_block
-                .as_ref()
-                .map(|b| b.sample_rate)
-                .unwrap_or(30000.0);
-            self.fft.update_from_ring(&self.disp_ring, sr);
+            // Recompute only when the data or the FFT params changed — not every
+            // frame (the GUI renders many frames between blocks, and none while
+            // paused) (L12).
+            let ch = self.fft.selected_channel;
+            let n = self.fft.fft_size;
+            let stale = self.fft.computed_seq != self.block_seq
+                || self.fft.computed_channel != ch
+                || self.fft.computed_fft_size != n;
+            if stale {
+                let sr = self
+                    .latest_block
+                    .as_ref()
+                    .map(|b| b.sample_rate)
+                    .unwrap_or(30000.0);
+                let samples = self.fft_samples(ch, n);
+                self.fft.update_from_samples(&samples, sr);
+                self.fft.computed_seq = self.block_seq;
+                self.fft.computed_channel = ch;
+                self.fft.computed_fft_size = n;
+            }
         }
 
         // Detect filter settings change (user toggled in UI) — re-filter
@@ -1654,14 +2205,14 @@ impl eframe::App for KvApp {
                     // Brand
                     ui.label(
                         egui::RichText::new("KEYVAST")
-                            .size(16.0)
+                            .size(theme::FONT_BRAND)
                             .strong()
                             .color(theme::ACCENT_BLUE),
                     );
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new("Acquisition System")
-                            .size(10.0)
+                            .size(theme::FONT_BODY)
                             .color(theme::TEXT_DIM),
                     );
 
@@ -1679,7 +2230,7 @@ impl eframe::App for KvApp {
                         let playing = self.playback_mgr.state == playback::PlaybackState::Playing;
                         if theme::transport_button_sized(
                             ui,
-                            if playing { " Pause " } else { "  Play  " },
+                            if playing { "Pause" } else { "Play" },
                             if playing {
                                 theme::TEXT_SECONDARY
                             } else {
@@ -1693,7 +2244,7 @@ impl eframe::App for KvApp {
                         }
                         if theme::transport_button_tip(
                             ui,
-                            " Restart ",
+                            "Restart",
                             theme::BG_WIDGET,
                             loaded,
                             "Jump back to the start of the recording",
@@ -1713,7 +2264,7 @@ impl eframe::App for KvApp {
                             ui.label(theme::caption(format!("\u{25B6} {name}")));
                         } else if theme::transport_button_tip(
                             ui,
-                            " Open\u{2026} ",
+                            "Open\u{2026}",
                             theme::BTN_PLAY,
                             true,
                             "Open a .kvraw recording to play back",
@@ -1737,10 +2288,15 @@ impl eframe::App for KvApp {
                         }
 
                         // Record button — always clickable when running.
+                        // Labels name the ACTION the button performs, not the
+                        // current state — the state is shown by the status pill.
+                        // In particular the middle state is "Start Rec" (begin
+                        // writing to disk), not the passive status word "ARMED",
+                        // and it matches the sidebar Record button (C3).
                         let rec_label = match self.recording.state {
-                            RecordingState::Idle => " Record ",
-                            RecordingState::Armed => " ARMED ",
-                            RecordingState::Recording => " STOP REC ",
+                            RecordingState::Idle => "Record",
+                            RecordingState::Armed => "Start Rec",
+                            RecordingState::Recording => "Stop Rec",
                         };
                         let rec_color = match self.recording.state {
                             RecordingState::Idle => theme::BTN_RECORD,
@@ -1769,14 +2325,18 @@ impl eframe::App for KvApp {
                         // Pause button — only shown when running or already paused.
                         if running || self.display_paused {
                             let pause_label = if self.display_paused {
-                                " Resume "
+                                "Resume"
                             } else {
-                                " Pause "
+                                "Pause"
                             };
+                            // Both states use a solid accent so the enabled Pause
+                            // button never reads as disabled the way the old muted
+                            // TEXT_SECONDARY gray did; orange flags the frozen
+                            // (paused) state, blue is the normal action (C20).
                             let pause_color = if self.display_paused {
-                                theme::ACCENT_BLUE
+                                theme::ACCENT_ORANGE
                             } else {
-                                theme::TEXT_SECONDARY
+                                theme::ACCENT_BLUE
                             };
                             if theme::transport_button_sized(
                                 ui,
@@ -1814,43 +2374,55 @@ impl eframe::App for KvApp {
                     // Segmented control: the three sources sit flush inside one
                     // recessed frame so they read as a single "pick one" switch
                     // rather than three independent buttons.
+                    // Switching source stops (and finalizes) any live recording,
+                    // so the switch is locked while recording — the operator must
+                    // stop first. This mirrors the output-dir lock and prevents an
+                    // accidental click from silently ending a recording (C1).
+                    let source_locked = self.recording.state == RecordingState::Recording;
                     let mut pick: Option<DataSource> = None;
-                    egui::Frame::new()
-                        .fill(theme::BG_DARKEST)
-                        .corner_radius(egui::CornerRadius::same(5))
-                        .inner_margin(egui::Margin::same(2))
-                        .show(ui, |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            for (src, label, tip) in [
-                                (
-                                    DataSource::Demo,
-                                    "Demo",
-                                    "Synthetic neural data \u{2014} no hardware",
-                                ),
-                                (DataSource::Device, "Device", device_tip),
-                                (
-                                    DataSource::Playback,
-                                    "Playback",
-                                    "Replay a saved .kvraw recording",
-                                ),
-                            ] {
-                                let selected = self.data_source == src;
-                                if ui
-                                    .add_sized(
-                                        [66.0, 22.0],
-                                        egui::SelectableLabel::new(
-                                            selected,
-                                            egui::RichText::new(label).size(theme::FONT_HEADING),
-                                        ),
-                                    )
-                                    .on_hover_text(tip)
-                                    .clicked()
-                                    && !selected
-                                {
-                                    pick = Some(src);
+                    let seg = ui.add_enabled_ui(!source_locked, |ui| {
+                        egui::Frame::new()
+                            .fill(theme::BG_DARKEST)
+                            .corner_radius(egui::CornerRadius::same(theme::RADIUS_CARD))
+                            .inner_margin(egui::Margin::same(2))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                for (src, label, tip) in [
+                                    (
+                                        DataSource::Demo,
+                                        "Demo",
+                                        "Synthetic neural data \u{2014} no hardware",
+                                    ),
+                                    (DataSource::Device, "Device", device_tip),
+                                    (
+                                        DataSource::Playback,
+                                        "Playback",
+                                        "Replay a saved .kvraw recording",
+                                    ),
+                                ] {
+                                    let selected = self.data_source == src;
+                                    if ui
+                                        .add_sized(
+                                            [66.0, 22.0],
+                                            egui::SelectableLabel::new(
+                                                selected,
+                                                egui::RichText::new(label)
+                                                    .size(theme::FONT_HEADING),
+                                            ),
+                                        )
+                                        .on_hover_text(tip)
+                                        .clicked()
+                                        && !selected
+                                    {
+                                        pick = Some(src);
+                                    }
                                 }
-                            }
-                        });
+                            });
+                    });
+                    if source_locked {
+                        seg.response
+                            .on_hover_text("Stop recording before switching source");
+                    }
                     if let Some(src) = pick {
                         self.select_source(src);
                     }
@@ -1872,22 +2444,24 @@ impl eframe::App for KvApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new("v0.2.0")
-                                .size(9.0)
+                                .size(theme::FONT_CAPTION)
                                 .color(theme::TEXT_DIM),
                         );
                         ui.add_space(10.0);
 
-                        // Acquisition clock — colored by state.
-                        let clock_color = if self.recording.state == RecordingState::Recording {
-                            theme::ACCENT_RED
-                        } else if running {
-                            theme::ACCENT_YELLOW
-                        } else {
-                            theme::TEXT_DIM
+                        // Acquisition clock — colored to match the status pill so
+                        // the two never disagree: red=recording, yellow=armed,
+                        // green=live (was yellow, colliding with ARMED — C19),
+                        // dim=idle.
+                        let clock_color = match self.recording.state {
+                            RecordingState::Recording => theme::ACCENT_RED,
+                            RecordingState::Armed => theme::ACCENT_YELLOW,
+                            RecordingState::Idle if running => theme::ACCENT_GREEN,
+                            RecordingState::Idle => theme::TEXT_DIM,
                         };
                         ui.label(
                             egui::RichText::new(theme::format_clock(elapsed))
-                                .size(15.0)
+                                .size(theme::FONT_DISPLAY)
                                 .monospace()
                                 .strong()
                                 .color(clock_color),
@@ -1898,19 +2472,30 @@ impl eframe::App for KvApp {
                         ui.add_space(10.0);
 
                         // At-a-glance state pill: REC / ARMED / LIVE / IDLE.
+                        // Labels come from the canonical panels::rec_label /
+                        // acq_label so this pill, the status bar and the sidebar
+                        // always agree on wording (C4).
                         let (dot, label, color) = match self.recording.state {
-                            RecordingState::Recording => {
-                                (theme::STATUS_RECORDING, "REC", theme::ACCENT_RED)
-                            }
-                            RecordingState::Armed => {
-                                (theme::STATUS_ARMED, "ARMED", theme::ACCENT_YELLOW)
-                            }
-                            RecordingState::Idle if running => {
-                                (theme::STATUS_CONNECTED, "LIVE", theme::ACCENT_GREEN)
-                            }
-                            RecordingState::Idle => {
-                                (theme::STATUS_IDLE, "IDLE", theme::TEXT_SECONDARY)
-                            }
+                            RecordingState::Recording => (
+                                theme::STATUS_RECORDING,
+                                panels::rec_label(&RecordingState::Recording),
+                                theme::ACCENT_RED,
+                            ),
+                            RecordingState::Armed => (
+                                theme::STATUS_ARMED,
+                                panels::rec_label(&RecordingState::Armed),
+                                theme::ACCENT_YELLOW,
+                            ),
+                            RecordingState::Idle if running => (
+                                theme::STATUS_CONNECTED,
+                                panels::acq_label(true),
+                                theme::ACCENT_GREEN,
+                            ),
+                            RecordingState::Idle => (
+                                theme::STATUS_IDLE,
+                                panels::acq_label(false),
+                                theme::TEXT_SECONDARY,
+                            ),
                         };
                         // In a right-to-left layout, add the label first so the
                         // status dot lands to its left, reading "● LABEL".
@@ -1919,7 +2504,10 @@ impl eframe::App for KvApp {
                         ui.add_sized(
                             [44.0, 16.0],
                             egui::Label::new(
-                                egui::RichText::new(label).size(12.0).strong().color(color),
+                                egui::RichText::new(label)
+                                    .size(theme::FONT_LABEL)
+                                    .strong()
+                                    .color(color),
                             ),
                         );
                         ui.add_space(5.0);
@@ -1928,38 +2516,42 @@ impl eframe::App for KvApp {
                 });
             });
 
-        // ── Device error banner ─────────────────────────────────
-        // Surfaced when the acquisition source fails to open or read.
-        // Dismissible; the GUI and any other mode keep running regardless.
-        // Borrow the message instead of cloning it every frame; record the
-        // dismiss action in a local and apply it after the panel closure ends.
+        // ── Error banners (device + recorder) ───────────────────
+        // Both faults now surface as the same dismissible top banner with the
+        // shared error styling, instead of a device banner up top and a recorder
+        // banner buried in a collapsed sidebar section (C9/C17). The message is
+        // borrowed (not cloned each frame); dismissal is applied after drawing.
         let mut dismiss_device_error = false;
-        if let Some(err) = self.device_error.as_ref() {
-            egui::TopBottomPanel::top("device_error_banner")
-                .frame(
-                    egui::Frame::new()
-                        .fill(theme::ACCENT_RED)
-                        .inner_margin(egui::Margin::symmetric(8, 4)),
-                )
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("\u{26A0} Device error: {err}"))
-                                .size(12.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("Dismiss").clicked() {
-                                dismiss_device_error = true;
-                            }
-                        });
-                    });
-                });
+        if let Some(err) = self.device_error.as_deref() {
+            dismiss_device_error =
+                Self::draw_error_banner(ctx, "device_error_banner", "Device error", err);
         }
         if dismiss_device_error {
             self.device_error = None;
         }
+
+        let mut dismiss_recording_error = false;
+        if let Some(err) = self.recording_error.as_deref() {
+            dismiss_recording_error =
+                Self::draw_error_banner(ctx, "recorder_error_banner", "Recording error", err);
+        }
+        if dismiss_recording_error {
+            self.recording_error = None;
+        }
+
+        // Refresh disk headroom ~1/s so the always-visible status bar can show
+        // it regardless of which sidebar tab is open, and proactively alert
+        // before the recorder errors out on a full volume (C10).
+        let now_poll = Instant::now();
+        if self
+            .disk_poll_time
+            .is_none_or(|t| now_poll.duration_since(t).as_secs_f64() >= 1.0)
+        {
+            self.disk_poll_time = Some(now_poll);
+            self.disk_free_bytes = crate::diskspace::free_bytes(&self.recording.output_dir);
+        }
+        self.update_health_alerts();
+        let recent_drops = self.recent_drops();
 
         // ── Bottom status bar ───────────────────────────────────
         egui::TopBottomPanel::bottom("status_bar")
@@ -1976,6 +2568,9 @@ impl eframe::App for KvApp {
                     self.latest_stats.as_ref(),
                     self.latest_block.as_ref(),
                     elapsed,
+                    self.recorder_buffer_occupancy,
+                    self.disk_free_bytes,
+                    recent_drops,
                 );
             });
 
@@ -1993,11 +2588,11 @@ impl eframe::App for KvApp {
                 let mut start = false;
                 let mut stop = false;
                 let mut toggle_rec = false;
-                let mut dismiss_error = false;
                 let mut start_impedance = false;
                 let mut open_playback_file = false;
                 let mut save_clicked = false;
                 let mut load_clicked = false;
+                let mut jump_to_display = false;
 
                 // Compute elapsed recording seconds for the clock display.
                 let rec_elapsed_secs = self
@@ -2020,7 +2615,7 @@ impl eframe::App for KvApp {
                         ui.selectable_value(
                             &mut self.sidebar_tab,
                             tab,
-                            egui::RichText::new(label).size(10.0).strong(),
+                            egui::RichText::new(label).size(theme::FONT_BODY).strong(),
                         );
                     }
                 });
@@ -2040,8 +2635,19 @@ impl eframe::App for KvApp {
                                 self.latest_block.as_ref(),
                                 rec_elapsed_secs,
                                 self.recorder_buffer_occupancy,
-                                self.recording_error.as_deref(),
-                                &mut dismiss_error,
+                            );
+
+                            // Impedance is an electrode/device QC step, so it
+                            // belongs next to the device controls, not in a
+                            // misc TOOLS grab-bag (C23).
+                            ui.add_space(4.0);
+                            let can_measure = self.device.kind == DeviceKind::Rhd
+                                && self.device.rhd_bitfile.is_some();
+                            impedance_panel::draw_impedance_section(
+                                ui,
+                                &mut self.impedance,
+                                can_measure,
+                                &mut start_impedance,
                             );
 
                             ui.add_space(4.0);
@@ -2050,7 +2656,7 @@ impl eframe::App for KvApp {
                             ui.add_space(4.0);
                             egui::CollapsingHeader::new(
                                 egui::RichText::new("DATA FORMAT")
-                                    .size(11.0)
+                                    .size(theme::FONT_HEADING)
                                     .strong()
                                     .color(theme::TEXT_SECONDARY),
                             )
@@ -2062,7 +2668,7 @@ impl eframe::App for KvApp {
                                         "Recordings are saved in the native Keyvast .kvraw format. \
                                          Optionally convert a recording to another format below.",
                                     )
-                                    .size(9.0)
+                                    .size(theme::FONT_CAPTION)
                                     .color(theme::TEXT_DIM),
                                 );
                                 ui.add_space(2.0);
@@ -2070,22 +2676,22 @@ impl eframe::App for KvApp {
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::KeyvastNative,
-                                        egui::RichText::new("Keyvast .kvraw").size(10.0),
+                                        egui::RichText::new("Keyvast .kvraw").size(theme::FONT_BODY),
                                     );
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::IntanRhd,
-                                        egui::RichText::new("Intan .rhd").size(10.0),
+                                        egui::RichText::new("Intan .rhd").size(theme::FONT_BODY),
                                     );
                                     ui.selectable_value(
                                         &mut self.export_format,
                                         ExportFormat::FlatBinary,
-                                        egui::RichText::new("Flat binary").size(10.0),
+                                        egui::RichText::new("Flat binary").size(theme::FONT_BODY),
                                     );
                                 });
                                 ui.label(
                                     egui::RichText::new(self.export_format.label())
-                                        .size(9.0)
+                                        .size(theme::FONT_CAPTION)
                                         .italics()
                                         .color(theme::TEXT_DIM),
                                 );
@@ -2097,7 +2703,7 @@ impl eframe::App for KvApp {
                                             "Native format — recordings are already saved as .kvraw. \
                                              Pick a third-party format above to convert.",
                                         )
-                                        .size(9.0)
+                                        .size(theme::FONT_CAPTION)
                                         .color(theme::TEXT_DIM),
                                     );
                                 } else {
@@ -2105,7 +2711,7 @@ impl eframe::App for KvApp {
                                         .add_enabled(
                                             !exporting,
                                             egui::Button::new(
-                                                egui::RichText::new("Convert .kvraw…").size(10.0),
+                                                egui::RichText::new("Convert .kvraw…").size(theme::FONT_BODY),
                                             ),
                                         )
                                         .on_hover_text(
@@ -2118,30 +2724,58 @@ impl eframe::App for KvApp {
                                     if exporting {
                                         ui.label(
                                             egui::RichText::new("Converting…")
-                                                .size(9.0)
+                                                .size(theme::FONT_CAPTION)
                                                 .color(theme::TEXT_DIM),
                                         );
                                     } else if let Some(ref status) = self.export_status {
                                         ui.label(
                                             egui::RichText::new(status)
-                                                .size(9.0)
+                                                .size(theme::FONT_CAPTION)
                                                 .color(theme::TEXT_DIM),
                                         );
                                     }
                                 }
                             });
 
+                            // Record-subset decision lives with the recording
+                            // controls, not two clicks away on the DISPLAY tab —
+                            // choosing what to save is part of arming (C7). The
+                            // full per-channel Rec picker still lives in DISPLAY.
                             ui.add_space(4.0);
                             self.channel_select.sync_channel_count(total_ch);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Recording {} of {} channels \u{00B7} configure in DISPLAY \u{25B8} CHANNELS",
-                                    self.channel_select.selected_count(),
-                                    total_ch,
-                                ))
-                                .size(theme::FONT_CAPTION)
-                                .color(theme::TEXT_DIM),
-                            );
+                            let rec_locked =
+                                self.recording.state == RecordingState::Recording;
+                            ui.add_enabled_ui(!rec_locked, |ui| {
+                                ui.checkbox(
+                                    &mut self.channel_select.enabled,
+                                    egui::RichText::new("Record subset only")
+                                        .size(theme::FONT_BODY),
+                                )
+                                .on_hover_text(
+                                    "When off, every channel is recorded. Pick which channels in DISPLAY \u{25B8} CHANNELS.",
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "Recording {} of {} channels",
+                                        self.channel_select.selected_count(),
+                                        total_ch,
+                                    ))
+                                    .size(theme::FONT_CAPTION)
+                                    .color(theme::TEXT_DIM),
+                                );
+                                if self.channel_select.enabled
+                                    && ui
+                                        .small_button("Edit\u{2026}")
+                                        .on_hover_text(
+                                            "Open the per-channel Rec picker in DISPLAY \u{25B8} CHANNELS",
+                                        )
+                                        .clicked()
+                                {
+                                    jump_to_display = true;
+                                }
+                            });
                         }
                         SidebarTab::Display => {
                             panels::draw_display_settings(ui, &mut self.display);
@@ -2170,16 +2804,8 @@ impl eframe::App for KvApp {
                             fft_panel::draw_fft_section(ui, &mut self.fft, sr, total_ch);
                         }
                         SidebarTab::Tools => {
-                            let can_measure = self.device.kind == DeviceKind::Rhd
-                                && self.device.rhd_bitfile.is_some();
-                            impedance_panel::draw_impedance_section(
-                                ui,
-                                &mut self.impedance,
-                                can_measure,
-                                &mut start_impedance,
-                            );
-
-                            ui.add_space(4.0);
+                            // IMPEDANCE moved to ACQUIRE (next to the device). TOOLS
+                            // now holds offline/utility panels (C23).
                             playback::draw_playback_section(
                                 ui,
                                 &mut self.playback_mgr,
@@ -2204,9 +2830,6 @@ impl eframe::App for KvApp {
                     }
                 });
 
-                if dismiss_error {
-                    self.recording_error = None;
-                }
                 if start_impedance {
                     self.start_impedance_test();
                 }
@@ -2217,10 +2840,20 @@ impl eframe::App for KvApp {
                     }
                 }
                 if stop {
-                    self.stop_all();
+                    // Same guard as the toolbar Stop: confirm before ending an
+                    // active recording, else stop immediately (C1).
+                    if self.recording.state == RecordingState::Recording {
+                        self.pending_stop = Some(PendingStop::Acquisition);
+                    } else {
+                        self.stop_all();
+                    }
                 }
                 if toggle_rec {
                     self.toggle_recording();
+                }
+                if jump_to_display {
+                    // "Edit channels…" jumps straight to the per-channel picker (C7).
+                    self.sidebar_tab = SidebarTab::Display;
                 }
 
                 // Handle playback file open (outside borrow scope). Switches
@@ -2270,27 +2903,8 @@ impl eframe::App for KvApp {
                     }
                 }
                 if load_clicked {
-                    match config_persist::load_config(&self.config_persist.config_path) {
-                        Ok(cfg) => {
-                            cfg.apply_to(
-                                &mut self.display,
-                                &mut self.filters,
-                                &mut self.recording.output_dir,
-                                &mut self.recording.file_prefix,
-                                &mut self.remote_api_state.port,
-                            );
-                            self.ui_scale = cfg
-                                .ui_scale
-                                .clamp(config_persist::UI_SCALE_MIN, config_persist::UI_SCALE_MAX);
-                            self.config_persist.status_message = Some("Loaded".to_string());
-                            self.config_persist.loaded = true;
-                            self.toasts.success("Configuration loaded");
-                        }
-                        Err(e) => {
-                            self.toasts.error(format!("Load failed: {e}"));
-                            self.config_persist.status_message = Some(e);
-                        }
-                    }
+                    // Load replaces every live setting, so confirm first (C22).
+                    self.pending_load = true;
                 }
             });
 
@@ -2391,6 +3005,9 @@ impl eframe::App for KvApp {
 
         // ── Shortcut help overlay (B4) ──────────────────────────
         self.draw_help_overlay(ctx);
+        self.draw_quit_confirm(ctx);
+        self.draw_stop_confirm(ctx);
+        self.draw_load_confirm(ctx);
 
         // ── Toast notifications (B5) ────────────────────────────
         self.toasts.show(ctx);
@@ -2511,6 +3128,59 @@ fn export_kvraw(
     result.map_err(|e| e.to_string())
 }
 
+// ── Recording session-folder naming (C2) ────────────────────────────
+
+/// Format the current wall-clock time as a compact `YYYYMMDD_HHMMSS` stamp,
+/// dependency-free (Howard Hinnant's civil-from-days). UTC — this only names a
+/// unique session folder, so the exact zone is immaterial; the authoritative
+/// host timestamps live inside the recording's `recording.json`.
+fn utc_timestamp_compact() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    format_utc_stamp(secs)
+}
+
+/// Pure `unix seconds → "YYYYMMDD_HHMMSS"` conversion (split out for testing).
+fn format_utc_stamp(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // civil_from_days: days since 1970-01-01 → (year, month, day).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}{m:02}{d:02}_{hh:02}{mm:02}{ss:02}")
+}
+
+/// Resolve a unique per-session recording directory under `base`, named
+/// `<prefix>_<utc-stamp>` (with a numeric suffix if that already exists) so a
+/// new recording never overwrites a previous one (C2).
+fn resolve_session_dir(base: &str, prefix: &str) -> std::path::PathBuf {
+    let base = std::path::Path::new(base.trim());
+    let prefix = {
+        let p = prefix.trim();
+        if p.is_empty() { "session" } else { p }
+    };
+    let stamp = utc_timestamp_compact();
+    let mut candidate = base.join(format!("{prefix}_{stamp}"));
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = base.join(format!("{prefix}_{stamp}_{n}"));
+        n += 1;
+    }
+    candidate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2591,6 +3261,43 @@ mod tests {
         // Metadata is preserved; only the samples change.
         assert_eq!(out.channel_count, block.channel_count);
         assert_eq!(out.samples_per_channel, block.samples_per_channel);
+    }
+
+    #[test]
+    fn utc_stamp_formats_known_epochs() {
+        // Epoch 0 = 1970-01-01 00:00:00 UTC.
+        assert_eq!(format_utc_stamp(0), "19700101_000000");
+        // 2021-01-01 00:00:00 UTC = 1_609_459_200.
+        assert_eq!(format_utc_stamp(1_609_459_200), "20210101_000000");
+        // 2000-02-29 12:34:56 UTC (leap day) = 951_827_696.
+        assert_eq!(format_utc_stamp(951_827_696), "20000229_123456");
+    }
+
+    #[test]
+    fn session_dir_is_unique_and_never_overwrites() {
+        // Two resolutions in the same second must not collide: the second gets a
+        // numeric suffix because the first already exists on disk.
+        let base = std::env::temp_dir().join(format!("kvtest_{}", format_utc_stamp(0)));
+        let _ = std::fs::remove_dir_all(&base);
+        let base_str = base.to_string_lossy().into_owned();
+
+        let first = resolve_session_dir(&base_str, "session");
+        std::fs::create_dir_all(&first).unwrap();
+        let second = resolve_session_dir(&base_str, "session");
+        assert_ne!(first, second, "second session must not reuse the first dir");
+        assert!(!second.exists());
+
+        // Blank prefix falls back to "session".
+        let named = resolve_session_dir(&base_str, "   ");
+        assert!(
+            named
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("session_")
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

@@ -45,14 +45,24 @@ fn default_registers_match_open_ephys_rhd_30khz_settings() {
         })
         .collect::<Vec<_>>();
 
-    // RH1/RH2 DAC registers (8,10) encode the upper-bandwidth corner. The Open
-    // Ephys RHD plugin reference recording uses HighCut=7500 Hz (settings.xml),
-    // which the Intan resistor fit maps to rh1_dac1=22, rh2_dac1=23. (A 10 kHz
-    // corner would give 17/16 — that was the prior, non-matching value.)
+    // Golden register set matching the Open Ephys RHD plugin reference recording
+    // (Record Node settings.xml). Each field-specific byte is cross-checked against
+    // OE's documented settings, not just against current code output:
+    //   - Reg 4 = 140: DSP offset-removal OFF (dsp_en bit clear) to match OE
+    //     DSPOffset="0". Byte = weak_miso(0x80) | dsp_cutoff_freq(12); the cutoff
+    //     value is retained-but-inert, exactly as OE carries a DSPCutoffFreq with
+    //     DSPOffset=0. (Was 156 when DSP was erroneously enabled.)
+    //   - Regs 8,10 = 22,23: upper-bandwidth corner. OE uses HighCut=7500 Hz, which
+    //     the Intan resistor fit maps to rh1_dac1=22, rh2_dac1=23. (A 10 kHz corner
+    //     would give 17/16.)
+    //   - Regs 12,13 = 127,255: lower-bandwidth corner. OE uses LowCut=0.0955 Hz.
+    //     Below 0.15 Hz the Intan fit engages the 3 MOhm resistor and saturates the
+    //     RL DACs: rl_dac1=127, rl_dac2=63, rl_dac3=1 (reg13 also carries
+    //     adc_aux3_en in bit 7 -> 128|64|63 = 255). (Was 44,134 at LowCut=1.0 Hz.)
     assert_eq!(
         values,
         vec![
-            222, 66, 4, 2, 156, 64, 128, 0, 22, 128, 23, 128, 44, 134, 255, 255, 255, 255, 255,
+            222, 66, 4, 2, 140, 64, 128, 0, 22, 128, 23, 128, 127, 255, 255, 255, 255, 255, 255,
             255, 255, 255,
         ]
     );

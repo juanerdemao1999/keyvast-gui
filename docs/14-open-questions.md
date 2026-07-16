@@ -382,3 +382,26 @@ Only these need user attention soon:
 3. Is it acceptable to record TTL as both current state and timestamped change events?
 4. Is it acceptable to start with a 5-second recorder buffer and a 1-second GUI preview buffer?
 5. Is `run-YYYYMMDD-HHMMSS` acceptable as the first recording folder format?
+
+## 2026-07-14 RHD Follow-ups
+
+- **Hardware blocker:** `keyvast_260714_fifo.bit` intermittently emits corrupt/zero
+  1024-byte BTPipe regions after otherwise valid acquisition. Failures reproduced in
+  both GUI and CLI at strict frame boundaries (for example 256-frame blocks fail at
+  samples 217/237; 128-frame blocks fail at sample 109). Host-side 2 KiB FIFO headroom,
+  24 KiB chunking, 8 KiB chunking, and halving the logical block size did not eliminate
+  it. Inspect the FPGA FIFO write/read CDC, circular-buffer wrap, `EP_READY`, overflow/
+  underflow flags, and the semantics of WireOut `0x20`.
+- Should FIFO counter layout become an explicit bitfile/backend capability? The verified
+  `keyvast_260714_fifo.bit` build uses the full count at WireOut `0x20` and repurposes
+  `0x26`, while the stock Intan Rhythm fallback historically used split LSW/MSW values.
+- Make `flush_fifo()` fail closed on implausible or non-decreasing counts, propagate
+  FrontPanel pipe errors, and enforce a short wall-clock timeout instead of relying on
+  a 10,000-iteration cap. Throttle-override WireIn errors are now propagated, but flush
+  PipeOut errors and no-progress detection remain.
+- Represent Device startup as `Connecting -> Ready -> Streaming` in the GUI. The current
+  `live_pipeline.is_some()` check displays `Connected/LIVE` before the RHD backend has
+  opened or produced its first block, and synchronous thread join can freeze Stop if a
+  driver call never returns.
+- Reuse strict frame resynchronization for the final post-delay centering read, not only
+  the per-delay scan analysis.

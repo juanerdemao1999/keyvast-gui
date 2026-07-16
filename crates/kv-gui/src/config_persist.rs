@@ -19,8 +19,12 @@ use crate::theme;
 
 /// Minimum UI scale factor (`set_pixels_per_point`).
 pub const UI_SCALE_MIN: f32 = 0.8;
-/// Maximum UI scale factor — also the first-launch default.
+/// Maximum UI scale factor (slider upper bound only).
 pub const UI_SCALE_MAX: f32 = 1.6;
+/// Neutral first-launch / Reset scale. Previously the console launched at
+/// `UI_SCALE_MAX`, so it opened oversized and could only ever be shrunk, and
+/// Reset jumped back to max rather than to a sensible middle (C33).
+pub const UI_SCALE_DEFAULT: f32 = 1.0;
 
 // ── Config data model ───────────────────────────────────────────────
 
@@ -60,8 +64,8 @@ impl Default for PersistentConfig {
     fn default() -> Self {
         Self {
             visible_channels: 16,
-            time_scale_idx: 2,
-            amp_scale_idx: 4,
+            time_scale_idx: crate::panels::DEFAULT_TIME_WINDOW_IDX,
+            amp_scale_idx: 3,
             show_grid: true,
             channel_spacing: 3.0,
             display_mode: "sweep".to_string(),
@@ -77,7 +81,7 @@ impl Default for PersistentConfig {
             output_dir: "recordings".to_string(),
             file_prefix: "session".to_string(),
             remote_port: 4444,
-            ui_scale: UI_SCALE_MAX,
+            ui_scale: UI_SCALE_DEFAULT,
             window_width: 1200.0,
             window_height: 800.0,
             last_source: "demo".to_string(),
@@ -299,7 +303,9 @@ impl PersistentConfig {
         file_prefix: &mut String,
         remote_port: &mut u16,
     ) {
-        display.visible_channels = self.visible_channels;
+        // Clamp to ≥1: a persisted/hand-edited 0 would blank the waveform until
+        // the user drags the Channels slider (L14).
+        display.visible_channels = self.visible_channels.max(1);
         display.time_scale_idx = self
             .time_scale_idx
             .min(crate::panels::TIME_WINDOWS.len() - 1);
@@ -313,7 +319,8 @@ impl PersistentConfig {
             _ => DisplayMode::Sweep,
         };
         display.color_by_group = self.color_by_group;
-        display.channels_per_group = self.channels_per_group;
+        // Clamp to ≥1: a persisted 0 would silently disable group coloring (I4).
+        display.channels_per_group = self.channels_per_group.max(1);
 
         filters.hp_enabled = self.hp_enabled;
         filters.hp_cutoff_hz = self.hp_cutoff_hz;
@@ -369,7 +376,7 @@ pub fn draw_config_section(
 ) {
     egui::CollapsingHeader::new(
         egui::RichText::new("CONFIG")
-            .size(11.0)
+            .size(theme::FONT_HEADING)
             .strong()
             .color(theme::TEXT_SECONDARY),
     )
@@ -378,29 +385,43 @@ pub fn draw_config_section(
         // UI scale (#17) — scales the whole interface for high-DPI or distance
         // viewing.  Applied live and persisted with the rest of the config.
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("UI scale").size(10.0));
+            ui.label(egui::RichText::new("UI scale").size(theme::FONT_BODY));
             ui.add(
                 egui::Slider::new(ui_scale, UI_SCALE_MIN..=UI_SCALE_MAX)
                     .step_by(0.05)
                     .fixed_decimals(2),
             );
-            if ui.button(egui::RichText::new("Reset").size(10.0)).clicked() {
-                *ui_scale = UI_SCALE_MAX;
+            if ui
+                .button(egui::RichText::new("Reset").size(theme::FONT_BODY))
+                .on_hover_text("Reset UI scale to 1.0")
+                .clicked()
+            {
+                *ui_scale = UI_SCALE_DEFAULT;
             }
         });
 
         // Auto-save toggle
         ui.checkbox(
             &mut state.auto_save,
-            egui::RichText::new("Auto-save on change").size(10.0),
+            egui::RichText::new("Auto-save on change").size(theme::FONT_BODY),
         );
 
-        // Manual save/load buttons
+        // Manual save/load buttons. Load is destructive (it replaces every live
+        // setting), so it is spelled out and carries an explicit warning tooltip
+        // to reduce mis-clicks next to Save (C22).
         ui.horizontal(|ui| {
-            if ui.button(egui::RichText::new("Save").size(10.0)).clicked() {
+            if ui
+                .button(egui::RichText::new("Save").size(theme::FONT_BODY))
+                .on_hover_text("Write current settings to the config file")
+                .clicked()
+            {
                 *save_clicked = true;
             }
-            if ui.button(egui::RichText::new("Load").size(10.0)).clicked() {
+            if ui
+                .button(egui::RichText::new("Load\u{2026}").size(theme::FONT_BODY))
+                .on_hover_text("Replace ALL current live settings with the saved config file")
+                .clicked()
+            {
                 *load_clicked = true;
             }
         });
@@ -408,7 +429,7 @@ pub fn draw_config_section(
         // Config path display
         ui.label(
             egui::RichText::new(format!("File: {}", state.config_path.display()))
-                .size(9.0)
+                .size(theme::FONT_CAPTION)
                 .color(theme::TEXT_DIM),
         );
 
@@ -419,7 +440,11 @@ pub fn draw_config_section(
             } else {
                 theme::ACCENT_GREEN
             };
-            ui.label(egui::RichText::new(msg.as_str()).size(9.0).color(color));
+            ui.label(
+                egui::RichText::new(msg.as_str())
+                    .size(theme::FONT_CAPTION)
+                    .color(color),
+            );
         }
     });
 }
@@ -501,7 +526,7 @@ mod tests {
         let json = r#"{"visible_channels": 8}"#;
         let cfg = PersistentConfig::from_json(json);
         assert_eq!(cfg.visible_channels, 8);
-        assert_eq!(cfg.time_scale_idx, 2); // default
+        assert_eq!(cfg.time_scale_idx, crate::panels::DEFAULT_TIME_WINDOW_IDX); // default 5 s
         assert!(!cfg.hp_enabled); // default
     }
 

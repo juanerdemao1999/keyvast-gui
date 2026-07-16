@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kv-types = { path = "../kv-types" }
+log.workspace = true
 
 [dev-dependencies]
 kv-simulator = { path = "../kv-simulator" }
